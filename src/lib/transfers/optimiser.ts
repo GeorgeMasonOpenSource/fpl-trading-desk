@@ -1,4 +1,5 @@
 import { sql, json } from '@/lib/db/client';
+import { autoPick, type AutoPickInput } from '@/lib/pick/autoPick';
 
 /**
  * Transfer optimiser (deterministic, transparent).
@@ -161,13 +162,64 @@ function isLegalSwap(squad: SquadPlayer[], bank: number, out: SquadPlayer, inc: 
   return true;
 }
 
-function evDelta(out: SquadPlayer, inc: SquadPlayer): Record<Horizon, number> {
-  return {
-    1: inc.expectedPoints[1] - out.expectedPoints[1],
-    3: inc.expectedPoints[3] - out.expectedPoints[3],
-    6: inc.expectedPoints[6] - out.expectedPoints[6],
-    8: inc.expectedPoints[8] - out.expectedPoints[8]
-  };
+/**
+ * Score a 15-man squad by Starting-XI expected points for a given horizon.
+ * Uses the same auto-pick logic as the Pitch view — enumerate every legal
+ * formation, pick the highest-xPts XI, double the top scorer (captain).
+ *
+ * This is the *real* objective. Naively summing xPts across all 15 over-
+ * counts the bench, so swapping a 0.1-xPts 4th-sub for a 0.5-xPts 4th-sub
+ * gets credited 0.4 points that will never actually score.
+ */
+function xiPointsForHorizon(squad: SquadPlayer[], horizon: Horizon): number {
+  if (squad.length === 0) return 0;
+  const inputs: AutoPickInput[] = squad.map(p => ({
+    player_id: p.playerId,
+    web_name: p.webName,
+    pos: p.position,
+    team_short: p.teamShort,
+    xpts_total: Number(p.expectedPoints[horizon]) || 0
+  }));
+  return autoPick(inputs).totalXpts;
+}
+
+/** Bench utility — small credit so the optimiser still prefers a slightly
+ *  better bench when XI scores tie. Calibrated so a 1.0-xPts bench swap
+ *  scores ~0.1 — much smaller than a 1.0-xPts XI swap. */
+function benchUtility(squad: SquadPlayer[], horizon: Horizon): number {
+  const inputs: AutoPickInput[] = squad.map(p => ({
+    player_id: p.playerId, web_name: p.webName, pos: p.position,
+    team_short: p.teamShort, xpts_total: Number(p.expectedPoints[horizon]) || 0
+  }));
+  const pick = autoPick(inputs);
+  // First bench (sub priority 2) does the heavy lifting; 3rd/4th rarely come on.
+  const weights = [0, 0.18, 0.05, 0.02, 0.01];
+  return pick.bench.reduce((acc, b) => {
+    const w = weights[b.benchOrder ?? 0] ?? 0;
+    return acc + w * Number(b.player.xpts_total);
+  }, 0);
+}
+
+function squadScore(squad: SquadPlayer[], horizon: Horizon): number {
+  return xiPointsForHorizon(squad, horizon) + benchUtility(squad, horizon);
+}
+
+/**
+ * EV delta for swapping `out` → `inc`, scored as the change in
+ * (Starting-XI points + small bench utility). Computed per horizon.
+ */
+function evDeltaXI(
+  squad: SquadPlayer[],
+  baselineByHorizon: Record<Horizon, number>,
+  out: SquadPlayer,
+  inc: SquadPlayer
+): Record<Horizon, number> {
+  const after = squad.map(s => (s.playerId === out.playerId ? inc : s));
+  const delta = {} as Record<Horizon, number>;
+  for (const h of HORIZONS) {
+    delta[h] = squadScore(after, h) - baselineByHorizon[h];
+  }
+  return delta;
 }
 
 export async function compareTransferScenarios(cfg: OptimiserConfig): Promise<ScenarioResult[]> {
@@ -189,6 +241,12 @@ export async function compareTransferScenarios(cfg: OptimiserConfig): Promise<Sc
     byPos[pos] = await loadCandidates(cfg.startGameweek, pos, maxCost, ownedIds);
   }
 
+  // Baseline = score of the current 15 under auto-pick, per horizon.
+  // Every candidate move is compared to this so we measure real Starting-XI
+  // gain rather than raw sum-of-15 gain.
+  const baseline = {} as Record<Horizon, number>;
+  for (const h of HORIZONS) baseline[h] = squadScore(squad, h);
+
   // 1-move candidates (every squad slot × every candidate of that position)
   const oneMoves: TransferMove[] = [];
   for (const s of squad) {
@@ -196,7 +254,7 @@ export async function compareTransferScenarios(cfg: OptimiserConfig): Promise<Sc
       if (!isLegalSwap(squad, startBank, s, c)) continue;
       oneMoves.push({
         out: s, in: c,
-        evDelta: evDelta(s, c),
+        evDelta: evDeltaXI(squad, baseline, s, c),
         netCost: c.cost - s.cost
       });
     }
@@ -204,17 +262,23 @@ export async function compareTransferScenarios(cfg: OptimiserConfig): Promise<Sc
   oneMoves.sort((a, b) => b.evDelta[3] - a.evDelta[3]);
   const bestOne = oneMoves[0];
 
-  // 2-move candidates: greedily compose best-1 with best-orthogonal-second move
+  // 2-move candidates: greedily compose best-1 with best-orthogonal-second.
+  // The second move's evDelta is scored against the squad *after* the first
+  // move so we count the actual joint gain (cumulative, not double-counted).
   let bestTwo: { moves: [TransferMove, TransferMove]; ev: Record<Horizon, number> } | null = null;
   if (bestOne) {
     const squadAfterFirst = squad.map(s => (s.playerId === bestOne.out.playerId ? bestOne.in : s));
     const bankAfter = startBank + bestOne.out.cost - bestOne.in.cost;
+    const baselineAfterFirst = {} as Record<Horizon, number>;
+    for (const h of HORIZONS) baselineAfterFirst[h] = squadScore(squadAfterFirst, h);
+
     for (const s of squadAfterFirst) {
       if (s.playerId === bestOne.in.playerId) continue;
       for (const c of byPos[s.position]) {
         if (c.playerId === bestOne.in.playerId) continue;
         if (!isLegalSwap(squadAfterFirst, bankAfter, s, c)) continue;
-        const second = { out: s, in: c, evDelta: evDelta(s, c), netCost: c.cost - s.cost };
+        const secondDelta = evDeltaXI(squadAfterFirst, baselineAfterFirst, s, c);
+        const second = { out: s, in: c, evDelta: secondDelta, netCost: c.cost - s.cost };
         const totalEv = {
           1: bestOne.evDelta[1] + second.evDelta[1],
           3: bestOne.evDelta[3] + second.evDelta[3],
@@ -293,18 +357,33 @@ export async function compareTransferScenarios(cfg: OptimiserConfig): Promise<Sc
     });
   }
 
-  // Indicative wildcard: greedy top-5 upgrade
-  const sortedByXg = [...squad].sort((a, b) => a.expectedPoints[6] - b.expectedPoints[6]);
-  let wcEv = 0;
-  const wcMoves: TransferMove[] = [];
+  // Indicative wildcard: iteratively pick the move with the best XI EV gain
+  // against the current (post-prior-move) squad, until 5 moves are made or no
+  // positive-EV move remains. Greedy, not globally optimal, but produces
+  // sensible "fix my biggest weaknesses" suggestions.
+  let wcSquad = [...squad];
   let wcBank = startBank;
-  for (const s of sortedByXg.slice(0, 5)) {
-    const best = byPos[s.position].find(c => isLegalSwap(squad, wcBank, s, c) && c.expectedPoints[6] > s.expectedPoints[6]);
-    if (!best) continue;
-    wcBank += s.cost - best.cost;
-    wcEv += best.expectedPoints[6] - s.expectedPoints[6];
-    wcMoves.push({ out: s, in: best, evDelta: evDelta(s, best), netCost: best.cost - s.cost });
+  const wcMoves: TransferMove[] = [];
+  for (let iter = 0; iter < 5; iter++) {
+    let wcBaseline = {} as Record<Horizon, number>;
+    for (const h of HORIZONS) wcBaseline[h] = squadScore(wcSquad, h);
+    let bestStep: TransferMove | null = null;
+    for (const s of wcSquad) {
+      for (const c of byPos[s.position]) {
+        if (!isLegalSwap(wcSquad, wcBank, s, c)) continue;
+        const d = evDeltaXI(wcSquad, wcBaseline, s, c);
+        if (d[6] <= 0) continue;
+        if (!bestStep || d[6] > bestStep.evDelta[6]) {
+          bestStep = { out: s, in: c, evDelta: d, netCost: c.cost - s.cost };
+        }
+      }
+    }
+    if (!bestStep) break;
+    wcMoves.push(bestStep);
+    wcBank += bestStep.out.cost - bestStep.in.cost;
+    wcSquad = wcSquad.map(s => (s.playerId === bestStep!.out.playerId ? bestStep!.in : s));
   }
+  const wcEv = wcMoves.reduce((acc, m) => acc + m.evDelta[6], 0);
   if (wcMoves.length > 0) {
     results.push({
       scenario: 'wildcard',
