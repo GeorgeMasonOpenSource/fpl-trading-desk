@@ -222,6 +222,107 @@ function evDeltaXI(
   return delta;
 }
 
+/**
+ * Rank the top-N single-transfer moves for the given gameweek by Starting-XI
+ * EV gain over 1 GW (i.e. "best move for next week"). Used by the Transfer
+ * Planner's "Top transfers" table — the user sees a concrete leaderboard
+ * rather than just the abstract scenario summary.
+ *
+ * Returns the raw TransferMove plus convenience fields the UI needs.
+ */
+export interface RankedTransfer {
+  rank: number;
+  out: { playerId: number; webName: string; teamShort: string; position: Position; cost: number };
+  in:  { playerId: number; webName: string; teamShort: string; position: Position; cost: number };
+  evGain1: number;
+  evGain3: number;
+  evGain6: number;
+  evGain8: number;
+  netCost: number;          // tenths; negative = cash freed
+  changesCaptain: boolean;
+  startsImmediately: boolean;
+}
+
+export async function rankTopTransfers(
+  managerId: number,
+  startGw: number,
+  limit = 10
+): Promise<RankedTransfer[]> {
+  const squad = await loadSquad(managerId, startGw);
+  if (squad.length === 0) return [];
+  const bankRows = await sql<Array<{ bank: number }>>`
+    SELECT bank FROM manager_teams WHERE manager_id = ${managerId}
+  `;
+  const startBank = bankRows[0]?.bank ?? 0;
+
+  const ownedIds = squad.map(s => s.playerId);
+  const byPos: Record<Position, SquadPlayer[]> = { GKP: [], DEF: [], MID: [], FWD: [] };
+  for (const pos of ['GKP', 'DEF', 'MID', 'FWD'] as Position[]) {
+    const maxCost = startBank + Math.max(...squad.filter(s => s.position === pos).map(s => s.cost), 40);
+    byPos[pos] = await loadCandidates(startGw, pos, maxCost, ownedIds);
+  }
+
+  const baseline = {} as Record<Horizon, number>;
+  for (const h of HORIZONS) baseline[h] = squadScore(squad, h);
+
+  // Compute who the current captain is — we'll flag transfers that change them.
+  const baselinePick = autoPick(squad.map(p => ({
+    player_id: p.playerId, web_name: p.webName, pos: p.position,
+    team_short: p.teamShort, xpts_total: p.expectedPoints[1]
+  })));
+  const currentCaptainId = baselinePick.starters.find(s => s.isCaptain)?.player.player_id ?? -1;
+
+  const allMoves: Array<TransferMove & {
+    changesCaptain: boolean; startsImmediately: boolean;
+  }> = [];
+  for (const s of squad) {
+    for (const c of byPos[s.position]) {
+      if (!isLegalSwap(squad, startBank, s, c)) continue;
+      const after = squad.map(p => (p.playerId === s.playerId ? c : p));
+      const newPick = autoPick(after.map(p => ({
+        player_id: p.playerId, web_name: p.webName, pos: p.position,
+        team_short: p.teamShort, xpts_total: p.expectedPoints[1]
+      })));
+      const newCaptainId = newPick.starters.find(x => x.isCaptain)?.player.player_id ?? -1;
+      const startsImmediately = newPick.starters.some(x => x.player.player_id === c.playerId);
+      allMoves.push({
+        out: s, in: c,
+        evDelta: evDeltaXI(squad, baseline, s, c),
+        netCost: c.cost - s.cost,
+        changesCaptain: newCaptainId !== currentCaptainId,
+        startsImmediately
+      });
+    }
+  }
+
+  // Rank by next-GW EV gain (what the user sees as "points for the next gameweek").
+  // Tiebreak: 3-GW EV, then cheaper net cost.
+  allMoves.sort((a, b) => {
+    if (b.evDelta[1] !== a.evDelta[1]) return b.evDelta[1] - a.evDelta[1];
+    if (b.evDelta[3] !== a.evDelta[3]) return b.evDelta[3] - a.evDelta[3];
+    return a.netCost - b.netCost;
+  });
+
+  return allMoves.slice(0, limit).map((m, idx) => ({
+    rank: idx + 1,
+    out: {
+      playerId: m.out.playerId, webName: m.out.webName, teamShort: m.out.teamShort,
+      position: m.out.position, cost: m.out.cost
+    },
+    in: {
+      playerId: m.in.playerId, webName: m.in.webName, teamShort: m.in.teamShort,
+      position: m.in.position, cost: m.in.cost
+    },
+    evGain1: m.evDelta[1],
+    evGain3: m.evDelta[3],
+    evGain6: m.evDelta[6],
+    evGain8: m.evDelta[8],
+    netCost: m.netCost,
+    changesCaptain: m.changesCaptain,
+    startsImmediately: m.startsImmediately
+  }));
+}
+
 export async function compareTransferScenarios(cfg: OptimiserConfig): Promise<ScenarioResult[]> {
   const squad = await loadSquad(cfg.managerId, cfg.startGameweek);
   if (squad.length === 0) return [];
