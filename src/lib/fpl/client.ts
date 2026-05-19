@@ -6,7 +6,8 @@ import type {
   FplEventLive,
   FplManagerEntry,
   FplManagerPicks,
-  FplClassicLeague
+  FplClassicLeague,
+  FplElementSummary
 } from './types';
 
 // The public FPL host. All endpoints are unauthenticated and rate-limited.
@@ -80,5 +81,5 @@ export const fpl = {
       'classic-league', { entityId: leagueId }),
 
   elementSummary: (playerId: number) =>
-    fetchAndCache<unknown>(`/element-summary/${playerId}/`, 'element-summary', { entityId: playerId })
+    fetchAndCache<FplElementSummary>(`/element-summary/${playerId}/`, 'element-summary', { entityId: playerId })
 };

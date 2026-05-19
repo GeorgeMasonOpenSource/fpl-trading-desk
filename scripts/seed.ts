@@ -17,7 +17,8 @@
 import { fpl } from '../src/lib/fpl/client';
 import {
   upsertBootstrap, upsertFixtures, upsertManagerEntry, upsertManagerPicks,
-  upsertClassicLeague, upsertEventLive, upsertManagerLeagues
+  upsertClassicLeague, upsertEventLive, upsertManagerLeagues,
+  backfillPlayerHistory
 } from '../src/lib/fpl/normalise';
 import { sql } from '../src/lib/db/client';
 import { recomputeBaselines } from '../src/lib/projections/baseline';
@@ -105,6 +106,29 @@ async function main() {
     } catch (err) {
       console.warn(`  live event fetch failed: ${(err as Error).message}`);
     }
+  }
+
+  // Backfill per-match history from /element-summary/{id}/ — without this,
+  // "Recent 5 played" panels are empty (we only have the in-progress GW from
+  // live event ingest). Scope: the user's 15 + the top ~25 candidates per
+  // position by season minutes, so the transfer-planner top-10 always has
+  // recent-form data on both sides.
+  if (managerId) {
+    const squadIds = (await sql<Array<{ player_id: number }>>`
+      SELECT DISTINCT player_id FROM manager_picks WHERE manager_id = ${managerId}
+    `).map(r => r.player_id);
+
+    const candidateIds = (await sql<Array<{ id: number }>>`
+      SELECT id FROM players
+      WHERE status = 'a'
+      ORDER BY (season_minutes::numeric / NULLIF(season_starts, 0) + season_xg * 4 + season_xa * 3 + season_bonus) DESC NULLS LAST
+      LIMIT 100
+    `).map(r => r.id);
+
+    const ids = Array.from(new Set([...squadIds, ...candidateIds]));
+    console.log(`→ backfill history for ${ids.length} players`);
+    const res = await backfillPlayerHistory(ids);
+    console.log(`  fetched ${res.fetched}/${ids.length} · upserted ${res.rows} history rows`);
   }
 
   console.log('→ team strengths');

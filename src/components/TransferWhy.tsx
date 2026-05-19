@@ -42,15 +42,57 @@ function PlayerPanel({ label, name, ins, tone }: {
         <div className="text-ink-dim italic">No data yet.</div>
       ) : (
         <>
-          <Section title="Recent 5 played">
-            {ins.recent.apps === 0 ? (
-              <span className="text-ink-dim">No appearances yet.</span>
+          <Section title="Last 5 played — match by match">
+            {ins.matches.length === 0 ? (
+              <span className="text-ink-dim">No appearances on file yet. Run db:seed to backfill history.</span>
             ) : (
-              <span className="font-mono">
-                {ins.recent.apps} apps · {ins.recent.minutes}′ · {ins.recent.goals}G {ins.recent.assists}A ·
-                {' '}xG {fmt(ins.recent.xg, 1)} · xA {fmt(ins.recent.xa, 1)} ·
-                {' '}{ins.recent.bonus} bonus · <span className="text-ink">{ins.recent.fplPoints} pts</span>
-              </span>
+              <table className="w-full text-[11px] font-mono">
+                <thead className="text-ink-dim">
+                  <tr>
+                    <th className="text-left">GW</th>
+                    <th className="text-left">vs</th>
+                    <th className="text-right">min</th>
+                    <th className="text-right">G</th>
+                    <th className="text-right">A</th>
+                    <th className="text-right">xG</th>
+                    <th className="text-right">xA</th>
+                    <th className="text-right">B</th>
+                    <th className="text-right">pts</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {ins.matches.map(m => (
+                    <tr key={m.gw} className={m.minutes === 0 ? 'text-ink-dim' : ''}>
+                      <td className="text-left">{m.gw}</td>
+                      <td className="text-left">
+                        {m.opp}{m.home ? '(H)' : '(A)'}
+                        {!m.started && m.minutes > 0 && <span className="text-ink-dim ml-1">·sub</span>}
+                        {m.minutes === 0 && <span className="text-ink-dim ml-1">·DNP</span>}
+                      </td>
+                      <td className="text-right">{m.minutes}</td>
+                      <td className="text-right">{m.goals || ''}</td>
+                      <td className="text-right">{m.assists || ''}</td>
+                      <td className="text-right">{fmt(m.xg, 1)}</td>
+                      <td className="text-right">{fmt(m.xa, 1)}</td>
+                      <td className="text-right">{m.bonus || ''}</td>
+                      <td className={`text-right ${m.fplPoints >= 6 ? 'text-accent-green' : m.fplPoints >= 3 ? 'text-ink' : 'text-ink-dim'}`}>
+                        {m.fplPoints}
+                      </td>
+                    </tr>
+                  ))}
+                  <tr className="border-t border-line text-ink-dim">
+                    <td className="text-left">tot</td>
+                    <td></td>
+                    <td className="text-right">{ins.recent.minutes}</td>
+                    <td className="text-right">{ins.recent.goals}</td>
+                    <td className="text-right">{ins.recent.assists}</td>
+                    <td className="text-right">{fmt(ins.recent.xg, 1)}</td>
+                    <td className="text-right">{fmt(ins.recent.xa, 1)}</td>
+                    <td className="text-right">{ins.recent.bonus}</td>
+                    <td className="text-right text-ink">{ins.recent.fplPoints}</td>
+                  </tr>
+                </tbody>
+              </table>
             )}
           </Section>
 

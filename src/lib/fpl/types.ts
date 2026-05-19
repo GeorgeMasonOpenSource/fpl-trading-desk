@@ -201,6 +201,44 @@ export interface FplManagerTransfers {
   // FPL returns an array, not an object
 }
 
+/**
+ * /element-summary/{element_id}/ — per-player season history. Each row in
+ * `history` is one finished fixture; this is the FPL-public-API source for
+ * "recent form" data because /bootstrap-static/ only gives season totals.
+ */
+export interface FplElementHistoryRow {
+  element: number;
+  fixture: number;
+  opponent_team: number;
+  was_home: boolean;
+  round: number;                  // gameweek id
+  kickoff_time: string;
+  minutes: number;
+  starts: number;
+  goals_scored: number;
+  assists: number;
+  clean_sheets: number;
+  goals_conceded: number;
+  own_goals: number;
+  penalties_saved: number;
+  penalties_missed: number;
+  yellow_cards: number;
+  red_cards: number;
+  saves: number;
+  bonus: number;
+  bps: number;
+  total_points: number;
+  expected_goals: string;
+  expected_assists: string;
+  expected_goal_involvements: string;
+  expected_goals_conceded: string;
+}
+export interface FplElementSummary {
+  fixtures: unknown[];
+  history: FplElementHistoryRow[];
+  history_past?: unknown[];
+}
+
 export interface FplClassicLeague {
   league: { id: number; name: string };
   standings: {

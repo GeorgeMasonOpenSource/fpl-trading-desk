@@ -232,8 +232,8 @@ function evDeltaXI(
  */
 export interface RankedTransfer {
   rank: number;
-  out: { playerId: number; webName: string; teamShort: string; position: Position; cost: number };
-  in:  { playerId: number; webName: string; teamShort: string; position: Position; cost: number };
+  out: { playerId: number; webName: string; teamShort: string; position: Position; cost: number; xpts1: number };
+  in:  { playerId: number; webName: string; teamShort: string; position: Position; cost: number; xpts1: number };
   evGain1: number;
   evGain3: number;
   evGain6: number;
@@ -307,11 +307,13 @@ export async function rankTopTransfers(
     rank: idx + 1,
     out: {
       playerId: m.out.playerId, webName: m.out.webName, teamShort: m.out.teamShort,
-      position: m.out.position, cost: m.out.cost
+      position: m.out.position, cost: m.out.cost,
+      xpts1: Number(m.out.expectedPoints[1]) || 0
     },
     in: {
       playerId: m.in.playerId, webName: m.in.webName, teamShort: m.in.teamShort,
-      position: m.in.position, cost: m.in.cost
+      position: m.in.position, cost: m.in.cost,
+      xpts1: Number(m.in.expectedPoints[1]) || 0
     },
     evGain1: m.evDelta[1],
     evGain3: m.evDelta[3],

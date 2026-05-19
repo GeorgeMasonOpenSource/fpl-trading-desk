@@ -14,10 +14,25 @@ import { sql } from '@/lib/db/client';
  *   - roles: penalty / set-piece order from bootstrap-static (1 = primary).
  *   - season: full-season totals for context.
  */
+export interface RecentMatch {
+  gw: number;
+  opp: string;           // 3-letter team short name of opponent
+  home: boolean;
+  started: boolean;
+  minutes: number;
+  goals: number;
+  assists: number;
+  bonus: number;
+  fplPoints: number;
+  xg: number;
+  xa: number;
+}
+
 export interface PlayerInsight {
   playerId: number;
+  matches: RecentMatch[];   // per-match rows, last 5 played, most-recent first
   recent: {
-    apps: number;          // games with minutes > 0 in last 5 played
+    apps: number;
     starts: number;
     minutes: number;
     goals: number;
@@ -29,9 +44,9 @@ export interface PlayerInsight {
   };
   upcoming: Array<{
     gw: number;
-    opp: string;          // 3-letter team short name
+    opp: string;
     home: boolean;
-    fdr: number;          // 1..5
+    fdr: number;
   }>;
   roles: {
     penaltyOrder: number | null;
@@ -61,27 +76,35 @@ export async function getTransferInsights(
   if (playerIds.length === 0) return new Map();
 
   // Last 5 *played* fixtures per player. Use a window function so we only
-  // return the 5 most-recent finished fixture rows per player.
+  // return the 5 most-recent finished fixture rows per player, joined to teams
+  // for the opponent's short name so the UI can render "vs MUN (H)" style.
   const recentRows = await sql<Array<{
     player_id: number; gameweek_id: number;
     minutes: number; starts: number;
     goals_scored: number; assists: number;
     bonus: number; total_points: number;
     expected_goals: number; expected_assists: number;
+    opponent_team: number; was_home: boolean;
+    opp_short: string;
   }>>`
     SELECT player_id, gameweek_id, minutes, starts,
            goals_scored, assists, bonus, total_points,
-           expected_goals, expected_assists
+           expected_goals, expected_assists,
+           opponent_team, was_home, opp_short
     FROM (
-      SELECT pgh.*, ROW_NUMBER() OVER (
+      SELECT pgh.*,
+             t.short_name AS opp_short,
+             ROW_NUMBER() OVER (
                PARTITION BY pgh.player_id ORDER BY pgh.gameweek_id DESC
              ) AS rn
       FROM player_gameweek_history pgh
       JOIN fixtures f ON f.id = pgh.fixture_id
+      LEFT JOIN teams t ON t.id = pgh.opponent_team
       WHERE f.finished = TRUE
         AND pgh.player_id IN ${sql(playerIds as any)}
     ) sub
     WHERE rn <= 5
+    ORDER BY player_id, gameweek_id DESC
   `;
 
   // Upcoming fixtures — next 3 per player. Pull by team_id (a player's
@@ -154,6 +177,19 @@ export async function getTransferInsights(
 
     out.set(p.id, {
       playerId: p.id,
+      matches: recent.map(r => ({
+        gw: r.gameweek_id,
+        opp: (r as any).opp_short ?? '???',
+        home: !!(r as any).was_home,
+        started: Number(r.starts) > 0,
+        minutes: Number(r.minutes),
+        goals: Number(r.goals_scored),
+        assists: Number(r.assists),
+        bonus: Number(r.bonus),
+        fplPoints: Number(r.total_points),
+        xg: Number(r.expected_goals),
+        xa: Number(r.expected_assists)
+      })),
       recent: {
         apps: recent.filter(r => Number(r.minutes) > 0).length,
         starts: recent.reduce((s, r) => s + (Number(r.starts) || 0), 0),

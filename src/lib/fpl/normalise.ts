@@ -6,8 +6,10 @@ import type {
   FplManagerEntry,
   FplManagerPicks,
   FplClassicLeague,
-  FplEventLive
+  FplEventLive,
+  FplElementHistoryRow
 } from './types';
+import { fpl } from './client';
 
 const POSITION_MAP: Record<number, 'GKP' | 'DEF' | 'MID' | 'FWD'> = {
   1: 'GKP', 2: 'DEF', 3: 'MID', 4: 'FWD'
@@ -424,6 +426,107 @@ export async function upsertManagerPicks(managerId: number, gw: number, picks: F
       'is_captain', 'is_vice', 'multiplier', 'purchase_price', 'selling_price')}
     ON CONFLICT DO NOTHING
   `;
+}
+
+/**
+ * Backfill per-match history for a set of players by calling FPL's
+ * /element-summary/{id}/ endpoint and writing every finished fixture into
+ * player_gameweek_history. This is what powers the "Recent 5 played" panel.
+ *
+ * /event/{gw}/live/ only gives us the in-progress GW, so without this
+ * backfill we have zero history outside the live event window.
+ *
+ * Concurrency: 5 parallel requests (FPL tolerates this fine). Failures on
+ * individual players are logged and skipped — one rate-limit blip shouldn't
+ * abort the whole batch.
+ */
+export async function backfillPlayerHistory(playerIds: number[], concurrency = 5) {
+  if (playerIds.length === 0) return { fetched: 0, rows: 0 };
+  let fetched = 0;
+  const allRows: any[] = [];
+
+  // Pull players' team mapping so we can derive was_home / opponent on the
+  // history rows (FPL already gives them, but we double-check team_id mapping
+  // for the fixture in case of FPL data oddities).
+  const teamByPlayer = new Map<number, number>(
+    (await sql<Array<{ id: number; team_id: number }>>`
+      SELECT id, team_id FROM players WHERE id IN ${sql(playerIds as any)}
+    `).map(r => [r.id, r.team_id])
+  );
+
+  // Concurrency-limited fetch loop.
+  for (let i = 0; i < playerIds.length; i += concurrency) {
+    const batch = playerIds.slice(i, i + concurrency);
+    const results = await Promise.allSettled(batch.map(id => fpl.elementSummary(id)));
+    for (let j = 0; j < batch.length; j++) {
+      const id = batch[j]!;
+      const r = results[j]!;
+      if (r.status !== 'fulfilled') continue;
+      fetched++;
+      const history: FplElementHistoryRow[] = r.value.history ?? [];
+      for (const h of history) {
+        allRows.push({
+          player_id: h.element,
+          gameweek_id: h.round,
+          fixture_id: h.fixture,
+          opponent_team: h.opponent_team,
+          was_home: h.was_home,
+          minutes: h.minutes,
+          goals_scored: h.goals_scored,
+          assists: h.assists,
+          clean_sheets: h.clean_sheets,
+          goals_conceded: h.goals_conceded,
+          own_goals: h.own_goals,
+          penalties_saved: h.penalties_saved,
+          penalties_missed: h.penalties_missed,
+          yellow_cards: h.yellow_cards,
+          red_cards: h.red_cards,
+          saves: h.saves,
+          bonus: h.bonus,
+          bps: h.bps,
+          expected_goals: Number(h.expected_goals) || 0,
+          expected_assists: Number(h.expected_assists) || 0,
+          expected_goal_involvements: Number(h.expected_goal_involvements) || 0,
+          expected_goals_conceded: Number(h.expected_goals_conceded) || 0,
+          total_points: h.total_points,
+          starts: h.starts
+        });
+      }
+    }
+  }
+
+  if (allRows.length === 0) return { fetched, rows: 0 };
+
+  // Bulk INSERT, dedupe on (player, gw, fixture).
+  await sql`
+    INSERT INTO player_gameweek_history ${(sql as any)(allRows,
+      'player_id', 'gameweek_id', 'fixture_id', 'opponent_team', 'was_home',
+      'minutes', 'goals_scored', 'assists', 'clean_sheets', 'goals_conceded',
+      'own_goals', 'penalties_saved', 'penalties_missed', 'yellow_cards', 'red_cards',
+      'saves', 'bonus', 'bps', 'expected_goals', 'expected_assists',
+      'expected_goal_involvements', 'expected_goals_conceded', 'total_points', 'starts')}
+    ON CONFLICT (player_id, gameweek_id, fixture_id) DO UPDATE SET
+      minutes = EXCLUDED.minutes,
+      goals_scored = EXCLUDED.goals_scored,
+      assists = EXCLUDED.assists,
+      clean_sheets = EXCLUDED.clean_sheets,
+      goals_conceded = EXCLUDED.goals_conceded,
+      own_goals = EXCLUDED.own_goals,
+      penalties_saved = EXCLUDED.penalties_saved,
+      penalties_missed = EXCLUDED.penalties_missed,
+      yellow_cards = EXCLUDED.yellow_cards,
+      red_cards = EXCLUDED.red_cards,
+      saves = EXCLUDED.saves,
+      bonus = EXCLUDED.bonus,
+      bps = EXCLUDED.bps,
+      expected_goals = EXCLUDED.expected_goals,
+      expected_assists = EXCLUDED.expected_assists,
+      expected_goal_involvements = EXCLUDED.expected_goal_involvements,
+      expected_goals_conceded = EXCLUDED.expected_goals_conceded,
+      total_points = EXCLUDED.total_points,
+      starts = EXCLUDED.starts
+  `;
+  return { fetched, rows: allRows.length };
 }
 
 export async function upsertClassicLeague(league: FplClassicLeague, gw: number) {

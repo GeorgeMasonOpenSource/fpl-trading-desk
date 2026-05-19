@@ -112,13 +112,19 @@ export default async function TransferPlanner() {
                   <div className="grid grid-cols-[24px_1fr_1fr_64px_64px_64px_64px_90px] gap-x-3 items-center">
                     <div className="font-mono text-ink-dim">{t.rank}</div>
                     <div>
-                      <div className="font-medium">{t.out.webName}</div>
+                      <div className="font-medium">
+                        {t.out.webName}
+                        <span className="ml-2 font-mono text-xs text-ink-dim">{fmt(t.out.xpts1, 2)} xPts</span>
+                      </div>
                       <div className="text-[10px] text-ink-dim font-mono">
                         {t.out.position} · {t.out.teamShort} · £{(t.out.cost / 10).toFixed(1)}m
                       </div>
                     </div>
                     <div>
-                      <div className="font-medium">{t.in.webName}</div>
+                      <div className="font-medium">
+                        {t.in.webName}
+                        <span className="ml-2 font-mono text-xs text-accent-green">{fmt(t.in.xpts1, 2)} xPts</span>
+                      </div>
                       <div className="text-[10px] text-ink-dim font-mono">
                         {t.in.position} · {t.in.teamShort} · £{(t.in.cost / 10).toFixed(1)}m
                       </div>
