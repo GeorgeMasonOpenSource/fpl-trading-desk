@@ -124,6 +124,29 @@ export interface FplEventLive {
   }>;
 }
 
+export interface FplLeagueSummary {
+  id: number;
+  name: string;
+  short_name: string | null;
+  created: string;
+  closed: boolean;
+  rank: number | null;
+  max_entries: number | null;
+  league_type: 's' | 'x' | 'c';   // s=system, x=other, c=classic
+  scoring: 'c' | 'h';             // c=classic, h=h2h
+  admin_entry: number | null;
+  start_event: number;
+  entry_can_leave: boolean;
+  entry_can_admin: boolean;
+  entry_can_invite: boolean;
+  has_cup: boolean;
+  cup_league: number | null;
+  cup_qualified: boolean | null;
+  entry_rank: number | null;
+  entry_last_rank: number | null;
+  entry_percentile_rank: number | null;
+}
+
 export interface FplManagerEntry {
   id: number;
   player_first_name: string;
@@ -135,6 +158,11 @@ export interface FplManagerEntry {
   last_deadline_bank: number;
   last_deadline_value: number;
   last_deadline_total_transfers: number;
+  leagues?: {
+    classic?: FplLeagueSummary[];
+    h2h?: FplLeagueSummary[];
+    cup?: unknown;
+  };
 }
 
 export interface FplManagerPicks {

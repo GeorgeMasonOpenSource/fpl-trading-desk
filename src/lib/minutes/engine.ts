@@ -1,4 +1,4 @@
-import { sql, json } from '@/lib/db/client';
+import { sql } from '@/lib/db/client';
 import { clamp01, logistic } from '@/lib/util/math';
 import { computeReliability, computeRotationResistance } from './reliability';
 import type { ProjectionReason } from '@/lib/db/types';
@@ -208,11 +208,18 @@ export function projectMinutes(input: MinutesInputs): MinutesDistribution {
 
 /**
  * Run the engine for every upcoming fixture in the given gameweek and persist
- * the distribution. Reads everything it needs straight from the DB so we can
- * call it from a serverless cron or from a CLI script.
+ * the distribution.
+ *
+ * Batched implementation: 4 SELECTs + 1 bulk INSERT regardless of player count.
+ *   1. SELECT fixtures + their kickoff times
+ *   2. SELECT all (player, team, status) for the teams involved
+ *   3. SELECT all player history aggregates in one query
+ *   4. SELECT all manual overrides for those players
+ *   (european_fixtures filtered in JS — typically a handful of rows total)
+ *   5. Compute distribution per (player, fixture) in JS
+ *   6. Bulk INSERT all rows in one round-trip
  */
 export async function recomputeMinutesForGameweek(gw: number) {
-  // Pull upcoming fixtures (not yet finished).
   const fixtures = await sql<Array<{
     id: number; team_h: number; team_a: number; kickoff_time: string | null;
   }>>`
@@ -220,39 +227,74 @@ export async function recomputeMinutesForGameweek(gw: number) {
     FROM fixtures
     WHERE gameweek_id = ${gw} AND finished = FALSE
   `;
+  if (fixtures.length === 0) return 0;
 
+  const teamIds = Array.from(new Set(fixtures.flatMap(f => [f.team_h, f.team_a])));
+  if (teamIds.length === 0) return 0;
+
+  // All players on either side, with their status flags.
+  const players = await sql<Array<{
+    id: number; team_id: number; status: 'a'|'d'|'i'|'n'|'s'|'u';
+    chance_of_playing_next_round: number | null;
+  }>>`
+    SELECT id, team_id, status, chance_of_playing_next_round
+    FROM players WHERE team_id IN ${sql(teamIds as any)}
+  `;
+  const playerIds = players.map(p => p.id);
+
+  // Career aggregates per player — single query.
+  const aggs = playerIds.length === 0 ? [] : await sql<Array<{
+    player_id: number; appearances: number; starts: number; ninety: number;
+    eligible: number; congestion_starts: number; congestion_eligible: number;
+    early_off: number;
+  }>>`
+    SELECT
+      pgh.player_id,
+      COUNT(*) FILTER (WHERE pgh.minutes > 0)::int       AS appearances,
+      COUNT(*) FILTER (WHERE pgh.starts = 1)::int        AS starts,
+      COUNT(*) FILTER (WHERE pgh.minutes >= 90)::int     AS ninety,
+      COUNT(*)::int                                      AS eligible,
+      COUNT(*) FILTER (WHERE pgh.starts = 1 AND f.kickoff_time IS NOT NULL)::int AS congestion_starts,
+      COUNT(*) FILTER (WHERE TRUE)::int                  AS congestion_eligible,
+      COUNT(*) FILTER (WHERE pgh.minutes BETWEEN 1 AND 59)::int AS early_off
+    FROM player_gameweek_history pgh
+    LEFT JOIN fixtures f ON f.id = pgh.fixture_id
+    WHERE pgh.player_id IN ${sql(playerIds as any)}
+    GROUP BY pgh.player_id
+  `;
+  const aggByPlayer = new Map(aggs.map(a => [a.player_id, a]));
+
+  // Manual overrides for these players — single query.
+  const overrides = playerIds.length === 0 ? [] : await sql<Array<{
+    scope_id: number; kind: string; value: any;
+  }>>`
+    SELECT scope_id, kind, value FROM manual_overrides
+    WHERE scope = 'player' AND active = TRUE
+      AND scope_id IN ${sql(playerIds as any)}
+      AND (expires_at IS NULL OR expires_at > now())
+  `;
+  const overridesByPlayer = new Map<number, Array<{ kind: string; value: any }>>();
+  for (const o of overrides) {
+    if (!overridesByPlayer.has(o.scope_id)) overridesByPlayer.set(o.scope_id, []);
+    overridesByPlayer.get(o.scope_id)!.push({ kind: o.kind, value: o.value });
+  }
+
+  // European fixtures within the GW window — small table, one query.
+  const euFixtures = teamIds.length === 0 ? [] : await sql<Array<{
+    team_id: number; kickoff_time: string;
+  }>>`
+    SELECT team_id, kickoff_time FROM european_fixtures
+    WHERE team_id IN ${sql(teamIds as any)}
+  `;
+
+  const rows: any[] = [];
   for (const fix of fixtures) {
-    // Pull every player on either team.
-    const players = await sql<Array<{
-      id: number; team_id: number; status: 'a'|'d'|'i'|'n'|'s'|'u';
-      chance_of_playing_next_round: number | null;
-    }>>`
-      SELECT id, team_id, status, chance_of_playing_next_round
-      FROM players
-      WHERE team_id IN (${fix.team_h}, ${fix.team_a})
-    `;
+    const kickoff = fix.kickoff_time ? new Date(fix.kickoff_time).getTime() : null;
+    const fixturePlayers = players.filter(p => p.team_id === fix.team_h || p.team_id === fix.team_a);
 
-    for (const p of players) {
-      // Current-season aggregates
-      const [agg] = await sql<Array<{
-        appearances: number; starts: number; ninety: number; eligible: number;
-        congestion_starts: number; congestion_eligible: number;
-        early_off: number;
-      }>>`
-        SELECT
-          COUNT(*) FILTER (WHERE pgh.minutes > 0)::int       AS appearances,
-          COUNT(*) FILTER (WHERE pgh.starts = 1)::int        AS starts,
-          COUNT(*) FILTER (WHERE pgh.minutes >= 90)::int     AS ninety,
-          COUNT(*)::int                                      AS eligible,
-          COUNT(*) FILTER (WHERE pgh.starts = 1 AND f.kickoff_time IS NOT NULL)::int AS congestion_starts,
-          COUNT(*) FILTER (WHERE TRUE)::int                  AS congestion_eligible,
-          COUNT(*) FILTER (WHERE pgh.minutes BETWEEN 1 AND 59)::int AS early_off
-        FROM player_gameweek_history pgh
-        LEFT JOIN fixtures f ON f.id = pgh.fixture_id
-        WHERE pgh.player_id = ${p.id}
-      `;
-
-      const reliability = computeReliability({
+    for (const p of fixturePlayers) {
+      const agg = aggByPlayer.get(p.id);
+      const reliabilityInput = {
         appearancesAvailable: agg?.appearances ?? 0,
         totalAvailable:       agg?.eligible ?? 0,
         startsAvailable:      agg?.starts ?? 0,
@@ -260,99 +302,91 @@ export async function recomputeMinutesForGameweek(gw: number) {
         earlySubOffCount:     agg?.early_off ?? 0,
         congestionStarts:     agg?.congestion_starts ?? 0,
         congestionEligible:   agg?.congestion_eligible ?? 0
-      });
-      const rotationResistance = computeRotationResistance({
-        appearancesAvailable: agg?.appearances ?? 0,
-        totalAvailable:       agg?.eligible ?? 0,
-        startsAvailable:      agg?.starts ?? 0,
-        ninetyMinutesPlayed:  agg?.ninety ?? 0,
-        earlySubOffCount:     agg?.early_off ?? 0,
-        congestionStarts:     agg?.congestion_starts ?? 0,
-        congestionEligible:   agg?.congestion_eligible ?? 0
-      });
+      };
+      const reliability = computeReliability(reliabilityInput);
+      const rotationResistance = computeRotationResistance(reliabilityInput);
 
-      // European context: any UCL/UEL/UECL fixture within 4 days of this kickoff?
-      const [euCtx] = await sql<Array<{ post: boolean; pre: boolean }>>`
-        SELECT
-          EXISTS (
-            SELECT 1 FROM european_fixtures e
-            WHERE e.team_id = ${p.team_id}
-              AND e.kickoff_time < ${fix.kickoff_time ?? null}
-              AND ${fix.kickoff_time ?? null}::timestamptz - e.kickoff_time <= interval '4 days'
-          ) AS post,
-          EXISTS (
-            SELECT 1 FROM european_fixtures e
-            WHERE e.team_id = ${p.team_id}
-              AND e.kickoff_time > ${fix.kickoff_time ?? null}
-              AND e.kickoff_time - ${fix.kickoff_time ?? null}::timestamptz <= interval '4 days'
-          ) AS pre
-      `;
+      // EU context — compute against the in-memory list.
+      let postEu = false, preEu = false;
+      if (kickoff != null) {
+        for (const e of euFixtures) {
+          if (e.team_id !== p.team_id) continue;
+          const ekt = new Date(e.kickoff_time).getTime();
+          const deltaDays = Math.abs(kickoff - ekt) / (1000 * 60 * 60 * 24);
+          if (deltaDays > 4) continue;
+          if (ekt < kickoff) postEu = true; else preEu = true;
+        }
+      }
 
-      // Manual overrides applicable to this player
-      const overrides = await sql<Array<{ kind: string; value: any }>>`
-        SELECT kind, value FROM manual_overrides
-        WHERE scope = 'player' AND scope_id = ${p.id} AND active = TRUE
-          AND (expires_at IS NULL OR expires_at > now())
-      `;
-      const manualCap = overrides.find(o => o.kind === 'minutes_cap')?.value?.cap as number | undefined;
-      const manualAbsence = overrides.some(o => o.kind === 'availability' && o.value?.expected === 'out');
+      const playerOv = overridesByPlayer.get(p.id) ?? [];
+      const manualCap = playerOv.find(o => o.kind === 'minutes_cap')?.value?.cap as number | undefined;
+      const manualAbsence = playerOv.some(o => o.kind === 'availability' && o.value?.expected === 'out');
 
-      const startRate = agg && agg.eligible ? agg.starts / agg.eligible : 0;
-      const ninetyRate = agg && agg.starts ? agg.ninety / agg.starts : 0;
+      const startRate     = agg && agg.eligible ? agg.starts / agg.eligible : 0;
+      const ninetyRate    = agg && agg.starts ? agg.ninety / agg.starts : 0;
       const appearanceRate = agg && agg.eligible ? agg.appearances / agg.eligible : 0;
 
       const distribution = projectMinutes({
-        playerId: p.id,
-        fixtureId: fix.id,
-        reliability,
-        rotationResistance,
+        playerId: p.id, fixtureId: fix.id,
+        reliability, rotationResistance,
         currentSeasonStartRate: startRate,
         currentSeasonNinetyRate: ninetyRate,
         currentSeasonAppearanceRate: appearanceRate,
         fplStatus: p.status,
         chanceOfPlayingNext: p.chance_of_playing_next_round,
-        isPostEuropeanFixture: !!euCtx?.post,
-        isPreEuropeanFixture: !!euCtx?.pre,
-        daysRestBefore: null,
-        daysRestAfter: null,
+        isPostEuropeanFixture: postEu,
+        isPreEuropeanFixture:  preEu,
+        daysRestBefore: null, daysRestAfter: null,
         fixtureImportance: 1.0,
-        competitorPressure: 0,           // populated by role-matrix in a later pass
+        competitorPressure: 0,
         returnFromInjuryMatch: null,
         manualMinutesCap: manualCap,
         manualExpectedAbsence: manualAbsence
       });
 
-      await sql`
-        INSERT INTO minutes_projections (
-          player_id, fixture_id, start_prob, sixty_plus_prob, ninety_prob,
-          sub_prob, bench_unused_prob, injury_absence_prob, expected_minutes,
-          early_sub_risk, rotation_risk, rotation_resistance, minutes_confidence,
-          reliability_index, reasons, computed_at
-        ) VALUES (
-          ${p.id}, ${fix.id}, ${distribution.startProb}, ${distribution.sixtyPlusProb},
-          ${distribution.ninetyProb}, ${distribution.subProb}, ${distribution.benchUnusedProb},
-          ${distribution.injuryAbsenceProb}, ${distribution.expectedMinutes},
-          ${distribution.earlySubRisk}, ${distribution.rotationRisk},
-          ${distribution.rotationResistance}, ${distribution.confidence},
-          ${distribution.reliability}, ${json(distribution.reasons)}, now()
-        )
-        ON CONFLICT (player_id, fixture_id) DO UPDATE SET
-          start_prob = EXCLUDED.start_prob,
-          sixty_plus_prob = EXCLUDED.sixty_plus_prob,
-          ninety_prob = EXCLUDED.ninety_prob,
-          sub_prob = EXCLUDED.sub_prob,
-          bench_unused_prob = EXCLUDED.bench_unused_prob,
-          injury_absence_prob = EXCLUDED.injury_absence_prob,
-          expected_minutes = EXCLUDED.expected_minutes,
-          early_sub_risk = EXCLUDED.early_sub_risk,
-          rotation_risk = EXCLUDED.rotation_risk,
-          rotation_resistance = EXCLUDED.rotation_resistance,
-          minutes_confidence = EXCLUDED.minutes_confidence,
-          reliability_index = EXCLUDED.reliability_index,
-          reasons = EXCLUDED.reasons,
-          computed_at = now()
-      `;
+      rows.push({
+        player_id: p.id,
+        fixture_id: fix.id,
+        start_prob: distribution.startProb,
+        sixty_plus_prob: distribution.sixtyPlusProb,
+        ninety_prob: distribution.ninetyProb,
+        sub_prob: distribution.subProb,
+        bench_unused_prob: distribution.benchUnusedProb,
+        injury_absence_prob: distribution.injuryAbsenceProb,
+        expected_minutes: distribution.expectedMinutes,
+        early_sub_risk: distribution.earlySubRisk,
+        rotation_risk: distribution.rotationRisk,
+        rotation_resistance: distribution.rotationResistance,
+        minutes_confidence: distribution.confidence,
+        reliability_index: distribution.reliability,
+        reasons: JSON.stringify(distribution.reasons),
+        computed_at: new Date()
+      });
     }
   }
+
+  if (rows.length === 0) return fixtures.length;
+  await sql`
+    INSERT INTO minutes_projections ${(sql as any)(rows,
+      'player_id', 'fixture_id', 'start_prob', 'sixty_plus_prob', 'ninety_prob',
+      'sub_prob', 'bench_unused_prob', 'injury_absence_prob', 'expected_minutes',
+      'early_sub_risk', 'rotation_risk', 'rotation_resistance', 'minutes_confidence',
+      'reliability_index', 'reasons', 'computed_at')}
+    ON CONFLICT (player_id, fixture_id) DO UPDATE SET
+      start_prob = EXCLUDED.start_prob,
+      sixty_plus_prob = EXCLUDED.sixty_plus_prob,
+      ninety_prob = EXCLUDED.ninety_prob,
+      sub_prob = EXCLUDED.sub_prob,
+      bench_unused_prob = EXCLUDED.bench_unused_prob,
+      injury_absence_prob = EXCLUDED.injury_absence_prob,
+      expected_minutes = EXCLUDED.expected_minutes,
+      early_sub_risk = EXCLUDED.early_sub_risk,
+      rotation_risk = EXCLUDED.rotation_risk,
+      rotation_resistance = EXCLUDED.rotation_resistance,
+      minutes_confidence = EXCLUDED.minutes_confidence,
+      reliability_index = EXCLUDED.reliability_index,
+      reasons = EXCLUDED.reasons,
+      computed_at = now()
+  `;
   return fixtures.length;
 }

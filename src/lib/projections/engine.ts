@@ -282,46 +282,49 @@ export async function recomputeProjectionsForGameweek(gameweekId: number) {
       WHERE p.team_id IN (${fix.team_h}, ${fix.team_a})
     `;
 
+    // Pre-collect override info for this fixture's players in one query.
+    const playerIds = players.map(p => p.id);
+    const ov = playerIds.length === 0 ? [] : await sql<Array<{
+      scope_id: number; kind: string; value: any;
+    }>>`
+      SELECT scope_id, kind, value FROM manual_overrides
+      WHERE scope = 'player' AND active = TRUE
+        AND scope_id IN ${sql(playerIds as any)}
+        AND (expires_at IS NULL OR expires_at > now())
+    `;
+    const ovByPlayer = new Map<number, Array<{ kind: string; value: any }>>();
+    for (const o of ov) {
+      if (!ovByPlayer.has(o.scope_id)) ovByPlayer.set(o.scope_id, []);
+      ovByPlayer.get(o.scope_id)!.push({ kind: o.kind, value: o.value });
+    }
+
+    const projRows: any[] = [];
+    const snapshotRows: any[] = [];
+
     for (const p of players) {
       const isHome = p.team_id === fix.team_h;
       const teamXgFor = isHome ? exp.xgHome : exp.xgAway;
       const teamXgAgainst = isHome ? exp.xgAway : exp.xgHome;
       const cs = isHome ? exp.cleanSheetProbHome : exp.cleanSheetProbAway;
 
-      // Penalty / set-piece share — placeholder: in v1 we read manual overrides;
-      // long-term we infer from penalty attempts taken.
-      const ov = await sql<Array<{ kind: string; value: any }>>`
-        SELECT kind, value FROM manual_overrides
-        WHERE scope = 'player' AND scope_id = ${p.id} AND active = TRUE
-          AND (expires_at IS NULL OR expires_at > now())
-      `;
-      const penaltyShare = ov.find(o => o.kind === 'penalty_taker')?.value?.share ?? 0;
-      const setPieceShare = ov.find(o => o.kind === 'set_piece')?.value?.share ?? 0;
+      const playerOv = ovByPlayer.get(p.id) ?? [];
+      const penaltyShare = playerOv.find(o => o.kind === 'penalty_taker')?.value?.share ?? 0;
+      const setPieceShare = playerOv.find(o => o.kind === 'set_piece')?.value?.share ?? 0;
 
-      // Apply stage uncertainty penalties (small unless backtesting promotes them)
       const newSigningPenalty = (p.current_minutes < 270) ? weights.newSigningUncertainty * 0.20 : 0;
-      const managerChangePenalty = 0;  // wired up once team-level manager-change overrides exist
+      const managerChangePenalty = 0;
 
       const projection = projectPlayer({
-        playerId: p.id,
-        fixtureId: fix.id,
-        gameweekId,
-        position: p.position,
-        isHome,
-        startProb: p.start_prob,
-        sixtyPlusProb: p.sixty_plus_prob,
-        ninetyProb: p.ninety_prob,
-        subProb: p.sub_prob,
+        playerId: p.id, fixtureId: fix.id, gameweekId,
+        position: p.position, isHome,
+        startProb: p.start_prob, sixtyPlusProb: p.sixty_plus_prob,
+        ninetyProb: p.ninety_prob, subProb: p.sub_prob,
         benchUnusedProb: p.bench_unused_prob,
         injuryAbsenceProb: p.injury_absence_prob,
-        earlySubRisk: p.early_sub_risk,
-        expectedMinutes: p.expected_minutes,
-        baselineXg90: p.baseline_xg_per_90,
-        baselineXa90: p.baseline_xa_per_90,
-        baselineBonus90: p.baseline_bonus_per_90,
-        baselineCsShare: p.baseline_cs_share,
-        baselineYellow90: p.baseline_yellow_per_90,
-        baselineRed90: p.baseline_red_per_90,
+        earlySubRisk: p.early_sub_risk, expectedMinutes: p.expected_minutes,
+        baselineXg90: p.baseline_xg_per_90, baselineXa90: p.baseline_xa_per_90,
+        baselineBonus90: p.baseline_bonus_per_90, baselineCsShare: p.baseline_cs_share,
+        baselineYellow90: p.baseline_yellow_per_90, baselineRed90: p.baseline_red_per_90,
         baselineSaves90: p.baseline_saves_per_90,
         currentXg90: p.current_minutes ? (p.current_xg * 90) / p.current_minutes : null,
         currentXa90: p.current_minutes ? (p.current_xa * 90) / p.current_minutes : null,
@@ -329,27 +332,49 @@ export async function recomputeProjectionsForGameweek(gameweekId: number) {
         currentSampleMinutes: p.current_minutes,
         teamXgFor, teamXgAgainst, cleanSheetProb: cs,
         penaltyShare, setPieceShare,
-        goalShare: 0.15, assistShare: 0.15,    // placeholder until we wire role matrix shares
+        goalShare: 0.15, assistShare: 0.15,
         reliability: p.reliability_index,
         minutesConfidence: p.minutes_confidence,
         newSigningPenalty, managerChangePenalty
       });
 
+      projRows.push({
+        player_id: p.id, fixture_id: fix.id, gameweek_id: gameweekId,
+        xpts_total: projection.xpts_total,
+        xpts_appearance: projection.xpts_appearance,
+        xpts_goals: projection.xpts_goals,
+        xpts_assists: projection.xpts_assists,
+        xpts_clean_sheet: projection.xpts_clean_sheet,
+        xpts_bonus: projection.xpts_bonus,
+        xpts_saves: projection.xpts_saves,
+        xpts_pen_save: projection.xpts_pen_save,
+        xpts_cards: projection.xpts_cards,
+        xpts_concede: projection.xpts_concede,
+        xpts_owngoal: projection.xpts_owngoal,
+        floor: projection.floor,
+        ceiling: projection.ceiling,
+        risk_score: projection.risk_score,
+        confidence_score: projection.confidence_score,
+        reasons: JSON.stringify(projection.reasons),
+        computed_at: new Date()
+      });
+      snapshotRows.push({
+        gameweek_id: gameweekId,
+        player_id: p.id, fixture_id: fix.id,
+        payload: JSON.stringify(projection),
+        taken_at: new Date()
+      });
+      written++;
+    }
+
+    if (projRows.length > 0) {
+      // Bulk INSERT projections — 1 round-trip per fixture instead of N.
       await sql`
-        INSERT INTO projections (
-          player_id, fixture_id, gameweek_id,
-          xpts_total, xpts_appearance, xpts_goals, xpts_assists, xpts_clean_sheet,
-          xpts_bonus, xpts_saves, xpts_pen_save, xpts_cards, xpts_concede, xpts_owngoal,
-          floor, ceiling, risk_score, confidence_score, reasons, computed_at
-        ) VALUES (
-          ${p.id}, ${fix.id}, ${gameweekId},
-          ${projection.xpts_total}, ${projection.xpts_appearance}, ${projection.xpts_goals},
-          ${projection.xpts_assists}, ${projection.xpts_clean_sheet}, ${projection.xpts_bonus},
-          ${projection.xpts_saves}, ${projection.xpts_pen_save}, ${projection.xpts_cards},
-          ${projection.xpts_concede}, ${projection.xpts_owngoal},
-          ${projection.floor}, ${projection.ceiling}, ${projection.risk_score},
-          ${projection.confidence_score}, ${json(projection.reasons)}, now()
-        )
+        INSERT INTO projections ${(sql as any)(projRows,
+          'player_id', 'fixture_id', 'gameweek_id',
+          'xpts_total', 'xpts_appearance', 'xpts_goals', 'xpts_assists', 'xpts_clean_sheet',
+          'xpts_bonus', 'xpts_saves', 'xpts_pen_save', 'xpts_cards', 'xpts_concede', 'xpts_owngoal',
+          'floor', 'ceiling', 'risk_score', 'confidence_score', 'reasons', 'computed_at')}
         ON CONFLICT (player_id, fixture_id) DO UPDATE SET
           xpts_total = EXCLUDED.xpts_total,
           xpts_appearance = EXCLUDED.xpts_appearance,
@@ -369,12 +394,10 @@ export async function recomputeProjectionsForGameweek(gameweekId: number) {
           reasons = EXCLUDED.reasons,
           computed_at = now()
       `;
-
       await sql`
-        INSERT INTO projection_snapshots (gameweek_id, player_id, fixture_id, payload, taken_at)
-        VALUES (${gameweekId}, ${p.id}, ${fix.id}, ${json(projection)}, now())
+        INSERT INTO projection_snapshots ${(sql as any)(snapshotRows,
+          'gameweek_id', 'player_id', 'fixture_id', 'payload', 'taken_at')}
       `;
-      written++;
     }
   }
   return written;

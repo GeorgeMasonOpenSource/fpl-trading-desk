@@ -17,7 +17,7 @@
 import { fpl } from '../src/lib/fpl/client';
 import {
   upsertBootstrap, upsertFixtures, upsertManagerEntry, upsertManagerPicks,
-  upsertClassicLeague, upsertEventLive
+  upsertClassicLeague, upsertEventLive, upsertManagerLeagues
 } from '../src/lib/fpl/normalise';
 import { sql } from '../src/lib/db/client';
 import { recomputeBaselines } from '../src/lib/projections/baseline';
@@ -50,6 +50,9 @@ async function main() {
     console.log(`→ manager ${managerId}`);
     const entry = await fpl.managerEntry(managerId);
     await upsertManagerEntry(entry, 1);
+    await upsertManagerLeagues(managerId, entry);
+    const leagueCount = (entry.leagues?.classic?.length ?? 0) + (entry.leagues?.h2h?.length ?? 0);
+    console.log(`  found ${leagueCount} leagues`);
 
     // Picks for the current (in-progress) GW
     if (currentGw) {

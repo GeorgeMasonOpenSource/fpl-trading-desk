@@ -14,7 +14,7 @@ import { revalidatePath, revalidateTag } from 'next/cache';
 import { fpl } from '@/lib/fpl/client';
 import { sql } from '@/lib/db/client';
 import {
-  upsertManagerEntry, upsertManagerPicks, upsertClassicLeague
+  upsertManagerEntry, upsertManagerPicks, upsertClassicLeague, upsertManagerLeagues
 } from '@/lib/fpl/normalise';
 import { setManagerId, setLeagueId, getManagerId, getLeagueId } from '@/lib/session';
 
@@ -65,6 +65,10 @@ export async function connectManager(formData: FormData): Promise<ConnectResult>
       ft = h.event_transfers > 0 ? 1 : Math.min(5, ft + 1);
     }
     await upsertManagerEntry(entry, ft);
+    // Persist every league the user belongs to, so the UI can list them
+    // without re-fetching. Standings still pulled on demand for the one
+    // they're actively monitoring.
+    await upsertManagerLeagues(managerId, entry);
 
     // 3. Pull picks for both the current (in-progress) and next (planning)
     //    gameweeks. If next-GW picks aren't yet exposed by FPL (lineup not
