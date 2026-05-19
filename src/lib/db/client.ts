@@ -23,14 +23,14 @@ function makeClient() {
     prepare: false,          // Neon pooled mode doesn't support prepared statements
     // Postgres NUMERIC/DECIMAL types default to strings (because they can be
     // arbitrary precision). All our NUMERIC columns are small probabilities or
-    // points — safe to coerce to JS Number so downstream arithmetic and
-    // `.toFixed()` calls work without manual Number() wrapping everywhere.
+    // points — safe to coerce to JS Number on read. On write, postgres.js
+    // expects a string for NUMERIC, so we stringify.
     types: {
-      bigint: postgres.BigInt, // keep BIGINT as BigInt
       numeric: {
-        to:     0,             // pg type lookup (oid 1700) — `to` unused for parsing
-        from:   [1700],        // NUMERIC oid
-        serialize: (x: unknown) => x as any,
+        to:     1700,
+        from:   [1700],
+        serialize: (x: number | string | null | undefined) =>
+          x == null ? null as any : typeof x === 'string' ? x : String(x),
         parse:  (x: string) => Number(x)
       }
     }
