@@ -11,6 +11,10 @@ import { getManagerId, getLeagueId } from '@/lib/session';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
+// Server actions originating from this page (connectManager etc.) inherit this
+// timeout. Vercel Hobby caps at 60s; we set the max so the first connect has
+// breathing room even on cold starts.
+export const maxDuration = 60;
 
 export default async function DashboardPage() {
   const managerId = getManagerId();

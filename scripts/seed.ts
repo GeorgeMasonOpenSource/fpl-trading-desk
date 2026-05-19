@@ -1,16 +1,17 @@
 #!/usr/bin/env tsx
 /**
  * Seed: run the FPL bootstrap + fixtures + (optional) manager + league + refresh.
- * Useful for first-time local dev. Idempotent.
+ * Useful for first-time local dev. Idempotent. Reads env vars directly from
+ * `process.env` — pass them inline:
+ *   DATABASE_URL=... FPL_MANAGER_ID=... npm run db:seed
  */
-import 'dotenv/config';
-import { fpl } from '../src/lib/fpl/client.js';
-import { upsertBootstrap, upsertFixtures, upsertManagerEntry, upsertManagerPicks, upsertClassicLeague } from '../src/lib/fpl/normalise.js';
-import { sql } from '../src/lib/db/client.js';
-import { recomputeBaselines } from '../src/lib/projections/baseline.js';
-import { recomputeTeamStrengths } from '../src/lib/projections/team-strength.js';
-import { recomputeMinutesForGameweek } from '../src/lib/minutes/engine.js';
-import { recomputeProjectionsForGameweek } from '../src/lib/projections/engine.js';
+import { fpl } from '../src/lib/fpl/client';
+import { upsertBootstrap, upsertFixtures, upsertManagerEntry, upsertManagerPicks, upsertClassicLeague } from '../src/lib/fpl/normalise';
+import { sql } from '../src/lib/db/client';
+import { recomputeBaselines } from '../src/lib/projections/baseline';
+import { recomputeTeamStrengths } from '../src/lib/projections/team-strength';
+import { recomputeMinutesForGameweek } from '../src/lib/minutes/engine';
+import { recomputeProjectionsForGameweek } from '../src/lib/projections/engine';
 
 async function main() {
   console.log('→ bootstrap');

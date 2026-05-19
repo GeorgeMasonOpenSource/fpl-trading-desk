@@ -14,13 +14,8 @@ import { revalidatePath } from 'next/cache';
 import { fpl } from '@/lib/fpl/client';
 import { sql } from '@/lib/db/client';
 import {
-  upsertBootstrap, upsertFixtures, upsertManagerEntry, upsertManagerPicks,
-  upsertClassicLeague
+  upsertManagerEntry, upsertManagerPicks, upsertClassicLeague
 } from '@/lib/fpl/normalise';
-import { recomputeTeamStrengths } from '@/lib/projections/team-strength';
-import { recomputeBaselines } from '@/lib/projections/baseline';
-import { recomputeMinutesForGameweek } from '@/lib/minutes/engine';
-import { recomputeProjectionsForGameweek } from '@/lib/projections/engine';
 import { setManagerId, setLeagueId, getManagerId, getLeagueId } from '@/lib/session';
 
 export interface ConnectResult {
@@ -35,7 +30,14 @@ export interface ConnectResult {
   };
 }
 
-/** Hit the FPL manager endpoint to confirm the ID is real, then ingest everything. */
+/** Hit the FPL manager endpoint to confirm the ID is real, then ingest the
+ *  light per-user bits. Heavy ingestion (bootstrap, fixtures, model recompute)
+ *  is intentionally NOT done here — it's far too slow for Vercel's 10s server
+ *  action timeout and is owned by the GitHub Actions cron / local seed script.
+ *  If the bootstrap-derived tables (teams/players/fixtures) are empty when
+ *  connect runs, we still save the manager cookie + picks so the user can see
+ *  their squad immediately; the dashboard surfaces a "models warming up" hint.
+ */
 export async function connectManager(formData: FormData): Promise<ConnectResult> {
   const managerRaw = String(formData.get('managerId') ?? '').trim();
   const leagueRaw = String(formData.get('leagueId') ?? '').trim();
@@ -48,22 +50,13 @@ export async function connectManager(formData: FormData): Promise<ConnectResult>
     return { ok: false, error: 'League ID must be a positive integer (or blank).' };
   }
 
-  // 1. Validate manager via FPL
-  let managerName: string;
   try {
+    // 1. Validate manager via FPL (fast: single endpoint, ~300ms)
     const entry = await fpl.managerEntry(managerId);
-    managerName = entry.name;
-    // Persist cookies before doing anything heavier so the user gets immediate feedback.
     setManagerId(managerId);
     setLeagueId(leagueId);
 
-    // Refresh bootstrap + fixtures so we have current data to project against.
-    const bs = await fpl.bootstrap();
-    await upsertBootstrap(bs);
-    const fixtures = await fpl.fixtures();
-    await upsertFixtures(fixtures);
-
-    // Free transfer count from history
+    // 2. Free transfer count from history (fast)
     const history = (await fpl.managerHistory(managerId)) as {
       current: Array<{ event_transfers: number }>;
     };
@@ -73,7 +66,9 @@ export async function connectManager(formData: FormData): Promise<ConnectResult>
     }
     await upsertManagerEntry(entry, ft);
 
-    // Current GW + picks
+    // 3. Current GW + picks — needs gameweeks table populated; if not (fresh
+    //    deploy before first cron run), skip silently and the dashboard hint
+    //    will tell the user to wait.
     const gwRows = await sql<Array<{ id: number }>>`
       SELECT id FROM gameweeks WHERE is_current = TRUE UNION ALL
       SELECT id FROM gameweeks WHERE is_next = TRUE LIMIT 1
@@ -85,21 +80,12 @@ export async function connectManager(formData: FormData): Promise<ConnectResult>
     }
 
     let leagueLabel: string | undefined;
-    if (leagueId) {
+    if (leagueId && gw != null) {
       const league = await fpl.classicLeague(leagueId);
-      await upsertClassicLeague(league, gw ?? 0);
+      await upsertClassicLeague(league, gw);
       leagueLabel = league.league.name;
     }
 
-    // Recompute the models so the dashboard isn't empty.
-    await recomputeTeamStrengths();
-    await recomputeBaselines();
-    if (gw != null) {
-      await recomputeMinutesForGameweek(gw);
-      await recomputeProjectionsForGameweek(gw);
-    }
-
-    // Refresh every page that depends on session state.
     revalidatePath('/', 'layout');
 
     return {
@@ -108,10 +94,8 @@ export async function connectManager(formData: FormData): Promise<ConnectResult>
       leagueId,
       gameweek: gw,
       ingested: {
-        teams: bs.teams.length,
-        players: bs.elements.length,
-        fixtures: fixtures.length,
-        manager: managerName,
+        teams: 0, players: 0, fixtures: 0,
+        manager: entry.name,
         league: leagueLabel
       }
     };
@@ -156,17 +140,22 @@ export async function refreshNowForm() {
   if (!r.ok) console.error('[refreshNow]', r.error);
 }
 
-/** Pull fresh manager + league picks + recompute models. Quick path. */
+/**
+ *  Per-user refresh: re-fetch this manager's entry + current GW picks + the
+ *  league snapshot. Keeps under Vercel Hobby's 10s server-action limit.
+ *
+ *  The heavy ingest (bootstrap, fixtures, team-strength + minutes +
+ *  projection recompute) is owned by GitHub Actions (`/.github/workflows`)
+ *  which POST to `/api/refresh` with a 60s `maxDuration` and the
+ *  `INGEST_SECRET`. We deliberately do not invoke that path from a server
+ *  action because the cumulative latency of sequential INSERTs from
+ *  Vercel→Neon would always exceed 10s.
+ */
 export async function refreshNow(): Promise<ConnectResult> {
   const managerId = getManagerId();
   if (!managerId) return { ok: false, error: 'No manager connected.' };
   const leagueId = getLeagueId();
   try {
-    // Light bootstrap to catch price changes / status flags
-    const bs = await fpl.bootstrap();
-    await upsertBootstrap(bs);
-    await upsertFixtures(await fpl.fixtures());
-
     const entry = await fpl.managerEntry(managerId);
     const history = (await fpl.managerHistory(managerId)) as {
       current: Array<{ event_transfers: number }>;
@@ -186,14 +175,9 @@ export async function refreshNow(): Promise<ConnectResult> {
       const picks = await fpl.managerPicks(managerId, gw);
       await upsertManagerPicks(managerId, gw, picks);
     }
-    if (leagueId) {
+    if (leagueId && gw != null) {
       const league = await fpl.classicLeague(leagueId);
-      await upsertClassicLeague(league, gw ?? 0);
-    }
-    await recomputeTeamStrengths();
-    if (gw != null) {
-      await recomputeMinutesForGameweek(gw);
-      await recomputeProjectionsForGameweek(gw);
+      await upsertClassicLeague(league, gw);
     }
     revalidatePath('/', 'layout');
     return { ok: true, managerId, leagueId, gameweek: gw };
