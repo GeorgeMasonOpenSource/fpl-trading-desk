@@ -20,7 +20,20 @@ function makeClient() {
     max: 1,                  // serverless friendly
     idle_timeout: 20,
     connect_timeout: 10,
-    prepare: false           // Neon pooled mode doesn't support prepared statements
+    prepare: false,          // Neon pooled mode doesn't support prepared statements
+    // Postgres NUMERIC/DECIMAL types default to strings (because they can be
+    // arbitrary precision). All our NUMERIC columns are small probabilities or
+    // points — safe to coerce to JS Number so downstream arithmetic and
+    // `.toFixed()` calls work without manual Number() wrapping everywhere.
+    types: {
+      bigint: postgres.BigInt, // keep BIGINT as BigInt
+      numeric: {
+        to:     0,             // pg type lookup (oid 1700) — `to` unused for parsing
+        from:   [1700],        // NUMERIC oid
+        serialize: (x: unknown) => x as any,
+        parse:  (x: string) => Number(x)
+      }
+    }
   });
 }
 
