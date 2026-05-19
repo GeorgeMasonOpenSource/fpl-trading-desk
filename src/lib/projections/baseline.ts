@@ -37,6 +37,14 @@ export async function recomputeBaselines() {
       LIMIT 4
     `;
 
+    // postgres returns NUMERIC columns as strings. Coerce defensively so the
+    // arithmetic below produces numbers, not stringly-concatenated nonsense.
+    const dFwdXg  = Number(defaults.fwd_xg);
+    const dMidXg  = Number(defaults.mid_xg);
+    const dMidXa  = Number(defaults.mid_xa);
+    const dDefXa  = Number(defaults.def_xa);
+    const dGkpSav = Number(defaults.gkp_saves);
+
     let totalW = 0;
     let xgPer90 = 0, xaPer90 = 0, bonusPer90 = 0, csShare = 0;
     let yel90 = 0, red90 = 0;
@@ -44,20 +52,20 @@ export async function recomputeBaselines() {
     for (let i = 0; i < seasons.length; i++) {
       const w = Math.pow(0.5, i);
       const s = seasons[i];
-      const mins = Math.max(1, s.minutes);
-      xgPer90    += w * (s.expected_goals    * 90 / mins);
-      xaPer90    += w * (s.expected_assists  * 90 / mins);
-      bonusPer90 += w * (s.bonus             * 90 / mins);
-      csShare    += w * (s.clean_sheets      / Math.max(1, mins / 90));
-      yel90      += w * (s.yellow_cards      * 90 / mins);
-      red90      += w * (s.red_cards         * 90 / mins);
+      const mins = Math.max(1, Number(s.minutes));
+      xgPer90    += w * (Number(s.expected_goals)    * 90 / mins);
+      xaPer90    += w * (Number(s.expected_assists)  * 90 / mins);
+      bonusPer90 += w * (Number(s.bonus)             * 90 / mins);
+      csShare    += w * (Number(s.clean_sheets)      / Math.max(1, mins / 90));
+      yel90      += w * (Number(s.yellow_cards)      * 90 / mins);
+      red90      += w * (Number(s.red_cards)         * 90 / mins);
       totalW += w;
-      sampleMinutes += s.minutes;
+      sampleMinutes += Number(s.minutes);
     }
     if (totalW === 0) {
       // No history — fall back to positional defaults.
-      xgPer90 = p.position === 'FWD' ? defaults.fwd_xg : p.position === 'MID' ? defaults.mid_xg : 0.03;
-      xaPer90 = p.position === 'FWD' ? 0.07 : p.position === 'MID' ? defaults.mid_xa : defaults.def_xa;
+      xgPer90 = p.position === 'FWD' ? dFwdXg : p.position === 'MID' ? dMidXg : 0.03;
+      xaPer90 = p.position === 'FWD' ? 0.07   : p.position === 'MID' ? dMidXa : dDefXa;
       bonusPer90 = 0.20;
       csShare = p.position === 'DEF' || p.position === 'GKP' ? 0.30 : 0.10;
       totalW = 1;
@@ -77,7 +85,7 @@ export async function recomputeBaselines() {
       VALUES (${p.player_id}, 75, 0.7,
               ${xgPer90}, ${xaPer90}, ${xgPer90 + xaPer90},
               ${bonusPer90}, ${csShare}, ${yel90}, ${red90},
-              ${p.position === 'GKP' ? defaults.gkp_saves : 0}, 0,
+              ${p.position === 'GKP' ? dGkpSav : 0}, 0,
               ${sampleMinutes}, now())
       ON CONFLICT (player_id) DO UPDATE SET
         baseline_xg_per_90 = EXCLUDED.baseline_xg_per_90,
