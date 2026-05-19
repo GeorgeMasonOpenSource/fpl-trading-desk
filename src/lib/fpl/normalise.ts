@@ -65,16 +65,16 @@ export async function upsertBootstrap(bs: FplBootstrap) {
     data_checked: e.data_checked,
     average_entry_score: e.average_entry_score ?? null,
     highest_score: e.highest_score ?? null,
-    chip_plays: JSON.stringify(e.chip_plays ?? []),
+    chip_plays: e.chip_plays ?? [],
     most_captained: e.most_captained ?? null,
     most_vice_captained: e.most_vice_captained ?? null,
     most_selected: e.most_selected ?? null,
     most_transferred_in: e.most_transferred_in ?? null,
     top_element: e.top_element ?? null,
-    top_element_info: e.top_element_info ? JSON.stringify(e.top_element_info) : null
+    top_element_info: e.top_element_info ?? null
   }));
   await sql`
-    INSERT INTO gameweeks ${sql(eventRows,
+    INSERT INTO gameweeks ${(sql as any)(eventRows,
       'id', 'name', 'deadline_time', 'is_current', 'is_next', 'is_previous',
       'finished', 'data_checked', 'average_entry_score', 'highest_score',
       'chip_plays', 'most_captained', 'most_vice_captained', 'most_selected',
@@ -173,11 +173,11 @@ export async function upsertFixtures(rows: FplFixture[]) {
     finished: f.finished,
     started: f.started,
     minutes: f.minutes,
-    stats: JSON.stringify(f.stats ?? []),
+    stats: f.stats ?? [],
     updated_at: new Date()
   }));
   await sql`
-    INSERT INTO fixtures ${sql(records,
+    INSERT INTO fixtures ${(sql as any)(records,
       'id', 'gameweek_id', 'kickoff_time', 'team_h', 'team_a',
       'team_h_difficulty', 'team_a_difficulty', 'team_h_score', 'team_a_score',
       'finished', 'started', 'minutes', 'stats', 'updated_at')}

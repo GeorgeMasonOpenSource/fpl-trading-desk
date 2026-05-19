@@ -359,7 +359,10 @@ export async function recomputeMinutesForGameweek(gw: number) {
         rotation_resistance: distribution.rotationResistance,
         minutes_confidence: distribution.confidence,
         reliability_index: distribution.reliability,
-        reasons: JSON.stringify(distribution.reasons),
+        // Pass the array directly. postgres.js detects the JSONB column type
+        // and serializes once. Stringifying here causes a double-encode and
+        // corrupts the stored value as a JSON-string of a JSON-string.
+        reasons: distribution.reasons,
         computed_at: new Date()
       });
     }

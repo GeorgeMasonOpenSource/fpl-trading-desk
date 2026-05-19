@@ -355,13 +355,14 @@ export async function recomputeProjectionsForGameweek(gameweekId: number) {
         ceiling: projection.ceiling,
         risk_score: projection.risk_score,
         confidence_score: projection.confidence_score,
-        reasons: JSON.stringify(projection.reasons),
+        // Plain object/array for JSONB columns — postgres.js handles encoding.
+        reasons: projection.reasons,
         computed_at: new Date()
       });
       snapshotRows.push({
         gameweek_id: gameweekId,
         player_id: p.id, fixture_id: fix.id,
-        payload: JSON.stringify(projection),
+        payload: projection,
         taken_at: new Date()
       });
       written++;
