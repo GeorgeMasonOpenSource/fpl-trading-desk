@@ -11,6 +11,7 @@ export const metadata = {
 
 const NAV = [
   { href: '/',                   label: 'Dashboard' },
+  { href: '/pitch',              label: 'Pitch view' },
   { href: '/my-team',            label: 'My Team' },
   { href: '/transfer-planner',   label: 'Transfer Planner' },
   { href: '/captaincy',          label: 'Captaincy' },

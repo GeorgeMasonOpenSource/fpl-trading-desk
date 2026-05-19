@@ -263,10 +263,13 @@ export async function recomputeProjectionsForGameweek(gameweekId: number) {
         COALESCE(mp.early_sub_risk, 0)           AS early_sub_risk,
         COALESCE(mp.expected_minutes, 0)         AS expected_minutes,
         COALESCE(mp.minutes_confidence, 0.5)     AS minutes_confidence,
-        COALESCE(c.minutes, 0)                   AS current_minutes,
-        COALESCE(c.xg, 0)                        AS current_xg,
-        COALESCE(c.xa, 0)                        AS current_xa,
-        COALESCE(c.bonus, 0)                     AS current_bonus
+        -- Current-season evidence: prefer the season totals stored on players
+        -- (sourced from FPL bootstrap-static, covers the entire PL season).
+        -- Fall back to any per-GW history rows we've ingested live.
+        GREATEST(COALESCE(p.season_minutes, 0), COALESCE(c.minutes, 0))::numeric AS current_minutes,
+        GREATEST(COALESCE(p.season_xg, 0), COALESCE(c.xg, 0))::numeric           AS current_xg,
+        GREATEST(COALESCE(p.season_xa, 0), COALESCE(c.xa, 0))::numeric           AS current_xa,
+        GREATEST(COALESCE(p.season_bonus, 0), COALESCE(c.bonus, 0))::numeric     AS current_bonus
       FROM players p
       LEFT JOIN player_baselines b ON b.player_id = p.id
       LEFT JOIN minutes_projections mp

@@ -99,6 +99,8 @@ export async function upsertBootstrap(bs: FplBootstrap) {
   `;
 
   // Players — bulk insert + capture status snapshots in one go.
+  // Includes per-season totals straight from bootstrap so the engines have
+  // proper season-long evidence (rather than only the in-progress GW).
   const playerRows = bs.elements
     .filter(p => POSITION_MAP[p.element_type])
     .map(p => ({
@@ -118,6 +120,18 @@ export async function upsertBootstrap(bs: FplBootstrap) {
       selected_by_percent: Number(p.selected_by_percent) || 0,
       transfers_in_event: p.transfers_in_event,
       transfers_out_event: p.transfers_out_event,
+      season_minutes: (p as any).minutes ?? 0,
+      season_starts: (p as any).starts ?? 0,
+      season_goals: (p as any).goals_scored ?? 0,
+      season_assists: (p as any).assists ?? 0,
+      season_xg: Number((p as any).expected_goals) || 0,
+      season_xa: Number((p as any).expected_assists) || 0,
+      season_xgi: Number((p as any).expected_goal_involvements) || 0,
+      season_xgc: Number((p as any).expected_goals_conceded) || 0,
+      season_bonus: (p as any).bonus ?? 0,
+      season_yellow_cards: (p as any).yellow_cards ?? 0,
+      season_red_cards: (p as any).red_cards ?? 0,
+      season_saves: (p as any).saves ?? 0,
       updated_at: new Date()
     }));
   await sql`
@@ -125,7 +139,11 @@ export async function upsertBootstrap(bs: FplBootstrap) {
       'id', 'code', 'team_id', 'position', 'first_name', 'second_name', 'web_name',
       'now_cost', 'status', 'news', 'news_added_at',
       'chance_of_playing_next_round', 'chance_of_playing_this_round',
-      'selected_by_percent', 'transfers_in_event', 'transfers_out_event', 'updated_at')}
+      'selected_by_percent', 'transfers_in_event', 'transfers_out_event',
+      'season_minutes', 'season_starts', 'season_goals', 'season_assists',
+      'season_xg', 'season_xa', 'season_xgi', 'season_xgc',
+      'season_bonus', 'season_yellow_cards', 'season_red_cards', 'season_saves',
+      'updated_at')}
     ON CONFLICT (id) DO UPDATE SET
       team_id = EXCLUDED.team_id,
       position = EXCLUDED.position,
@@ -141,6 +159,18 @@ export async function upsertBootstrap(bs: FplBootstrap) {
       selected_by_percent = EXCLUDED.selected_by_percent,
       transfers_in_event = EXCLUDED.transfers_in_event,
       transfers_out_event = EXCLUDED.transfers_out_event,
+      season_minutes = EXCLUDED.season_minutes,
+      season_starts = EXCLUDED.season_starts,
+      season_goals = EXCLUDED.season_goals,
+      season_assists = EXCLUDED.season_assists,
+      season_xg = EXCLUDED.season_xg,
+      season_xa = EXCLUDED.season_xa,
+      season_xgi = EXCLUDED.season_xgi,
+      season_xgc = EXCLUDED.season_xgc,
+      season_bonus = EXCLUDED.season_bonus,
+      season_yellow_cards = EXCLUDED.season_yellow_cards,
+      season_red_cards = EXCLUDED.season_red_cards,
+      season_saves = EXCLUDED.season_saves,
       updated_at = now()
   `;
 

@@ -232,17 +232,34 @@ export async function recomputeMinutesForGameweek(gw: number) {
   const teamIds = Array.from(new Set(fixtures.flatMap(f => [f.team_h, f.team_a])));
   if (teamIds.length === 0) return 0;
 
-  // All players on either side, with their status flags.
+  // All players on either side, with their status flags AND season totals from
+  // bootstrap. The season columns are the primary evidence source because
+  // player_gameweek_history only carries the in-progress GW we ingested live.
   const players = await sql<Array<{
     id: number; team_id: number; status: 'a'|'d'|'i'|'n'|'s'|'u';
     chance_of_playing_next_round: number | null;
+    season_minutes: number; season_starts: number;
   }>>`
-    SELECT id, team_id, status, chance_of_playing_next_round
+    SELECT id, team_id, status, chance_of_playing_next_round,
+           season_minutes, season_starts
     FROM players WHERE team_id IN ${sql(teamIds as any)}
   `;
   const playerIds = players.map(p => p.id);
 
-  // Career aggregates per player — single query.
+  // Games played per team — denominator for start/appearance rates.
+  const teamGames = await sql<Array<{ team_id: number; games: number }>>`
+    SELECT t.id AS team_id,
+           COUNT(DISTINCT f.id) FILTER (WHERE f.finished = TRUE)::int AS games
+    FROM teams t
+    LEFT JOIN fixtures f ON (f.team_h = t.id OR f.team_a = t.id)
+    WHERE t.id IN ${sql(teamIds as any)}
+    GROUP BY t.id
+  `;
+  const gamesByTeam = new Map(teamGames.map(t => [t.team_id, Math.max(1, t.games)]));
+
+  // Career aggregates per player from in-database history (best-effort: this
+  // only carries games we've ingested via live event, not the full season).
+  // We blend this with the season totals from `players` above.
   const aggs = playerIds.length === 0 ? [] : await sql<Array<{
     player_id: number; appearances: number; starts: number; ninety: number;
     eligible: number; congestion_starts: number; congestion_eligible: number;
@@ -294,11 +311,28 @@ export async function recomputeMinutesForGameweek(gw: number) {
 
     for (const p of fixturePlayers) {
       const agg = aggByPlayer.get(p.id);
+      // Use the bigger of the two: live-ingested games for this season OR the
+      // team's elapsed gameweek count. Season totals span the full PL year,
+      // so the team's games-played is the right denominator.
+      const eligible = Math.max(agg?.eligible ?? 0, gamesByTeam.get(p.team_id) ?? 0);
+      const seasonStarts = Number(p.season_starts) || 0;
+      const seasonMinutes = Number(p.season_minutes) || 0;
+      // Approximate appearances: starts plus any extra minutes appearances
+      // (rough but close — every started match is one appearance, and bench
+      // cameos add ~20 mins each).
+      const approxAppearances = Math.min(
+        eligible,
+        seasonStarts + Math.max(0, Math.round((seasonMinutes - seasonStarts * 65) / 25))
+      );
+      const approxNinety = seasonStarts === 0
+        ? 0
+        : Math.min(seasonStarts, Math.round(seasonMinutes / 90));
+
       const reliabilityInput = {
-        appearancesAvailable: agg?.appearances ?? 0,
-        totalAvailable:       agg?.eligible ?? 0,
-        startsAvailable:      agg?.starts ?? 0,
-        ninetyMinutesPlayed:  agg?.ninety ?? 0,
+        appearancesAvailable: Math.max(approxAppearances, agg?.appearances ?? 0),
+        totalAvailable:       eligible,
+        startsAvailable:      Math.max(seasonStarts, agg?.starts ?? 0),
+        ninetyMinutesPlayed:  Math.max(approxNinety, agg?.ninety ?? 0),
         earlySubOffCount:     agg?.early_off ?? 0,
         congestionStarts:     agg?.congestion_starts ?? 0,
         congestionEligible:   agg?.congestion_eligible ?? 0
@@ -322,9 +356,11 @@ export async function recomputeMinutesForGameweek(gw: number) {
       const manualCap = playerOv.find(o => o.kind === 'minutes_cap')?.value?.cap as number | undefined;
       const manualAbsence = playerOv.some(o => o.kind === 'availability' && o.value?.expected === 'out');
 
-      const startRate     = agg && agg.eligible ? agg.starts / agg.eligible : 0;
-      const ninetyRate    = agg && agg.starts ? agg.ninety / agg.starts : 0;
-      const appearanceRate = agg && agg.eligible ? agg.appearances / agg.eligible : 0;
+      const startRate      = eligible > 0 ? reliabilityInput.startsAvailable / eligible : 0;
+      const ninetyRate     = reliabilityInput.startsAvailable > 0
+        ? reliabilityInput.ninetyMinutesPlayed / reliabilityInput.startsAvailable
+        : 0;
+      const appearanceRate = eligible > 0 ? reliabilityInput.appearancesAvailable / eligible : 0;
 
       const distribution = projectMinutes({
         playerId: p.id, fixtureId: fix.id,
