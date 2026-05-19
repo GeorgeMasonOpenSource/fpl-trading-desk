@@ -31,6 +31,16 @@ export interface MinutesInputs {
   currentSeasonStartRate: number;   // 0..1 from this season's lineup observations
   currentSeasonNinetyRate: number;  // 0..1
   currentSeasonAppearanceRate: number;
+  // Recency-weighted rates over the last few played fixtures (decay 0.6 per
+  // step). When recentStartSample is high (≥ ~2.3, i.e. 5 played fixtures in
+  // the window), recent rates dominate season rates — so a player who's been
+  // benched in the last 3 weeks (Havertz over Gyökeres, Wilson hit-and-miss,
+  // Cherki dropped) sees their start prob collapse in real time instead of
+  // riding their season-long start rate.
+  recentStartRate?: number;
+  recentNinetyRate?: number;
+  recentAppearanceRate?: number;
+  recentStartSample?: number;       // 0..~2.31 — effective sample size after decay
   fplStatus: 'a' | 'd' | 'i' | 'n' | 's' | 'u';
   chanceOfPlayingNext: number | null; // 0..100 from FPL
   // Context for this specific fixture:
@@ -90,10 +100,25 @@ export function projectMinutes(input: MinutesInputs): MinutesDistribution {
   }
 
   // 2. Start probability (given available) -----------------------------------
-  // Start with current-season start rate, blend with reliability.
+  // First, blend season start rate with the recency-weighted start rate so a
+  // player who's been recently dropped collapses fast. recencyWeight ramps
+  // from 0 (no recent data) to ~1 (5+ played fixtures in window).
+  const recencyWeight = clamp01((input.recentStartSample ?? 0) / 2.0);
+  const blendedStartRate =
+    recencyWeight * (input.recentStartRate ?? input.currentSeasonStartRate) +
+    (1 - recencyWeight) * input.currentSeasonStartRate;
+  if (recencyWeight > 0.3 && input.recentStartRate != null &&
+      Math.abs(input.recentStartRate - input.currentSeasonStartRate) > 0.20) {
+    reasons.push({
+      kind: 'recency_shift',
+      weight: input.recentStartRate - input.currentSeasonStartRate,
+      detail: `recent starts ${(input.recentStartRate*100).toFixed(0)}% vs season ${(input.currentSeasonStartRate*100).toFixed(0)}%`
+    });
+  }
+
   // Reliability acts as a stabiliser for thin samples.
   let startGivenAvailable =
-    0.70 * input.currentSeasonStartRate +
+    0.70 * blendedStartRate +
     0.30 * input.reliability;
 
   // Competitor pressure penalises the start prob.
@@ -145,9 +170,12 @@ export function projectMinutes(input: MinutesInputs): MinutesDistribution {
   const startProb = clamp01(startGivenAvailable * (1 - injuryAbsenceProb));
 
   // 3. Once starting: distribution over how many minutes ----------------------
-  // 90-min rate, conditional on starting.
+  // 90-min rate, conditional on starting — blended with recent observation.
+  const blendedNinetyRate =
+    recencyWeight * (input.recentNinetyRate ?? input.currentSeasonNinetyRate) +
+    (1 - recencyWeight) * input.currentSeasonNinetyRate;
   const ninetyGivenStart = clamp01(
-    0.70 * input.currentSeasonNinetyRate +
+    0.70 * blendedNinetyRate +
     0.30 * input.reliability -
     (input.returnFromInjuryMatch === 1 ? 0.6 : 0) -
     (input.returnFromInjuryMatch === 2 ? 0.3 : 0)
@@ -157,9 +185,12 @@ export function projectMinutes(input: MinutesInputs): MinutesDistribution {
   const startedButEarlyOff = clamp01(1 - ninetyGivenStart - sixtyToEightyNineGivenStart);
 
   // 4. Sub appearances (given not starting & available) ----------------------
+  const blendedAppearanceRate =
+    recencyWeight * (input.recentAppearanceRate ?? input.currentSeasonAppearanceRate) +
+    (1 - recencyWeight) * input.currentSeasonAppearanceRate;
   const subGivenNotStartingAvail = clamp01(
-    0.6 * input.currentSeasonAppearanceRate -
-    0.4 * (input.currentSeasonStartRate)
+    0.6 * blendedAppearanceRate -
+    0.4 * blendedStartRate
   );
 
   // 5. Compose distribution ---------------------------------------------------
@@ -281,6 +312,32 @@ export async function recomputeMinutesForGameweek(gw: number) {
   `;
   const aggByPlayer = new Map(aggs.map(a => [a.player_id, a]));
 
+  // Recent per-match rows per player — the last 5 played fixtures. Powers
+  // recency-weighted start/ninety/appearance rates so a player who was nailed
+  // earlier in the season but recently benched gets a falling startProb, not
+  // his season average.
+  const recentMatchRows = playerIds.length === 0 ? [] : await sql<Array<{
+    player_id: number; gameweek_id: number;
+    minutes: number; starts: number;
+  }>>`
+    SELECT player_id, gameweek_id, minutes, starts FROM (
+      SELECT pgh.player_id, pgh.gameweek_id, pgh.minutes, pgh.starts,
+             ROW_NUMBER() OVER (PARTITION BY pgh.player_id ORDER BY pgh.gameweek_id DESC) AS rn
+      FROM player_gameweek_history pgh
+      JOIN fixtures f ON f.id = pgh.fixture_id
+      WHERE f.finished = TRUE
+        AND pgh.player_id IN ${sql(playerIds as any)}
+    ) sub
+    WHERE rn <= 5
+    ORDER BY player_id, gameweek_id DESC
+  `;
+  const recentByPlayer = new Map<number, Array<{ minutes: number; starts: number }>>();
+  for (const r of recentMatchRows) {
+    const arr = recentByPlayer.get(r.player_id) ?? [];
+    arr.push({ minutes: Number(r.minutes), starts: Number(r.starts) });
+    recentByPlayer.set(r.player_id, arr);
+  }
+
   // Manual overrides for these players — single query.
   const overrides = playerIds.length === 0 ? [] : await sql<Array<{
     scope_id: number; kind: string; value: any;
@@ -362,12 +419,36 @@ export async function recomputeMinutesForGameweek(gw: number) {
         : 0;
       const appearanceRate = eligible > 0 ? reliabilityInput.appearancesAvailable / eligible : 0;
 
+      // Recency-weighted rates over the last 5 played fixtures. Decay 0.6
+      // per step → weights [1.0, 0.6, 0.36, 0.22, 0.13], effN ≤ 2.31.
+      const recent = recentByPlayer.get(p.id) ?? [];
+      let rN = 0, rS = 0, rA = 0, rNine = 0, rStartedAcc = 0;
+      let w = 1;
+      for (const m of recent) {
+        const started = m.starts > 0 ? 1 : 0;
+        const appeared = m.minutes > 0 ? 1 : 0;
+        const ninety = m.minutes >= 90 ? 1 : 0;
+        rS += w * started;
+        rA += w * appeared;
+        if (started) {
+          rNine += w * ninety;
+          rStartedAcc += w;
+        }
+        rN += w;
+        w *= 0.6;
+      }
+      const recentStartRate      = rN > 0 ? rS / rN : undefined;
+      const recentAppearanceRate = rN > 0 ? rA / rN : undefined;
+      const recentNinetyRate     = rStartedAcc > 0 ? rNine / rStartedAcc : undefined;
+
       const distribution = projectMinutes({
         playerId: p.id, fixtureId: fix.id,
         reliability, rotationResistance,
         currentSeasonStartRate: startRate,
         currentSeasonNinetyRate: ninetyRate,
         currentSeasonAppearanceRate: appearanceRate,
+        recentStartRate, recentNinetyRate, recentAppearanceRate,
+        recentStartSample: rN,
         fplStatus: p.status,
         chanceOfPlayingNext: p.chance_of_playing_next_round,
         isPostEuropeanFixture: postEu,
