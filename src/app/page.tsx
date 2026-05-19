@@ -4,17 +4,18 @@ import { RecommendationCard } from '@/components/RecommendationCard';
 import { StaleDataWarning } from '@/components/StaleDataWarning';
 import { PlayerCard, PlayerCardData } from '@/components/PlayerCard';
 import { SetupCard } from '@/components/SetupCard';
-import { currentGameweek, lastIngestAt, managerSummary, squadForGameweek } from '@/lib/db/queries';
+import { getGameweeks, lastIngestAt, managerSummary, squadForGameweek, livePoints } from '@/lib/db/queries';
 import { compareTransferScenarios } from '@/lib/transfers/optimiser';
 import { rankCaptains } from '@/lib/captaincy/engine';
 import { getManagerId, getLeagueId } from '@/lib/session';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
-// Server actions originating from this page (connectManager etc.) inherit this
-// timeout. Vercel Hobby caps at 60s; we set the max so the first connect has
-// breathing room even on cold starts.
 export const maxDuration = 60;
+// Page-level ISR: even when called dynamically, the cached helpers below
+// short-circuit most queries. This is the upper bound on how stale the page
+// can be without revalidation.
+export const revalidate = 60;
 
 export default async function DashboardPage() {
   const managerId = getManagerId();
@@ -22,37 +23,23 @@ export default async function DashboardPage() {
   const evThreshold = Number(process.env.EV_TRANSFER_THRESHOLD ?? 0.6);
   const hitThreshold = Number(process.env.EV_HIT_THRESHOLD ?? 1.5);
 
-  const gw = await currentGameweek();
+  const { current: liveGw, next: planGw, planning } = await getGameweeks();
   const ingest = await lastIngestAt();
 
-  // Not connected — surface the setup card.
   if (!managerId) {
     return (
       <div className="space-y-6">
         <header>
           <div className="text-xs uppercase tracking-widest text-ink-dim">Dashboard</div>
           <h1 className="text-2xl font-semibold">Welcome to the Trading Desk</h1>
-          <p className="text-sm text-ink-muted mt-1">
-            Connect your FPL team to price your next move.
-          </p>
+          <p className="text-sm text-ink-muted mt-1">Connect your FPL team to price your next move.</p>
         </header>
         <SetupCard prefillManager={null} prefillLeague={null} />
-        <Card title="What you'll get the moment you connect">
-          <ul className="text-sm text-ink-muted space-y-1.5 list-disc list-inside marker:text-ink-dim">
-            <li>Your full squad with expected minutes distribution and xPts breakdown.</li>
-            <li>Transfer routes (do-nothing, roll, ft1, ft2, -4, -8, wildcard) priced over 1/3/6/8 GW horizons.</li>
-            <li>Captaincy ranking with safe / aggressive / mini-league / triple-captain buckets.</li>
-            <li>Chip value timeline for WC / FH / BB / TC.</li>
-            <li>Mini-league war room: threats, helpers, captain differences, point-swing events.</li>
-            <li>Manual factual overrides whenever you have news the model doesn't.</li>
-          </ul>
-        </Card>
       </div>
     );
   }
 
-  // Connected but no current GW yet — DB is empty / migrations only.
-  if (!gw) {
+  if (!planning) {
     return (
       <div className="space-y-6">
         <h1 className="text-2xl font-semibold">Dashboard</h1>
@@ -60,8 +47,7 @@ export default async function DashboardPage() {
         <Card title="No gameweek data yet">
           <p className="text-sm text-ink-muted">
             Hit <span className="font-mono">Refresh now</span> in the bar above
-            to fetch FPL data. If your database is empty, run the migrations
-            first (see README).
+            to fetch FPL data. If your database is empty, run <span className="font-mono">npm run db:seed</span> locally first.
           </p>
         </Card>
       </div>
@@ -69,21 +55,22 @@ export default async function DashboardPage() {
   }
 
   const summary = await managerSummary(managerId);
-  const squad   = await squadForGameweek(managerId, gw.id);
+  const planningSquad = await squadForGameweek(managerId, planning.id);
 
-  // If the user just connected but recompute didn't run for any reason, the
-  // squad may exist but projections won't. Avoid running the optimiser on
-  // empty data — it's a footgun.
-  const hasProjections = squad.some(p => Number(p.xpts_total) > 0);
+  // Live tracking for the in-progress GW (if any). When liveGw is null (early
+  // season or just-finished week), this section is hidden.
+  const live = liveGw ? await livePoints(managerId, liveGw.id) : null;
+
+  const hasProjections = planningSquad.some(p => Number(p.xpts_total) > 0);
   const scenarios = hasProjections
     ? await compareTransferScenarios({
-        managerId, startGameweek: gw.id,
+        managerId, startGameweek: planning.id,
         freeTransfers: summary?.free_transfers ?? 1,
         evThreshold, hitThreshold
       })
     : [];
   const captains = hasProjections
-    ? await rankCaptains(managerId, gw.id, leagueId ?? undefined)
+    ? await rankCaptains(managerId, planning.id, leagueId ?? undefined)
     : null;
 
   const recommendedScenario = scenarios.slice().sort((a, b) => b.ev - a.ev)[0] ?? null;
@@ -94,10 +81,15 @@ export default async function DashboardPage() {
 
   return (
     <div className="space-y-6">
-      <header className="flex items-end justify-between">
+      <header className="flex items-end justify-between flex-wrap gap-3">
         <div>
           <div className="text-xs uppercase tracking-widest text-ink-dim">Dashboard</div>
-          <h1 className="text-2xl font-semibold">{gw.name} · deadline {new Date(gw.deadline).toUTCString()}</h1>
+          <h1 className="text-2xl font-semibold">
+            {liveGw && !liveGw.finished
+              ? <>{liveGw.name} <span className="text-ink-muted text-base font-normal">in progress</span> · planning {planGw?.name ?? planning.name}</>
+              : <>Planning {planning.name} · deadline {new Date(planning.deadline).toUTCString().slice(0, 22)}</>
+            }
+          </h1>
         </div>
         <div className="flex gap-2">
           <Badge tone="blue">Manager {managerId}</Badge>
@@ -108,12 +100,35 @@ export default async function DashboardPage() {
 
       <StaleDataWarning lastIngest={ingest} />
 
+      {live && liveGw && !liveGw.finished && (
+        <Card title={`${liveGw.name} live`} subtitle="Updates every ~5 min during match windows"
+              action={<Badge tone="green">{live.points} pts so far</Badge>}>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm font-mono">
+            <div className="bg-bg-inset rounded-md p-3">
+              <div className="text-2xl text-accent-green">{live.points}</div>
+              <div className="text-[11px] text-ink-dim">Live points</div>
+            </div>
+            <div className="bg-bg-inset rounded-md p-3">
+              <div className="text-2xl">{live.stillToPlay}</div>
+              <div className="text-[11px] text-ink-dim">Still to play</div>
+            </div>
+            <div className="bg-bg-inset rounded-md p-3">
+              <div className="text-2xl">{live.rows.filter(r => r.bonus > 0).reduce((s, r) => s + r.bonus, 0)}</div>
+              <div className="text-[11px] text-ink-dim">Bonus banked</div>
+            </div>
+            <div className="bg-bg-inset rounded-md p-3">
+              <div className="text-2xl">{live.rows.find(r => r.is_captain)?.web_name ?? '—'}</div>
+              <div className="text-[11px] text-ink-dim">Captain</div>
+            </div>
+          </div>
+        </Card>
+      )}
+
       {!hasProjections && (
-        <Card title="Models haven't been computed yet">
+        <Card title="Models warming up">
           <p className="text-sm text-ink-muted">
-            Your squad is loaded but the projection / minutes models haven't
-            run for this gameweek. Click <span className="font-mono">Refresh now</span> in
-            the top bar.
+            Squad loaded but no projections for {planning.name} yet. The model recompute hasn't run for the planning gameweek. Run{' '}
+            <span className="font-mono">npm run db:seed</span> locally with your manager ID, or wait for the daily cron.
           </p>
         </Card>
       )}
@@ -121,11 +136,9 @@ export default async function DashboardPage() {
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
         {recommend && (
           <RecommendationCard d={{
-            title: 'Recommended action',
+            title: `Recommended action · ${planning.name}`,
             verdict: recommend.scenario,
-            ev: recommend.ev,
-            risk: recommend.risk,
-            confidence: recommend.confidence,
+            ev: recommend.ev, risk: recommend.risk, confidence: recommend.confidence,
             reasons: recommend.reasons
           }} />
         )}
@@ -134,8 +147,7 @@ export default async function DashboardPage() {
             title: `Safe captain · ${captains.safe.webName}`,
             verdict: 'captain',
             ev: captains.safe.projection,
-            risk: 1 - captains.safe.startProb,
-            confidence: 0.8,
+            risk: 1 - captains.safe.startProb, confidence: 0.8,
             reasons: captains.safe.reasons
           }} />
         )}
@@ -143,17 +155,15 @@ export default async function DashboardPage() {
           <RecommendationCard d={{
             title: `Aggressive captain · ${captains.aggressive.webName}`,
             verdict: 'captain',
-            ev: captains.aggressive.ceiling,
-            risk: 0.4,
-            confidence: 0.6,
+            ev: captains.aggressive.ceiling, risk: 0.4, confidence: 0.6,
             reasons: ['Highest ceiling among your top 6 projections.']
           }} />
         )}
       </div>
 
-      <Card title="My team — minutes & xPts">
+      <Card title={`My team for ${planning.name} — minutes & xPts`}>
         <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
-          {squad.map(p => {
+          {planningSquad.map(p => {
             const card: PlayerCardData = {
               player_id: p.player_id,
               web_name:  p.web_name,

@@ -10,7 +10,7 @@
  *      immediately
  *   4. revalidates the affected pages
  */
-import { revalidatePath } from 'next/cache';
+import { revalidatePath, revalidateTag } from 'next/cache';
 import { fpl } from '@/lib/fpl/client';
 import { sql } from '@/lib/db/client';
 import {
@@ -86,6 +86,10 @@ export async function connectManager(formData: FormData): Promise<ConnectResult>
       leagueLabel = league.league.name;
     }
 
+    // Invalidate the per-manager caches so the dashboard reads fresh data on
+    // the next paint instead of waiting for the 60s TTL.
+    revalidateTag(`manager:${managerId}`);
+    revalidateTag('gameweeks');
     revalidatePath('/', 'layout');
 
     return {
@@ -179,6 +183,8 @@ export async function refreshNow(): Promise<ConnectResult> {
       const league = await fpl.classicLeague(leagueId);
       await upsertClassicLeague(league, gw);
     }
+    revalidateTag(`manager:${managerId}`);
+    revalidateTag('live');
     revalidatePath('/', 'layout');
     return { ok: true, managerId, leagueId, gameweek: gw };
   } catch (err) {
