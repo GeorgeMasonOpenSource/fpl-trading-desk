@@ -4,6 +4,7 @@ import { PlayerCard, PlayerCardData } from '@/components/PlayerCard';
 import { NotConnected } from '@/components/NotConnected';
 import { currentGameweek, squadForGameweek, managerSummary } from '@/lib/db/queries';
 import { getManagerId } from '@/lib/session';
+import { n, fmt } from '@/lib/util/fmt';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -23,9 +24,9 @@ export default async function MyTeam() {
         <div className="text-xs uppercase tracking-widest text-ink-dim">My team</div>
         <h1 className="text-2xl font-semibold">{summary?.name ?? `Manager ${managerId}`}</h1>
         <div className="flex gap-2 mt-2 text-xs">
-          <Badge tone="blue">£{summary ? (summary.team_value/10).toFixed(1) : '0.0'}m team value</Badge>
-          <Badge tone="steel">£{summary ? (summary.bank/10).toFixed(1) : '0.0'}m bank</Badge>
-          <Badge tone="violet">FT {summary?.free_transfers ?? 1}</Badge>
+          <Badge tone="blue">£{fmt(n(summary?.team_value) / 10, 1)}m team value</Badge>
+          <Badge tone="steel">£{fmt(n(summary?.bank) / 10, 1)}m bank</Badge>
+          <Badge tone="violet">FT {n(summary?.free_transfers, 1)}</Badge>
         </div>
       </header>
       <Card title="Starting XI">

@@ -1,4 +1,5 @@
 import { Badge } from './ui/Badge';
+import { fmt, pct } from '@/lib/util/fmt';
 
 export interface RecommendationCardData {
   title: string;
@@ -20,14 +21,14 @@ export function RecommendationCard({ d }: { d: RecommendationCardData }) {
     <div className="bg-bg-card border border-line rounded-card p-4 flex flex-col gap-3">
       <div className="flex items-center justify-between">
         <h4 className="font-semibold">{d.title}</h4>
-        <Badge tone={tone as any}>{d.verdict.replace('_', ' ')}</Badge>
+        <Badge tone={tone as any}>{(d.verdict ?? '').replace('_', ' ')}</Badge>
       </div>
       <div className="grid grid-cols-3 gap-3 font-mono">
-        <Stat label="EV"        value={d.ev.toFixed(2)} accent />
-        <Stat label="risk"      value={`${(d.risk*100).toFixed(0)}%`} />
-        <Stat label="confidence" value={`${(d.confidence*100).toFixed(0)}%`} />
+        <Stat label="EV"         value={fmt(d.ev, 2)} accent />
+        <Stat label="risk"       value={pct(d.risk, 0)} />
+        <Stat label="confidence" value={pct(d.confidence, 0)} />
       </div>
-      {d.reasons.length > 0 && (
+      {Array.isArray(d.reasons) && d.reasons.length > 0 && (
         <ul className="text-xs text-ink-muted space-y-1">
           {d.reasons.map((r, i) => <li key={i}>· {r}</li>)}
         </ul>

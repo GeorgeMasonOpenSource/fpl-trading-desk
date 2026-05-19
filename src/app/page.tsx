@@ -8,6 +8,7 @@ import { getGameweeks, lastIngestAt, managerSummary, squadForGameweek, livePoint
 import { compareTransferScenarios } from '@/lib/transfers/optimiser';
 import { rankCaptains } from '@/lib/captaincy/engine';
 import { getManagerId, getLeagueId } from '@/lib/session';
+import { n, fmt } from '@/lib/util/fmt';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -93,8 +94,8 @@ export default async function DashboardPage() {
         </div>
         <div className="flex gap-2">
           <Badge tone="blue">Manager {managerId}</Badge>
-          {summary && <Badge tone="steel">FT {summary.free_transfers}</Badge>}
-          {summary && <Badge tone="steel">£{(summary.bank/10).toFixed(1)}m bank</Badge>}
+          {summary && <Badge tone="steel">FT {n(summary.free_transfers, 1)}</Badge>}
+          {summary && <Badge tone="steel">£{fmt(n(summary.bank) / 10, 1)}m bank</Badge>}
         </div>
       </header>
 
