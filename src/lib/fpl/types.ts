@@ -73,6 +73,14 @@ export interface FplElement {
   yellow_cards: number;
   red_cards: number;
   saves: number;
+  // 25/26 — defensive contributions (clearances+blocks+interceptions+
+  // tackles+recoveries). New scoring rule: DEF +2pts at 10+, MID/FWD at 12+.
+  defensive_contribution?: number;
+  defensive_contribution_per_90?: string;
+  // Set-piece + penalty order: 1 = first taker, 2 = second, etc.
+  penalties_order?: number | null;
+  corners_and_indirect_freekicks_order?: number | null;
+  direct_freekicks_order?: number | null;
 }
 
 export interface FplElementType {

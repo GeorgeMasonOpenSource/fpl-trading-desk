@@ -132,6 +132,12 @@ export async function upsertBootstrap(bs: FplBootstrap) {
       season_yellow_cards: (p as any).yellow_cards ?? 0,
       season_red_cards: (p as any).red_cards ?? 0,
       season_saves: (p as any).saves ?? 0,
+      // DEFCON + set-piece / penalty order (25/26 fields).
+      season_defcon: (p as any).defensive_contribution ?? 0,
+      season_defcon_per_90: Number((p as any).defensive_contribution_per_90) || 0,
+      penalties_order: (p as any).penalties_order ?? null,
+      corners_and_indirect_freekicks_order: (p as any).corners_and_indirect_freekicks_order ?? null,
+      direct_freekicks_order: (p as any).direct_freekicks_order ?? null,
       updated_at: new Date()
     }));
   await sql`
@@ -143,6 +149,8 @@ export async function upsertBootstrap(bs: FplBootstrap) {
       'season_minutes', 'season_starts', 'season_goals', 'season_assists',
       'season_xg', 'season_xa', 'season_xgi', 'season_xgc',
       'season_bonus', 'season_yellow_cards', 'season_red_cards', 'season_saves',
+      'season_defcon', 'season_defcon_per_90',
+      'penalties_order', 'corners_and_indirect_freekicks_order', 'direct_freekicks_order',
       'updated_at')}
     ON CONFLICT (id) DO UPDATE SET
       team_id = EXCLUDED.team_id,
@@ -171,7 +179,28 @@ export async function upsertBootstrap(bs: FplBootstrap) {
       season_yellow_cards = EXCLUDED.season_yellow_cards,
       season_red_cards = EXCLUDED.season_red_cards,
       season_saves = EXCLUDED.season_saves,
+      season_defcon = EXCLUDED.season_defcon,
+      season_defcon_per_90 = EXCLUDED.season_defcon_per_90,
+      penalties_order = EXCLUDED.penalties_order,
+      corners_and_indirect_freekicks_order = EXCLUDED.corners_and_indirect_freekicks_order,
+      direct_freekicks_order = EXCLUDED.direct_freekicks_order,
       updated_at = now()
+  `;
+
+  // After every player upsert, refresh team-level xG / xA totals so the
+  // projection engine can derive goal- and assist-share from data instead of
+  // a hardcoded constant.
+  await sql`
+    UPDATE teams t SET
+      season_xg_total = COALESCE(agg.xg, 0),
+      season_xa_total = COALESCE(agg.xa, 0)
+    FROM (
+      SELECT team_id,
+             SUM(season_xg)::numeric AS xg,
+             SUM(season_xa)::numeric AS xa
+      FROM players GROUP BY team_id
+    ) agg
+    WHERE agg.team_id = t.id
   `;
 
   // Injury history — one bulk insert. (No conflict — append-only audit log.)

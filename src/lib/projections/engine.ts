@@ -54,6 +54,8 @@ interface PlayerProjectionContext {
   setPieceShare: number;
   goalShare: number;       // share of team open-play goal threat
   assistShare: number;     // share of team assist threat
+  // 25/26 defensive contribution rate (defensive actions per 90).
+  defconPer90: number;
   // Confidence inputs:
   reliability: number;
   minutesConfidence: number;
@@ -74,6 +76,7 @@ export interface ProjectionResult {
   xpts_cards: number;
   xpts_concede: number;
   xpts_owngoal: number;
+  xpts_defcon: number;        // 25/26 defensive-contribution component
   floor: number;
   ceiling: number;
   risk_score: number;
@@ -101,11 +104,31 @@ export function projectPlayer(ctx: PlayerProjectionContext): ProjectionResult {
                           ctx.baselineBonus90, priorN);
 
   // ---------- 2. Fixture modulation -------------------------------------------
-  // Player goal expectation = his per-90 baseline, modulated by team scoring
-  // environment in this fixture, normalised by a 1.4 league average.
+  // Two-source goal expectation, then take the max:
+  //   (a) Personal per-90 method: xg90 × minutes × fixture-strength factor.
+  //       Good for "process" — describes what the player typically does.
+  //   (b) Share-of-team method: team xG for this fixture × player goalShare.
+  //       Good for "outcome" — directly tied to how many goals will be scored.
+  // The personal method alone collapses when the team's overall xG environment
+  // shifts, and the share method alone is harsh on a thin sample. Blend with a
+  // 50/50 weighting once the player has 540+ minutes, otherwise lean personal.
+  const minutesFactor = ctx.expectedMinutes / 90;
   const fixtureBoost = ctx.teamXgFor / 1.4;
-  const playerXg = xg90 * (ctx.expectedMinutes / 90) * fixtureBoost;
-  const playerXa = xa90 * (ctx.expectedMinutes / 90) * fixtureBoost;
+  const goalsPersonal = xg90 * minutesFactor * fixtureBoost;
+  const goalsFromShare = ctx.teamXgFor * minutesFactor * ctx.goalShare;
+  const shareWeight = clamp01(minutesSeen / 540) * 0.5;  // 0 .. 0.5
+  const playerXg = goalsPersonal * (1 - shareWeight) + goalsFromShare * shareWeight;
+
+  const assistsPersonal = xa90 * minutesFactor * fixtureBoost;
+  const assistsFromShare = ctx.teamXgFor * minutesFactor * ctx.assistShare * 0.7;
+  const playerXa = assistsPersonal * (1 - shareWeight) + assistsFromShare * shareWeight;
+
+  if (ctx.goalShare > 0.1) {
+    reasons.push({ kind: 'goal_share', weight: ctx.goalShare, detail: `goal share ${(ctx.goalShare*100).toFixed(0)}% of team xG` });
+  }
+  if (ctx.assistShare > 0.1) {
+    reasons.push({ kind: 'assist_share', weight: ctx.assistShare, detail: `assist share ${(ctx.assistShare*100).toFixed(0)}% of team xA` });
+  }
 
   // Penalty bump: if this player is the penalty taker, add expected pen goals.
   // Approximate: ~0.10 pens awarded per fixture in PL × team-attack adjustment × success rate 0.78
@@ -156,13 +179,51 @@ export function projectPlayer(ctx: PlayerProjectionContext): ProjectionResult {
   // Own goals: rare, approximate from concede × small prob
   const xpts_owngoal = -0.02 * (expectedConcedeBy90 / 1.4);
 
-  // Bonus: baseline bonus/90 scaled by minutes and fixture strength.
-  const xpts_bonus = bonus90 * (ctx.expectedMinutes / 90) * fixtureBoost;
+  // Bonus: baseline bonus/90 scaled by minutes and fixture strength. Set-piece
+  // takers grab disproportionately more BPS (corners + indirect FKs = passes
+  // into the box) so we apply a small bump if this player is the first or
+  // second set-piece option.
+  const setPieceBonusBump = ctx.setPieceShare > 0 ? 1 + 0.15 * ctx.setPieceShare : 1;
+  const xpts_bonus = bonus90 * (ctx.expectedMinutes / 90) * fixtureBoost * setPieceBonusBump;
+
+  // ---------- 25/26 DEFCON points ---------------------------------------------
+  // FPL awards 2 pts when:
+  //   - DEF reaches 10+ defensive actions in a match
+  //   - MID / FWD reach 12+ defensive actions in a match
+  // GKP get the existing saves component, no DEFCON.
+  //
+  // We model the count as Poisson with rate = defconPer90 × minutes/90, then
+  // compute P(count >= threshold). The 2 pts only land if the player also
+  // makes the 60' bar (the rule is per-match, but realistically you don't hit
+  // 10 actions in 20 minutes anyway, so we condition on sixtyPlus).
+  const defconThreshold = ctx.position === 'DEF' ? 10 : 12;
+  let xpts_defcon = 0;
+  if (ctx.position !== 'GKP' && ctx.defconPer90 > 0) {
+    const expectedActions = ctx.defconPer90 * (ctx.expectedMinutes / 90);
+    // P(Poisson(lambda) >= k) — small k so just sum k..k+10.
+    const lambda = expectedActions;
+    let cdf = 0;
+    let term = Math.exp(-lambda);
+    for (let i = 0; i < defconThreshold; i++) {
+      cdf += term;
+      term = term * lambda / (i + 1);
+    }
+    const pDefcon = clamp01(1 - cdf);
+    xpts_defcon = pDefcon * 2 * ctx.sixtyPlusProb;
+    if (xpts_defcon > 0.1) {
+      reasons.push({
+        kind: 'defcon',
+        weight: xpts_defcon,
+        detail: `${expectedActions.toFixed(1)} expected def-actions → P(≥${defconThreshold}) ${(pDefcon*100).toFixed(0)}%`
+      });
+    }
+  }
 
   // Total
   const xpts_total =
     xpts_appearance + xpts_goals + xpts_assists + xpts_clean_sheet +
-    xpts_bonus + xpts_saves + xpts_pen_save + xpts_cards + xpts_concede + xpts_owngoal;
+    xpts_bonus + xpts_saves + xpts_pen_save + xpts_cards + xpts_concede +
+    xpts_owngoal + xpts_defcon;
 
   // ---------- 4. Floor / Ceiling -----------------------------------------------
   // Floor: outcome where player plays but doesn't score/assist or doesn't play.
@@ -209,6 +270,7 @@ export function projectPlayer(ctx: PlayerProjectionContext): ProjectionResult {
   return {
     xpts_total, xpts_appearance, xpts_goals, xpts_assists, xpts_clean_sheet,
     xpts_bonus, xpts_saves, xpts_pen_save, xpts_cards, xpts_concede, xpts_owngoal,
+    xpts_defcon,
     floor, ceiling, risk_score: risk, confidence_score: confidence,
     reasons
   };
@@ -243,6 +305,11 @@ export async function recomputeProjectionsForGameweek(gameweekId: number) {
       sub_prob: number; bench_unused_prob: number; injury_absence_prob: number;
       early_sub_risk: number; expected_minutes: number; minutes_confidence: number;
       current_minutes: number; current_xg: number; current_xa: number; current_bonus: number;
+      season_xg: number; season_xa: number; season_bonus: number;
+      season_defcon_per_90: number;
+      penalties_order: number | null;
+      corners_order: number | null; freekicks_order: number | null;
+      team_xg_total: number; team_xa_total: number;
     }>>`
       SELECT
         p.id, p.team_id, p.position,
@@ -269,8 +336,18 @@ export async function recomputeProjectionsForGameweek(gameweekId: number) {
         GREATEST(COALESCE(p.season_minutes, 0), COALESCE(c.minutes, 0))::numeric AS current_minutes,
         GREATEST(COALESCE(p.season_xg, 0), COALESCE(c.xg, 0))::numeric           AS current_xg,
         GREATEST(COALESCE(p.season_xa, 0), COALESCE(c.xa, 0))::numeric           AS current_xa,
-        GREATEST(COALESCE(p.season_bonus, 0), COALESCE(c.bonus, 0))::numeric     AS current_bonus
+        GREATEST(COALESCE(p.season_bonus, 0), COALESCE(c.bonus, 0))::numeric     AS current_bonus,
+        COALESCE(p.season_xg, 0)::numeric                                        AS season_xg,
+        COALESCE(p.season_xa, 0)::numeric                                        AS season_xa,
+        COALESCE(p.season_bonus, 0)::numeric                                     AS season_bonus,
+        COALESCE(p.season_defcon_per_90, 0)::numeric                             AS season_defcon_per_90,
+        p.penalties_order,
+        p.corners_and_indirect_freekicks_order AS corners_order,
+        p.direct_freekicks_order               AS freekicks_order,
+        COALESCE(t.season_xg_total, 0)::numeric AS team_xg_total,
+        COALESCE(t.season_xa_total, 0)::numeric AS team_xa_total
       FROM players p
+      JOIN teams t ON t.id = p.team_id
       LEFT JOIN player_baselines b ON b.player_id = p.id
       LEFT JOIN minutes_projections mp
         ON mp.player_id = p.id AND mp.fixture_id = ${fix.id}
@@ -311,8 +388,41 @@ export async function recomputeProjectionsForGameweek(gameweekId: number) {
       const cs = isHome ? exp.cleanSheetProbHome : exp.cleanSheetProbAway;
 
       const playerOv = ovByPlayer.get(p.id) ?? [];
-      const penaltyShare = playerOv.find(o => o.kind === 'penalty_taker')?.value?.share ?? 0;
-      const setPieceShare = playerOv.find(o => o.kind === 'set_piece')?.value?.share ?? 0;
+      // Manual overrides take precedence — they're factual ("manager said X
+      // takes pens this week"). If unset, derive from the FPL public order
+      // fields: penalties_order == 1 means first taker.
+      const manualPenShare = playerOv.find(o => o.kind === 'penalty_taker')?.value?.share;
+      const penaltyShare =
+        manualPenShare != null ? manualPenShare :
+        p.penalties_order === 1 ? 0.95 :
+        p.penalties_order === 2 ? 0.30 : 0;
+      const manualSpShare = playerOv.find(o => o.kind === 'set_piece')?.value?.share;
+      const setPieceShare =
+        manualSpShare != null ? manualSpShare :
+        Math.max(
+          p.corners_order === 1 ? 0.9 : p.corners_order === 2 ? 0.4 : 0,
+          p.freekicks_order === 1 ? 0.9 : p.freekicks_order === 2 ? 0.4 : 0
+        );
+
+      // goal- and assist-share — derived from data so a 35%-of-team-xG striker
+      // isn't treated like a fringe forward. We clamp the share to 60% so the
+      // model never collapses to "Haaland gets everything"; the rest is shared
+      // with the other 10 outfielders implicitly.
+      const goalShare   = p.team_xg_total > 0
+        ? Math.min(0.60, Number(p.season_xg) / Number(p.team_xg_total))
+        : 0.15;
+      const assistShare = p.team_xa_total > 0
+        ? Math.min(0.60, Number(p.season_xa) / Number(p.team_xa_total))
+        : 0.15;
+
+      // Bonus baseline boost — when player_baselines hasn't been computed yet
+      // (default 0.25) and we have substantial current-season evidence, use
+      // current-season bonus/90 as the baseline so we don't shrink toward 0.25.
+      const seasonMins = Number(p.current_minutes) || 0;
+      const seasonBonus90 = seasonMins > 540
+        ? (Number(p.season_bonus) * 90) / seasonMins
+        : Number(p.baseline_bonus_per_90);
+      const baselineBonus90 = Math.max(Number(p.baseline_bonus_per_90), seasonBonus90);
 
       const newSigningPenalty = (p.current_minutes < 270) ? weights.newSigningUncertainty * 0.20 : 0;
       const managerChangePenalty = 0;
@@ -326,7 +436,7 @@ export async function recomputeProjectionsForGameweek(gameweekId: number) {
         injuryAbsenceProb: p.injury_absence_prob,
         earlySubRisk: p.early_sub_risk, expectedMinutes: p.expected_minutes,
         baselineXg90: p.baseline_xg_per_90, baselineXa90: p.baseline_xa_per_90,
-        baselineBonus90: p.baseline_bonus_per_90, baselineCsShare: p.baseline_cs_share,
+        baselineBonus90, baselineCsShare: p.baseline_cs_share,
         baselineYellow90: p.baseline_yellow_per_90, baselineRed90: p.baseline_red_per_90,
         baselineSaves90: p.baseline_saves_per_90,
         currentXg90: p.current_minutes ? (p.current_xg * 90) / p.current_minutes : null,
@@ -335,7 +445,8 @@ export async function recomputeProjectionsForGameweek(gameweekId: number) {
         currentSampleMinutes: p.current_minutes,
         teamXgFor, teamXgAgainst, cleanSheetProb: cs,
         penaltyShare, setPieceShare,
-        goalShare: 0.15, assistShare: 0.15,
+        goalShare, assistShare,
+        defconPer90: Number(p.season_defcon_per_90) || 0,
         reliability: p.reliability_index,
         minutesConfidence: p.minutes_confidence,
         newSigningPenalty, managerChangePenalty
@@ -354,6 +465,7 @@ export async function recomputeProjectionsForGameweek(gameweekId: number) {
         xpts_cards: projection.xpts_cards,
         xpts_concede: projection.xpts_concede,
         xpts_owngoal: projection.xpts_owngoal,
+        xpts_defcon: projection.xpts_defcon,
         floor: projection.floor,
         ceiling: projection.ceiling,
         risk_score: projection.risk_score,
@@ -377,7 +489,8 @@ export async function recomputeProjectionsForGameweek(gameweekId: number) {
         INSERT INTO projections ${(sql as any)(projRows,
           'player_id', 'fixture_id', 'gameweek_id',
           'xpts_total', 'xpts_appearance', 'xpts_goals', 'xpts_assists', 'xpts_clean_sheet',
-          'xpts_bonus', 'xpts_saves', 'xpts_pen_save', 'xpts_cards', 'xpts_concede', 'xpts_owngoal',
+          'xpts_bonus', 'xpts_saves', 'xpts_pen_save', 'xpts_cards', 'xpts_concede',
+          'xpts_owngoal', 'xpts_defcon',
           'floor', 'ceiling', 'risk_score', 'confidence_score', 'reasons', 'computed_at')}
         ON CONFLICT (player_id, fixture_id) DO UPDATE SET
           xpts_total = EXCLUDED.xpts_total,
@@ -391,6 +504,7 @@ export async function recomputeProjectionsForGameweek(gameweekId: number) {
           xpts_cards = EXCLUDED.xpts_cards,
           xpts_concede = EXCLUDED.xpts_concede,
           xpts_owngoal = EXCLUDED.xpts_owngoal,
+          xpts_defcon = EXCLUDED.xpts_defcon,
           floor = EXCLUDED.floor,
           ceiling = EXCLUDED.ceiling,
           risk_score = EXCLUDED.risk_score,
