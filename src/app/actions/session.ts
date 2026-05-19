@@ -66,23 +66,46 @@ export async function connectManager(formData: FormData): Promise<ConnectResult>
     }
     await upsertManagerEntry(entry, ft);
 
-    // 3. Current GW + picks — needs gameweeks table populated; if not (fresh
-    //    deploy before first cron run), skip silently and the dashboard hint
-    //    will tell the user to wait.
-    const gwRows = await sql<Array<{ id: number }>>`
-      SELECT id FROM gameweeks WHERE is_current = TRUE UNION ALL
-      SELECT id FROM gameweeks WHERE is_next = TRUE LIMIT 1
-    `;
-    const gw = gwRows[0]?.id ?? null;
-    if (gw != null) {
-      const picks = await fpl.managerPicks(managerId, gw);
-      await upsertManagerPicks(managerId, gw, picks);
+    // 3. Pull picks for both the current (in-progress) and next (planning)
+    //    gameweeks. If next-GW picks aren't yet exposed by FPL (lineup not
+    //    submitted), fall back to copying the current squad into the next
+    //    slot so the planning views can render.
+    const currentRows = await sql<Array<{ id: number }>>`SELECT id FROM gameweeks WHERE is_current = TRUE LIMIT 1`;
+    const nextRows    = await sql<Array<{ id: number }>>`SELECT id FROM gameweeks WHERE is_next = TRUE LIMIT 1`;
+    const currentGw = currentRows[0]?.id ?? null;
+    const nextGw    = nextRows[0]?.id ?? null;
+
+    if (currentGw != null) {
+      try {
+        const picks = await fpl.managerPicks(managerId, currentGw);
+        await upsertManagerPicks(managerId, currentGw, picks);
+      } catch { /* tolerate if FPL has nothing yet */ }
     }
+    if (nextGw != null) {
+      try {
+        const picks = await fpl.managerPicks(managerId, nextGw);
+        await upsertManagerPicks(managerId, nextGw, picks);
+      } catch {
+        if (currentGw != null) {
+          await sql`
+            INSERT INTO manager_picks (manager_id, gameweek_id, player_id, position,
+                                       is_captain, is_vice, multiplier,
+                                       purchase_price, selling_price)
+            SELECT manager_id, ${nextGw}, player_id, position, is_captain, is_vice,
+                   multiplier, purchase_price, selling_price
+            FROM manager_picks
+            WHERE manager_id = ${managerId} AND gameweek_id = ${currentGw}
+            ON CONFLICT DO NOTHING
+          `;
+        }
+      }
+    }
+    const gw = nextGw ?? currentGw;   // for downstream return-value reporting
 
     let leagueLabel: string | undefined;
-    if (leagueId && gw != null) {
+    if (leagueId && (currentGw != null || nextGw != null)) {
       const league = await fpl.classicLeague(leagueId);
-      await upsertClassicLeague(league, gw);
+      await upsertClassicLeague(league, currentGw ?? nextGw ?? 0);
       leagueLabel = league.league.name;
     }
 
@@ -170,21 +193,44 @@ export async function refreshNow(): Promise<ConnectResult> {
     }
     await upsertManagerEntry(entry, ft);
 
-    const gwRows = await sql<Array<{ id: number }>>`
-      SELECT id FROM gameweeks WHERE is_current = TRUE UNION ALL
-      SELECT id FROM gameweeks WHERE is_next = TRUE LIMIT 1
-    `;
-    const gw = gwRows[0]?.id ?? null;
-    if (gw != null) {
-      const picks = await fpl.managerPicks(managerId, gw);
-      await upsertManagerPicks(managerId, gw, picks);
+    const currentRows = await sql<Array<{ id: number }>>`SELECT id FROM gameweeks WHERE is_current = TRUE LIMIT 1`;
+    const nextRows    = await sql<Array<{ id: number }>>`SELECT id FROM gameweeks WHERE is_next = TRUE LIMIT 1`;
+    const currentGw = currentRows[0]?.id ?? null;
+    const nextGw    = nextRows[0]?.id ?? null;
+
+    if (currentGw != null) {
+      try {
+        const picks = await fpl.managerPicks(managerId, currentGw);
+        await upsertManagerPicks(managerId, currentGw, picks);
+      } catch { /* ignore */ }
     }
+    if (nextGw != null) {
+      try {
+        const picks = await fpl.managerPicks(managerId, nextGw);
+        await upsertManagerPicks(managerId, nextGw, picks);
+      } catch {
+        if (currentGw != null) {
+          await sql`
+            INSERT INTO manager_picks (manager_id, gameweek_id, player_id, position,
+                                       is_captain, is_vice, multiplier,
+                                       purchase_price, selling_price)
+            SELECT manager_id, ${nextGw}, player_id, position, is_captain, is_vice,
+                   multiplier, purchase_price, selling_price
+            FROM manager_picks
+            WHERE manager_id = ${managerId} AND gameweek_id = ${currentGw}
+            ON CONFLICT DO NOTHING
+          `;
+        }
+      }
+    }
+    const gw = nextGw ?? currentGw;
     if (leagueId && gw != null) {
       const league = await fpl.classicLeague(leagueId);
       await upsertClassicLeague(league, gw);
     }
     revalidateTag(`manager:${managerId}`);
     revalidateTag('live');
+    revalidateTag('gameweeks');
     revalidatePath('/', 'layout');
     return { ok: true, managerId, leagueId, gameweek: gw };
   } catch (err) {
