@@ -1,0 +1,31 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html, body {
+  height: 100%;
+  background: #0A0C10;
+  color: #E6EAF2;
+  font-feature-settings: 'cv11', 'ss01', 'tnum';
+}
+
+/* Soft scrollbars for the tables-heavy UI */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: #2A3140; border-radius: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+
+.font-tabular { font-variant-numeric: tabular-nums; }
+
+/* Generic club-colour blocks. Numbered slots, not real club names. */
+.club-block {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 22px; height: 22px; border-radius: 6px;
+  font-size: 10px; font-weight: 600;
+  letter-spacing: 0.04em;
+  background: var(--c, #2A3140);
+  color: #0A0C10;
+}

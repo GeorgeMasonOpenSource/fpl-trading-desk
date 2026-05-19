@@ -1,0 +1,31 @@
+name: Ingest · hourly
+
+on:
+  schedule:
+    # Every hour outside the live window. The live workflow handles 1-5 min ticks.
+    - cron: '5 * * * *'
+  workflow_dispatch: {}
+
+concurrency:
+  group: ingest-hourly
+  cancel-in-progress: true
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Refresh fixtures (lightweight) + manager picks
+        run: |
+          curl -sS -X POST "${BASE_URL}/api/ingest/fixtures" \
+            -H "authorization: Bearer ${INGEST_SECRET}" \
+            --fail
+          if [ -n "$FPL_MANAGER_ID" ]; then
+            curl -sS -X POST "${BASE_URL}/api/ingest/manager?managerId=${FPL_MANAGER_ID}" \
+              -H "authorization: Bearer ${INGEST_SECRET}" \
+              --fail || true
+          fi
+        env:
+          BASE_URL: ${{ secrets.BASE_URL }}
+          INGEST_SECRET: ${{ secrets.INGEST_SECRET }}
+          FPL_MANAGER_ID: ${{ secrets.FPL_MANAGER_ID }}

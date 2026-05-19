@@ -1,0 +1,53 @@
+name: Ingest · daily
+
+on:
+  schedule:
+    - cron: '15 5 * * *'     # 05:15 UTC every day
+  workflow_dispatch: {}
+
+concurrency:
+  group: ingest-daily
+  cancel-in-progress: false
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Ingest bootstrap + fixtures
+        run: |
+          curl -sS -X POST "${BASE_URL}/api/ingest/bootstrap" \
+            -H "authorization: Bearer ${INGEST_SECRET}" \
+            --fail
+          curl -sS -X POST "${BASE_URL}/api/ingest/fixtures" \
+            -H "authorization: Bearer ${INGEST_SECRET}" \
+            --fail
+        env:
+          BASE_URL: ${{ secrets.BASE_URL }}
+          INGEST_SECRET: ${{ secrets.INGEST_SECRET }}
+
+      - name: Refresh models (team strengths -> baselines -> minutes -> projections)
+        run: |
+          curl -sS -X POST "${BASE_URL}/api/refresh" \
+            -H "authorization: Bearer ${INGEST_SECRET}" \
+            --fail
+        env:
+          BASE_URL: ${{ secrets.BASE_URL }}
+          INGEST_SECRET: ${{ secrets.INGEST_SECRET }}
+
+      - name: Ingest manager + league snapshot
+        if: ${{ secrets.FPL_MANAGER_ID != '' }}
+        run: |
+          curl -sS -X POST "${BASE_URL}/api/ingest/manager?managerId=${FPL_MANAGER_ID}" \
+            -H "authorization: Bearer ${INGEST_SECRET}" \
+            --fail
+          if [ -n "$FPL_LEAGUE_ID" ]; then
+            curl -sS -X POST "${BASE_URL}/api/ingest/league?leagueId=${FPL_LEAGUE_ID}" \
+              -H "authorization: Bearer ${INGEST_SECRET}" \
+              --fail
+          fi
+        env:
+          BASE_URL: ${{ secrets.BASE_URL }}
+          INGEST_SECRET: ${{ secrets.INGEST_SECRET }}
+          FPL_MANAGER_ID: ${{ secrets.FPL_MANAGER_ID }}
+          FPL_LEAGUE_ID: ${{ secrets.FPL_LEAGUE_ID }}

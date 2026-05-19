@@ -1,0 +1,26 @@
+name: Ingest · live (matchday)
+
+on:
+  schedule:
+    # Every 5 minutes — the route itself returns fast when no match is live, so
+    # the cost is bounded. Tighten / loosen by editing this cron.
+    - cron: '*/5 * * * *'
+  workflow_dispatch: {}
+
+concurrency:
+  group: ingest-live
+  cancel-in-progress: true
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Pull live event data
+        run: |
+          curl -sS -X POST "${BASE_URL}/api/ingest/live" \
+            -H "authorization: Bearer ${INGEST_SECRET}" \
+            --fail
+        env:
+          BASE_URL: ${{ secrets.BASE_URL }}
+          INGEST_SECRET: ${{ secrets.INGEST_SECRET }}
