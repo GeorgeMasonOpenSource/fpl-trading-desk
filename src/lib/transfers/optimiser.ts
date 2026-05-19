@@ -99,8 +99,14 @@ async function loadSquad(managerId: number, startGw: number): Promise<SquadPlaye
   }));
 }
 
-/** Candidate pool: top-N players per position by 3-GW xPts, respecting cost. */
-async function loadCandidates(startGw: number, position: Position, maxCost: number) {
+/** Candidate pool: top-N players per position by 3-GW xPts, respecting cost.
+ *  Excludes player_ids already in the squad — without this filter the optimiser
+ *  cheerfully suggests transfers to players you already own.
+ */
+async function loadCandidates(
+  startGw: number, position: Position, maxCost: number, excludeIds: number[]
+) {
+  const exclude = excludeIds.length > 0 ? excludeIds : [-1];
   const rows = await sql<Array<{
     player_id: number; team_id: number; now_cost: number;
     web_name: string; team_short: string;
@@ -125,8 +131,9 @@ async function loadCandidates(startGw: number, position: Position, maxCost: numb
     WHERE p.position = ${position}
       AND p.now_cost <= ${maxCost}
       AND p.status = 'a'
+      AND p.id NOT IN ${sql(exclude as any)}
     ORDER BY proj.h3 DESC NULLS LAST
-    LIMIT 30
+    LIMIT 40
   `;
   return rows.map(r => ({
     playerId: r.player_id,
@@ -143,10 +150,14 @@ async function loadCandidates(startGw: number, position: Position, maxCost: numb
 function isLegalSwap(squad: SquadPlayer[], bank: number, out: SquadPlayer, inc: SquadPlayer) {
   if (inc.position !== out.position) return false;
   if (inc.playerId === out.playerId) return false;
+  // Don't allow buying someone who's already in the squad.
+  if (squad.some(s => s.playerId === inc.playerId)) return false;
   const newBank = bank + out.cost - inc.cost;
   if (newBank < 0) return false;
-  const sameClubCount = squad.filter(s => s.teamId === inc.teamId && s.playerId !== out.playerId).length;
-  if (sameClubCount + (inc.teamId === out.teamId ? 0 : 1) > 3) return false;
+  // Count of inc.teamId in the squad after the swap (squad - out + inc) must be ≤ 3.
+  const sameClubAfter =
+    squad.filter(s => s.teamId === inc.teamId && s.playerId !== out.playerId).length + 1;
+  if (sameClubAfter > 3) return false;
   return true;
 }
 
@@ -167,13 +178,15 @@ export async function compareTransferScenarios(cfg: OptimiserConfig): Promise<Sc
   `;
   const startBank = bankRows[0]?.bank ?? 0;
 
-  // Candidate pool by position
+  // Candidate pool by position, with already-owned players removed up front so
+  // the optimiser doesn't even consider them.
+  const ownedIds = squad.map(s => s.playerId);
   const byPos: Record<Position, SquadPlayer[]> = {
     GKP: [], DEF: [], MID: [], FWD: []
   };
   for (const pos of ['GKP', 'DEF', 'MID', 'FWD'] as Position[]) {
     const maxCost = startBank + Math.max(...squad.filter(s => s.position === pos).map(s => s.cost), 40);
-    byPos[pos] = await loadCandidates(cfg.startGameweek, pos, maxCost);
+    byPos[pos] = await loadCandidates(cfg.startGameweek, pos, maxCost, ownedIds);
   }
 
   // 1-move candidates (every squad slot × every candidate of that position)
