@@ -18,6 +18,7 @@ const NAV = [
   { href: '/chip-planner',       label: 'Chip Planner' },
   { href: '/mini-league',        label: 'Mini League War Room' },
   { href: '/creator-signals',    label: 'Creator Board' },
+  { href: '/decision-matrix',    label: 'Decision Matrix' },
   { href: '/creator-accuracy',   label: 'Creator Accuracy' },
   { href: '/player-explorer',    label: 'Player Explorer' },
   { href: '/minutes-lab',        label: 'Minutes Lab' },

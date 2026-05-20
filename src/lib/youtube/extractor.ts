@@ -258,7 +258,12 @@ export function extractAll(
       ...surnameToEntries.keys(),
       ...aliasToEntry.keys()
     ])
-  ].filter(s => s.length >= 3).sort((a, b) => b.length - a.length);
+  ]
+    // Drop short needles (noisy) and our English-word stopword list. Real
+    // players matching a stopword surname (e.g. "Son") stay reachable via
+    // their explicit aliases.
+    .filter(s => s.length >= 3 && !SURNAME_STOPWORDS.has(s))
+    .sort((a, b) => b.length - a.length);
 
   // Compile one big alternation regex of all unique needles.
   const escaped = allNeedles.map(n => n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
@@ -285,10 +290,12 @@ export function extractAll(
   }
   let rankingWindow: RankingWindow | null = null;
 
-  // Stitch tokens into rolling 4-cue windows so a sentence spanning a cue
-  // boundary still matches. Each cue plus the next 3 forms a window.
+  // Stitch tokens into rolling 8-cue windows so a sentence spanning a cue
+  // boundary still matches AND the raw quote we slice has enough context on
+  // either side of the player mention. Was 4 cues (~120 chars total) which
+  // forced quotes to truncate mid-word; 8 cues gives ~240 chars to work with.
   for (let i = 0; i < tokens.length; i++) {
-    const window = tokens.slice(i, i + 4);
+    const window = tokens.slice(i, i + 8);
     const windowText = window.map(t => t.text).join(' ');
     const lower = windowText.toLowerCase();
     const windowStartSec = Math.round(window[0]!.startSec);
@@ -354,7 +361,7 @@ export function extractAll(
             positionRank: rankingWindow.nextRank,
             playerId: player.playerId,
             webName: player.webName,
-            rawQuote: windowText.slice(Math.max(0, startIdx - 30), Math.min(windowText.length, endIdx + 40)).trim(),
+            rawQuote: buildSentenceQuote(windowText, startIdx, endIdx),
             startSec: windowStartSec
           });
           rankingWindow.seenPlayers.add(player.playerId);
@@ -378,7 +385,7 @@ export function extractAll(
           metric: np.metric,
           metricValue: val,
           metricUnit: np.unit ?? null,
-          rawQuote: windowText.slice(Math.max(0, startIdx - 60), Math.min(windowText.length, endIdx + 60)).trim(),
+          rawQuote: buildSentenceQuote(windowText, startIdx, endIdx),
           startSec: windowStartSec
         });
       }
@@ -391,9 +398,7 @@ export function extractAll(
         else                     hit = pat.re.test(around);
         if (!hit) continue;
 
-        const rawQuoteStart = Math.max(0, startIdx - 60);
-        const rawQuoteEnd = Math.min(windowText.length, endIdx + 60);
-        const rawQuote = windowText.slice(rawQuoteStart, rawQuoteEnd).trim();
+        const rawQuote = buildSentenceQuote(windowText, startIdx, endIdx);
 
         // §1a — re-interpret a "recommend"/"buying"/"love" hit inside a
         // transfers_out / avoid section as the opposite (`selling`). This is
@@ -520,21 +525,63 @@ function dedupe(signals: ExtractedSignal[]): ExtractedSignal[] {
 /**
  * Build the player lexicon from the DB players table. Aliases are a small
  * curated map of common nicknames the regex won't otherwise catch.
+ *
+ * CALIBRATION RULES (learned from real ingests):
+ *
+ *   1. Don't include a standalone first name unless it's globally unique
+ *      ("Mo Salah" yes; "Bruno" no — collides with Guimarães; "Erling"
+ *      yes; but we keep things conservative and prefer "erling haaland").
+ *
+ *   2. When two FPL players share a surname (Lewis Hall vs Dewsbury-Hall,
+ *      multiple Williams etc.), the regex emits an ambiguous match and
+ *      halves confidence. To kill the ambiguity, list the distinguishing
+ *      form ("Dewsbury Hall", "Daniel James") as an alias on the player
+ *      we DO want to match.
+ *
+ *   3. Compound / hyphenated surnames need an unhyphenated variant —
+ *      transcripts often drop the hyphen ("Alexander Arnold",
+ *      "Dewsbury Hall"). Add both forms.
  */
 const ALIASES: Record<string, string[]> = {
-  'B.Fernandes': ['bruno', 'fernandes', 'bruno fernandes', 'bruno f'],
-  'De Bruyne':   ['kdb', 'de bruyne'],
-  'Saka':        ['saka'],
-  'Salah':       ['mo salah', 'salah'],
-  'Haaland':     ['erling', 'haaland'],
-  'Son':         ['sonny', 'son'],
-  'Trent':       ['taa', 'trent', 'alexander-arnold'],
-  'Saliba':      ['saliba'],
-  'Palmer':      ['cole palmer', 'palmer'],
-  'Watkins':     ['ollie watkins', 'watkins'],
-  'Isak':        ['alexander isak', 'isak'],
-  'Mbeumo':      ['mbeumo', 'bryan mbeumo']
+  // B.Fernandes — DROPPED the standalone "bruno" (collided with
+  // Bruno Guimarães of Newcastle). Still matches via full name or "Bruno F".
+  'B.Fernandes':   ['fernandes', 'bruno fernandes', 'bruno f', 'b. fernandes'],
+  // Bruno Guimarães (NEW) — explicit alias set so creators saying "Bruno G"
+  // resolve correctly rather than misfiring to Fernandes.
+  'Bruno G.':      ['bruno g', 'bruno guimaraes', 'bruno guimarães', 'guimaraes', 'guimarães'],
+  'De Bruyne':     ['kdb', 'de bruyne'],
+  'Saka':          ['saka'],
+  'Salah':         ['mo salah', 'salah'],
+  // Removed standalone "erling" — too generic.
+  'Haaland':       ['haaland', 'erling haaland'],
+  // Removed standalone "sonny" — keeping nickname is fine, dropping "son"
+  // surname from needles (see SURNAME_STOPWORDS) so we don't match the
+  // English word "son".
+  'Son':           ['sonny', 'son heung-min', 'heung-min'],
+  'Trent':         ['taa', 'trent', 'alexander-arnold', 'alexander arnold'],
+  'Saliba':        ['saliba'],
+  'Palmer':        ['cole palmer', 'palmer'],
+  'Watkins':       ['ollie watkins', 'watkins'],
+  'Isak':          ['alexander isak', 'isak'],
+  'Mbeumo':        ['mbeumo', 'bryan mbeumo'],
+  // Dewsbury-Hall — alias the space-separated and lone "dewsbury" forms so
+  // transcripts that drop the hyphen resolve here, not to Lewis Hall.
+  'Dewsbury-Hall': ['dewsbury-hall', 'dewsbury hall', 'kiernan dewsbury-hall', 'dewsbury']
 };
+
+/**
+ * Surnames we deliberately DON'T match against the transcript needle regex.
+ * Either common English words that happen to also be FPL surnames (almost
+ * always misfires) or players we know are inactive/departed. The player
+ * is still findable via aliases — only the surname needle is dropped.
+ */
+const SURNAME_STOPWORDS = new Set<string>([
+  // English-word homographs that have caused noise on the Creator Board.
+  'lucky', 'free', 'fine', 'real', 'good', 'bad', 'true', 'false',
+  'just', 'only', 'very', 'most', 'best', 'first', 'last',
+  // Common short words that occasionally appear in FPL rosters.
+  'son',  // intentionally — Heung-min is matchable via nickname aliases.
+]);
 
 export function buildLexicon(players: Array<{
   id: number; web_name: string; first_name: string; second_name: string;
@@ -549,4 +596,75 @@ export function buildLexicon(players: Array<{
       aliases: ALIASES[p.web_name] ?? []
     };
   });
+}
+
+/* ---------------------------------------------------------------------------
+ * Sentence-aware raw-quote builder.
+ *
+ * Old behaviour: take ±60 chars around the player mention. That truncated
+ * mid-word constantly ("…sula's 13pointer…", "…ively left out…").
+ *
+ * New behaviour: grow the quote outward to the nearest sentence boundary on
+ * each side, capped at MAX_RADIUS chars. If no sentence boundary is found
+ * within the radius, snap to a word boundary instead so we never start or
+ * end mid-word.
+ *
+ * Why both: YouTube ASR transcripts SOMETIMES have proper punctuation (when
+ * the creator's diction is clear or YouTube's auto-punctuation kicks in)
+ * but often don't. Falling through to a word-boundary fallback means we
+ * get reasonable quotes either way.
+ * -------------------------------------------------------------------------*/
+function buildSentenceQuote(text: string, mentionStart: number, mentionEnd: number): string {
+  // Max characters to extend on each side of the mention. Tuned so a typical
+  // FPL transcript snippet shows the full surrounding thought (~30–50 words).
+  const MAX_RADIUS = 180;
+
+  // ----- Backward: look for the start of the current sentence ----------
+  const backStart = Math.max(0, mentionStart - MAX_RADIUS);
+  const before = text.slice(backStart, mentionStart);
+  // Find the last `. ` / `! ` / `? ` (terminator + whitespace) in the window.
+  // We start AFTER that terminator so the quote begins at a sentence boundary.
+  const sentRe = /[.!?]\s+/g;
+  let lastSentEnd = -1;
+  let m: RegExpExecArray | null;
+  while ((m = sentRe.exec(before)) !== null) {
+    lastSentEnd = m.index + m[0].length;
+  }
+  let start: number;
+  if (lastSentEnd >= 0) {
+    start = backStart + lastSentEnd;
+  } else if (backStart === 0) {
+    // We've hit the start of the transcript — keep it.
+    start = 0;
+  } else {
+    // No sentence terminator inside the window. Snap to the NEXT word
+    // boundary so we don't begin mid-word. Walk forward past any
+    // non-whitespace until we find a space, then start just after it.
+    start = backStart;
+    while (start < mentionStart && /\S/.test(text[start] ?? '')) start++;
+    while (start < mentionStart && /\s/.test(text[start] ?? '')) start++;
+  }
+
+  // ----- Forward: look for the end of the current sentence -------------
+  const fwdEnd = Math.min(text.length, mentionEnd + MAX_RADIUS);
+  const after = text.slice(mentionEnd, fwdEnd);
+  // First terminator after the mention that's followed by whitespace or EOS.
+  const fwdMatch = after.match(/[.!?](?:\s|$)/);
+  let end: number;
+  if (fwdMatch && fwdMatch.index !== undefined) {
+    end = mentionEnd + fwdMatch.index + 1; // include the terminator itself
+  } else if (fwdEnd === text.length) {
+    end = text.length;
+  } else {
+    // No terminator — snap back to a word boundary. Walk backward from
+    // fwdEnd to the last whitespace before it.
+    end = fwdEnd;
+    while (end > mentionEnd && /\S/.test(text[end - 1] ?? '')) end--;
+  }
+
+  // Guard rails — never emit a quote shorter than the mention itself.
+  if (end <= mentionStart) end = Math.min(text.length, mentionEnd + 40);
+  if (start >= mentionEnd) start = Math.max(0, mentionStart - 40);
+
+  return text.slice(start, end).trim();
 }

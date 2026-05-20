@@ -52,10 +52,18 @@ async function main() {
     }
   }
 
-  // 2. Load player lexicon once.
+  // 2. Load player lexicon once. Filter to active players who have played
+  // THIS season — drops departed players (e.g. Mahrez to Saudi) and the
+  // never-active reserves whose dictionary-word names would otherwise
+  // misfire on the Creator Board.
   const players = await sql<Array<{
     id: number; web_name: string; first_name: string; second_name: string;
-  }>>`SELECT id, web_name, first_name, second_name FROM players WHERE status <> 'u'`;
+  }>>`
+    SELECT id, web_name, first_name, second_name
+      FROM players
+     WHERE status <> 'u'
+       AND COALESCE(season_minutes, 0) > 0
+  `;
   const lexicon = buildLexicon(players);
   console.log(`→ lexicon: ${lexicon.length} players`);
 
