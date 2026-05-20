@@ -220,3 +220,213 @@ export async function getTransferInsights(
   }
   return out;
 }
+
+/* ---------------------------------------------------------------------------
+ * EV decomposition + per-fixture deltas (for the Transfer Planner's "why")
+ *
+ * `getTransferEvBreakdown` returns, for every player in `playerIds`:
+ *   - components: summed xpts_* components over the next `horizonGws` fixtures
+ *   - perFixture: one row per upcoming fixture (next ≤ horizonGws) with the
+ *     fixture's xpts_total, opponent short, home/away, and gameweek_id
+ *
+ * Two reads:
+ *   (1) projections joined to fixtures filtered by gameweek_id window
+ *   (2) teams lookup so we can resolve the opponent's short_name
+ *
+ * The caller then computes IN - OUT component deltas and renders the bar.
+ * Keeping the math in the UI layer keeps the SQL simple and reusable for the
+ * compare-to overlay (§3d), which feeds in arbitrary player_id pairs.
+ * -------------------------------------------------------------------------*/
+
+export interface EvComponents {
+  appearance: number;
+  goals: number;
+  assists: number;
+  cleanSheet: number;
+  bonus: number;
+  saves: number;
+  penSave: number;
+  cards: number;       // negative (a penalty)
+  concede: number;     // negative (a penalty)
+  owngoal: number;     // negative
+  defcon: number;
+  total: number;
+}
+
+export interface FixturePoint {
+  gameweekId: number;
+  fixtureId: number;
+  opp: string;
+  home: boolean;
+  xpts: number;
+}
+
+export interface PlayerEvBreakdown {
+  playerId: number;
+  components: EvComponents;
+  perFixture: FixturePoint[];
+}
+
+const ZERO_COMPONENTS: EvComponents = {
+  appearance: 0, goals: 0, assists: 0, cleanSheet: 0, bonus: 0,
+  saves: 0, penSave: 0, cards: 0, concede: 0, owngoal: 0, defcon: 0, total: 0
+};
+
+export async function getTransferEvBreakdown(
+  playerIds: number[],
+  startGameweek: number,
+  horizonGws: number
+): Promise<Map<number, PlayerEvBreakdown>> {
+  if (playerIds.length === 0 || horizonGws <= 0) return new Map();
+  const endGw = startGameweek + horizonGws - 1;
+
+  // Pull every projection row in the window for every requested player. The
+  // join to fixtures + teams lets us resolve "opponent short" without a second
+  // round-trip. Note: a player's team_id can change mid-season (loan, transfer
+  // window) — we resolve `was_home` by comparing fixture.team_h to the player's
+  // CURRENT team_id, which is the same logic the rest of the app uses.
+  const rows = await sql<Array<{
+    player_id: number; fixture_id: number; gameweek_id: number;
+    team_id: number; team_h: number; team_a: number;
+    home_short: string; away_short: string;
+    xpts_total: number;
+    xpts_appearance: number; xpts_goals: number; xpts_assists: number;
+    xpts_clean_sheet: number; xpts_bonus: number; xpts_saves: number;
+    xpts_pen_save: number; xpts_cards: number; xpts_concede: number;
+    xpts_owngoal: number; xpts_defcon: number;
+  }>>`
+    SELECT pr.player_id, pr.fixture_id, pr.gameweek_id,
+           p.team_id,
+           f.team_h, f.team_a,
+           th.short_name AS home_short,
+           ta.short_name AS away_short,
+           pr.xpts_total,
+           pr.xpts_appearance, pr.xpts_goals, pr.xpts_assists,
+           pr.xpts_clean_sheet, pr.xpts_bonus, pr.xpts_saves,
+           pr.xpts_pen_save, pr.xpts_cards, pr.xpts_concede,
+           pr.xpts_owngoal, COALESCE(pr.xpts_defcon, 0) AS xpts_defcon
+      FROM projections pr
+      JOIN players p ON p.id = pr.player_id
+      JOIN fixtures f ON f.id = pr.fixture_id
+      JOIN teams th ON th.id = f.team_h
+      JOIN teams ta ON ta.id = f.team_a
+     WHERE pr.player_id IN ${sql(playerIds as any)}
+       AND pr.gameweek_id BETWEEN ${startGameweek} AND ${endGw}
+     ORDER BY pr.player_id, pr.gameweek_id
+  `;
+
+  const out = new Map<number, PlayerEvBreakdown>();
+  // Seed every requested player so the caller always gets a value, even if
+  // the player has no projections in the window (e.g. zero upcoming fixtures).
+  for (const id of playerIds) {
+    out.set(id, { playerId: id, components: { ...ZERO_COMPONENTS }, perFixture: [] });
+  }
+  for (const r of rows) {
+    const entry = out.get(r.player_id)!;
+    const isHome = r.team_h === r.team_id;
+    entry.perFixture.push({
+      gameweekId: r.gameweek_id,
+      fixtureId: r.fixture_id,
+      opp: isHome ? r.away_short : r.home_short,
+      home: isHome,
+      xpts: Number(r.xpts_total) || 0
+    });
+    // A double-gameweek shows up as two rows for the same gameweek_id; we sum
+    // both into the components so the totals match xpts in the planner.
+    entry.components.appearance += Number(r.xpts_appearance) || 0;
+    entry.components.goals      += Number(r.xpts_goals) || 0;
+    entry.components.assists    += Number(r.xpts_assists) || 0;
+    entry.components.cleanSheet += Number(r.xpts_clean_sheet) || 0;
+    entry.components.bonus      += Number(r.xpts_bonus) || 0;
+    entry.components.saves      += Number(r.xpts_saves) || 0;
+    entry.components.penSave    += Number(r.xpts_pen_save) || 0;
+    entry.components.cards      += Number(r.xpts_cards) || 0;
+    entry.components.concede    += Number(r.xpts_concede) || 0;
+    entry.components.owngoal    += Number(r.xpts_owngoal) || 0;
+    entry.components.defcon     += Number(r.xpts_defcon) || 0;
+    entry.components.total      += Number(r.xpts_total) || 0;
+  }
+  return out;
+}
+
+/**
+ * Compute the per-component delta of a swap (IN - OUT). Negative deltas mean
+ * the outgoing player was actually stronger on that component — useful for
+ * showing "we're trading 0.3 clean-sheet points to gain 0.9 goal-threat".
+ */
+export function diffComponents(
+  inc: EvComponents,
+  out: EvComponents
+): EvComponents {
+  return {
+    appearance: inc.appearance - out.appearance,
+    goals:      inc.goals      - out.goals,
+    assists:    inc.assists    - out.assists,
+    cleanSheet: inc.cleanSheet - out.cleanSheet,
+    bonus:      inc.bonus      - out.bonus,
+    saves:      inc.saves      - out.saves,
+    penSave:    inc.penSave    - out.penSave,
+    cards:      inc.cards      - out.cards,
+    concede:    inc.concede    - out.concede,
+    owngoal:    inc.owngoal    - out.owngoal,
+    defcon:     inc.defcon     - out.defcon,
+    total:      inc.total      - out.total
+  };
+}
+
+/**
+ * Pair the IN player's per-fixture xPts with the OUT player's per-fixture
+ * xPts, matched by gameweek_id. Double-gameweeks are summed before pairing.
+ * Returns the union of both players' upcoming GWs so the user sees blanks
+ * on either side (e.g. a player going to a team with a blank GW shows 0).
+ */
+export interface PerGwDelta {
+  gameweekId: number;
+  inXpts: number;
+  outXpts: number;
+  inOpp: string | null;
+  outOpp: string | null;
+  inHome: boolean | null;
+  outHome: boolean | null;
+  delta: number;
+}
+
+export function pairPerFixture(
+  inFixtures: FixturePoint[],
+  outFixtures: FixturePoint[]
+): PerGwDelta[] {
+  const sumByGw = (fxs: FixturePoint[]) => {
+    const m = new Map<number, { xpts: number; opp: string; home: boolean }>();
+    for (const f of fxs) {
+      const prev = m.get(f.gameweekId);
+      if (!prev) {
+        m.set(f.gameweekId, { xpts: f.xpts, opp: f.opp, home: f.home });
+      } else {
+        // Double GW: sum xpts, label both opponents.
+        m.set(f.gameweekId, {
+          xpts: prev.xpts + f.xpts,
+          opp: `${prev.opp}+${f.opp}`,
+          home: prev.home
+        });
+      }
+    }
+    return m;
+  };
+  const inMap = sumByGw(inFixtures);
+  const outMap = sumByGw(outFixtures);
+  const gws = Array.from(new Set([...inMap.keys(), ...outMap.keys()])).sort((a, b) => a - b);
+  return gws.map(gw => {
+    const i = inMap.get(gw);
+    const o = outMap.get(gw);
+    return {
+      gameweekId: gw,
+      inXpts: i?.xpts ?? 0,
+      outXpts: o?.xpts ?? 0,
+      inOpp: i?.opp ?? null,
+      outOpp: o?.opp ?? null,
+      inHome: i?.home ?? null,
+      outHome: o?.home ?? null,
+      delta: (i?.xpts ?? 0) - (o?.xpts ?? 0)
+    };
+  });
+}

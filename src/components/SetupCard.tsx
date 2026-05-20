@@ -4,12 +4,14 @@ import { SubmitButton } from './SubmitButton';
 import { connectManagerForm } from '@/app/actions/session';
 
 /**
- * First-run setup card. Asks for an FPL manager ID and an optional classic
- * league ID, then runs the full ingestion + recompute server-side so the
- * dashboard works as soon as the form resolves.
+ * First-run setup card. Asks for just the FPL manager ID — every league the
+ * user belongs to is auto-pulled from /entry/{id}/ on connect, so there's no
+ * reason to make them type a league ID. The Mini League page exposes a
+ * dropdown over those leagues.
  */
-export function SetupCard({ prefillManager, prefillLeague }: {
+export function SetupCard({ prefillManager }: {
   prefillManager?: number | null;
+  /** @deprecated — left for backwards compat, no longer used. */
   prefillLeague?: number | null;
 }) {
   return (
@@ -19,24 +21,16 @@ export function SetupCard({ prefillManager, prefillLeague }: {
       action={<Badge tone="blue">setup</Badge>}
     >
       <form action={connectManagerForm} className="space-y-4">
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-          <Field
-            name="managerId"
-            label="FPL Manager ID"
-            placeholder="e.g. 1234567"
-            required
-            defaultValue={prefillManager ?? undefined}
-          />
-          <Field
-            name="leagueId"
-            label="Classic League ID (optional)"
-            placeholder="e.g. 987654"
-            defaultValue={prefillLeague ?? undefined}
-          />
-        </div>
-        <div className="flex items-center justify-between">
+        <Field
+          name="managerId"
+          label="FPL Manager ID"
+          placeholder="e.g. 1234567"
+          required
+          defaultValue={prefillManager ?? undefined}
+        />
+        <div className="flex items-center justify-between gap-3 flex-wrap">
           <p className="text-xs text-ink-dim max-w-md">
-            We will fetch your squad, your league standings, and run the model.
+            We will fetch your squad, all your leagues, and run the model.
             This takes about 5–15 seconds the first time. Nothing is submitted
             to FPL — read-only.
           </p>

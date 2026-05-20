@@ -95,6 +95,47 @@ export async function managerSummary(managerId: number) {
   )();
 }
 
+/**
+ * Players FPL has flagged: chance_of_playing < 100 or non-empty news. Marks
+ * squad-owned players. Sorted: owned-first, then most-at-risk (lowest
+ * chance_of_playing) first.
+ */
+export async function newsWatch(managerId: number, planningGw: number) {
+  const rows = await sql<Array<{
+    player_id: number; web_name: string; team_short: string; position: string;
+    status: string; news: string | null; news_added_at: string | null;
+    chance_of_playing_next_round: number | null;
+    chance_of_playing_this_round: number | null;
+    owned: boolean;
+  }>>`
+    SELECT p.id AS player_id, p.web_name, t.short_name AS team_short, p.position,
+           p.status, p.news, p.news_added_at,
+           p.chance_of_playing_next_round, p.chance_of_playing_this_round,
+           EXISTS (
+             SELECT 1 FROM manager_picks mp
+             WHERE mp.manager_id = ${managerId} AND mp.gameweek_id = ${planningGw}
+               AND mp.player_id = p.id
+           ) AS owned
+    FROM players p
+    JOIN teams t ON t.id = p.team_id
+    WHERE (
+      (p.chance_of_playing_next_round IS NOT NULL AND p.chance_of_playing_next_round < 100)
+      OR (p.news IS NOT NULL AND p.news <> '')
+      OR p.status <> 'a'
+    )
+    ORDER BY
+      EXISTS (
+        SELECT 1 FROM manager_picks mp
+        WHERE mp.manager_id = ${managerId} AND mp.gameweek_id = ${planningGw}
+          AND mp.player_id = p.id
+      ) DESC,
+      COALESCE(p.chance_of_playing_next_round, 50) ASC,
+      p.news_added_at DESC NULLS LAST
+    LIMIT 30
+  `;
+  return rows;
+}
+
 export async function squadForGameweek(managerId: number, gw: number) {
   return unstable_cache(
     async () => {

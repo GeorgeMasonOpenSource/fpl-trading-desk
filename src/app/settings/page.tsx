@@ -33,7 +33,7 @@ export default function SettingsPage() {
         </ul>
       </Card>
 
-      <SetupCard prefillManager={managerId} prefillLeague={leagueId} />
+      <SetupCard prefillManager={managerId} />
 
       <Card title="Environment fallbacks" subtitle="Used by GitHub Actions cron + when no cookie is set.">
         <ul className="text-sm font-mono space-y-1">

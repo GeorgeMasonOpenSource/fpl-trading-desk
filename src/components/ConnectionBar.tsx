@@ -4,15 +4,17 @@ import { saveIdsOnly, disconnect, refreshNowForm } from '@/app/actions/session';
 
 /**
  * Slim persistent strip at the top of the app showing the connected manager
- * and league. Includes an inline edit form (no JS required) and a "Refresh
- * now" button that re-runs ingestion + recompute server-side.
+ * and the currently active mini-league (name + id). The "edit" pop-out only
+ * exposes the manager ID — leagues are auto-pulled from /entry/{id}/ on
+ * connect and switched via the picker on the Mini League page.
  */
 export function ConnectionBar({
-  managerId, leagueId, managerName, lastIngest
+  managerId, leagueId, managerName, leagueName, lastIngest
 }: {
   managerId: number | null;
   leagueId: number | null;
   managerName: string | null;
+  leagueName: string | null;
   lastIngest: string | null;
 }) {
   const connected = managerId != null;
@@ -26,7 +28,7 @@ export function ConnectionBar({
         <span className="font-mono">{connected ? `${managerId}` : '—'}</span>
         {managerName && <span className="text-ink-dim">· {managerName}</span>}
         <span className="text-ink-muted ml-3">League</span>
-        <span className="font-mono">{leagueId ?? '—'}</span>
+        <span className="font-mono">{leagueName ?? (leagueId ? `${leagueId}` : '—')}</span>
       </div>
       <div className="flex-1" />
       <details className="relative">
@@ -47,16 +49,10 @@ export function ConnectionBar({
               className="mt-1 w-full bg-bg-inset border border-line rounded-md px-2 py-1 font-mono text-xs"
             />
           </label>
-          <label className="block">
-            <span className="text-[10px] uppercase tracking-widest text-ink-dim">League ID</span>
-            <input
-              name="leagueId"
-              type="number"
-              inputMode="numeric"
-              defaultValue={leagueId ?? ''}
-              className="mt-1 w-full bg-bg-inset border border-line rounded-md px-2 py-1 font-mono text-xs"
-            />
-          </label>
+          <p className="text-[10px] text-ink-dim leading-snug">
+            Leagues are auto-pulled when you connect. Switch between them on the{' '}
+            <span className="font-mono">Mini League War Room</span> page.
+          </p>
           <div className="flex justify-end gap-2 pt-1">
             <SubmitButton variant="secondary" className="!px-2 !py-1 !text-xs">Save</SubmitButton>
           </div>

@@ -498,35 +498,84 @@ export async function backfillPlayerHistory(playerIds: number[], concurrency = 5
   if (allRows.length === 0) return { fetched, rows: 0 };
 
   // Bulk INSERT, dedupe on (player, gw, fixture).
-  await sql`
-    INSERT INTO player_gameweek_history ${(sql as any)(allRows,
-      'player_id', 'gameweek_id', 'fixture_id', 'opponent_team', 'was_home',
-      'minutes', 'goals_scored', 'assists', 'clean_sheets', 'goals_conceded',
-      'own_goals', 'penalties_saved', 'penalties_missed', 'yellow_cards', 'red_cards',
-      'saves', 'bonus', 'bps', 'expected_goals', 'expected_assists',
-      'expected_goal_involvements', 'expected_goals_conceded', 'total_points', 'starts')}
-    ON CONFLICT (player_id, gameweek_id, fixture_id) DO UPDATE SET
-      minutes = EXCLUDED.minutes,
-      goals_scored = EXCLUDED.goals_scored,
-      assists = EXCLUDED.assists,
-      clean_sheets = EXCLUDED.clean_sheets,
-      goals_conceded = EXCLUDED.goals_conceded,
-      own_goals = EXCLUDED.own_goals,
-      penalties_saved = EXCLUDED.penalties_saved,
-      penalties_missed = EXCLUDED.penalties_missed,
-      yellow_cards = EXCLUDED.yellow_cards,
-      red_cards = EXCLUDED.red_cards,
-      saves = EXCLUDED.saves,
-      bonus = EXCLUDED.bonus,
-      bps = EXCLUDED.bps,
-      expected_goals = EXCLUDED.expected_goals,
-      expected_assists = EXCLUDED.expected_assists,
-      expected_goal_involvements = EXCLUDED.expected_goal_involvements,
-      expected_goals_conceded = EXCLUDED.expected_goals_conceded,
-      total_points = EXCLUDED.total_points,
-      starts = EXCLUDED.starts
-  `;
+  // Postgres caps a single statement at 65 534 bind parameters. We have 24
+  // columns per row, so anything over ~2700 rows blows past the cap with
+  // MAX_PARAMETERS_EXCEEDED. Chunking at 1500 rows leaves headroom for the
+  // ON CONFLICT clause and keeps each batch round-trip well under the limit.
+  const COLUMNS_PER_ROW = 24;
+  const MAX_PARAMS_PER_STMT = 60000;       // < 65534 with slack
+  const CHUNK_SIZE = Math.floor(MAX_PARAMS_PER_STMT / COLUMNS_PER_ROW); // ~2500
+  const BATCH = Math.min(1500, CHUNK_SIZE);
+  for (let i = 0; i < allRows.length; i += BATCH) {
+    const chunk = allRows.slice(i, i + BATCH);
+    await sql`
+      INSERT INTO player_gameweek_history ${(sql as any)(chunk,
+        'player_id', 'gameweek_id', 'fixture_id', 'opponent_team', 'was_home',
+        'minutes', 'goals_scored', 'assists', 'clean_sheets', 'goals_conceded',
+        'own_goals', 'penalties_saved', 'penalties_missed', 'yellow_cards', 'red_cards',
+        'saves', 'bonus', 'bps', 'expected_goals', 'expected_assists',
+        'expected_goal_involvements', 'expected_goals_conceded', 'total_points', 'starts')}
+      ON CONFLICT (player_id, gameweek_id, fixture_id) DO UPDATE SET
+        minutes = EXCLUDED.minutes,
+        goals_scored = EXCLUDED.goals_scored,
+        assists = EXCLUDED.assists,
+        clean_sheets = EXCLUDED.clean_sheets,
+        goals_conceded = EXCLUDED.goals_conceded,
+        own_goals = EXCLUDED.own_goals,
+        penalties_saved = EXCLUDED.penalties_saved,
+        penalties_missed = EXCLUDED.penalties_missed,
+        yellow_cards = EXCLUDED.yellow_cards,
+        red_cards = EXCLUDED.red_cards,
+        saves = EXCLUDED.saves,
+        bonus = EXCLUDED.bonus,
+        bps = EXCLUDED.bps,
+        expected_goals = EXCLUDED.expected_goals,
+        expected_assists = EXCLUDED.expected_assists,
+        expected_goal_involvements = EXCLUDED.expected_goal_involvements,
+        expected_goals_conceded = EXCLUDED.expected_goals_conceded,
+        total_points = EXCLUDED.total_points,
+        starts = EXCLUDED.starts
+    `;
+  }
   return { fetched, rows: allRows.length };
+}
+
+/**
+ * Upsert a list of European fixtures from a manual JSON file. The minutes
+ * engine flags a player's GW as pre-/post-European if their team has a
+ * European match within 4 days of the PL kickoff, which scales rotation
+ * penalty by (1 - rotation_resistance).
+ *
+ * Idempotent on (team_id, competition, kickoff_time): re-running won't
+ * duplicate rows.
+ */
+export async function upsertEuropeanFixtures(rows: Array<{
+  team_short: string; competition: string; kickoff_time: string;
+  opponent: string; is_home?: boolean; importance?: number; notes?: string;
+}>) {
+  if (rows.length === 0) return 0;
+  // Map team_short -> team_id via the teams table; skip rows we can't resolve.
+  const teams = await sql<Array<{ id: number; short_name: string }>>`
+    SELECT id, short_name FROM teams
+  `;
+  const idByShort = new Map(teams.map(t => [t.short_name, t.id]));
+  let inserted = 0;
+  for (const r of rows) {
+    const teamId = idByShort.get(r.team_short);
+    if (!teamId) continue;
+    await sql`
+      INSERT INTO european_fixtures
+        (team_id, competition, kickoff_time, opponent, is_home, importance, source, notes)
+      VALUES (
+        ${teamId}, ${r.competition}, ${r.kickoff_time}::timestamptz,
+        ${r.opponent}, ${r.is_home ?? false},
+        ${r.importance ?? 1.0}, 'manual_json', ${r.notes ?? null}
+      )
+      ON CONFLICT DO NOTHING
+    `;
+    inserted++;
+  }
+  return inserted;
 }
 
 export async function upsertClassicLeague(league: FplClassicLeague, gw: number) {

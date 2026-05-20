@@ -2,14 +2,33 @@ import { Card } from '@/components/ui/Card';
 import { Badge } from '@/components/ui/Badge';
 import { Table, THead, TH, TR, TD } from '@/components/ui/Table';
 import { compareTransferScenarios, rankTopTransfers } from '@/lib/transfers/optimiser';
-import { getTransferInsights } from '@/lib/transfers/insights';
+import {
+  getTransferInsights,
+  getTransferEvBreakdown,
+  diffComponents,
+  pairPerFixture
+} from '@/lib/transfers/insights';
 import { TransferWhy } from '@/components/TransferWhy';
+import { EvDecompositionBar } from '@/components/EvDecompositionBar';
+import { CompareToOverlay } from '@/components/CompareToOverlay';
 import { getGameweeks, managerSummary } from '@/lib/db/queries';
 import { getManagerId } from '@/lib/session';
 import { NotConnected } from '@/components/NotConnected';
 import { WhatIfTransfer } from '@/components/WhatIfTransfer';
 import { listMySquad, listCandidates } from '@/app/actions/whatif';
 import { fmt } from '@/lib/util/fmt';
+
+// Horizon (in GWs) used for the EV decomposition bar. We use 3 GW so a fixture
+// swing doesn't dominate (a single big-difficulty week would otherwise paint
+// the whole bar). 3 GW also matches the optimiser's primary EV horizon, so
+// the bar's "net" lines up with the +pts column in the row.
+const EV_BREAKDOWN_HORIZON_GWS = 3;
+// Heuristic value of a banked FT — used purely for the counterfactual line on
+// the transfer planner ("rolling banks a transfer worth ~X EV"). The number is
+// the long-run average EV gain of the top-1 transfer in the next GW assuming
+// the same squad; we use 0.5 as a conservative constant rather than simulating
+// next week. Tune later if backtesting suggests a different floor.
+const BANKED_FT_EV = 0.5;
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -37,10 +56,16 @@ export default async function TransferPlanner() {
 
   // Pull the recent-form + upcoming-fixture context for every player involved
   // in the top-10 list (both sides), so the user can audit each suggestion.
+  // We also batch-fetch the projection component breakdown across the next
+  // EV_BREAKDOWN_HORIZON_GWS gameweeks so each row can render its own
+  // stacked-bar decomposition + per-GW delta without an extra round-trip.
   const involvedIds = Array.from(new Set(
     topTransfers.flatMap(t => [t.out.playerId, t.in.playerId])
   ));
-  const insights = await getTransferInsights(involvedIds, gw.id);
+  const [insights, evBreakdowns] = await Promise.all([
+    getTransferInsights(involvedIds, gw.id),
+    getTransferEvBreakdown(involvedIds, gw.id, EV_BREAKDOWN_HORIZON_GWS)
+  ]);
 
   return (
     <div className="space-y-6">
@@ -103,7 +128,22 @@ export default async function TransferPlanner() {
               <div className="text-right">Net £</div>
               <div>Flags</div>
             </div>
-            {topTransfers.map(t => (
+            {topTransfers.map(t => {
+              const inBreak  = evBreakdowns.get(t.in.playerId);
+              const outBreak = evBreakdowns.get(t.out.playerId);
+              const delta = inBreak && outBreak
+                ? diffComponents(inBreak.components, outBreak.components)
+                : null;
+              const perGw = inBreak && outBreak
+                ? pairPerFixture(inBreak.perFixture, outBreak.perFixture)
+                : [];
+              // §3c counterfactual — the EV gain from rolling is: you give up
+              // this week's projected gain (-evGain1) but bank a transfer for
+              // next week (worth ~BANKED_FT_EV). The optimiser scores `roll`
+              // as zero EV by construction; this line surfaces the implicit
+              // trade-off so the user can see it on each row.
+              const rollNet = BANKED_FT_EV - t.evGain1;
+              return (
               <details
                 key={`${t.out.playerId}-${t.in.playerId}`}
                 className="group bg-bg-card border border-line rounded-md open:bg-bg-inset"
@@ -142,11 +182,24 @@ export default async function TransferPlanner() {
                       {t.changesCaptain && <Badge tone="violet">new C</Badge>}
                     </div>
                   </div>
-                  <div className="mt-1 text-[10px] text-ink-dim group-open:hidden">
-                    click to see recent form + upcoming fixtures →
+                  <div className="mt-1 flex items-center justify-between text-[10px] text-ink-dim">
+                    <span className="group-open:hidden">
+                      click to see EV breakdown, fixtures, and recent form →
+                    </span>
+                    <span
+                      className={`font-mono ${rollNet >= 0 ? 'text-accent-amber' : 'text-ink-dim'}`}
+                      title="Rolling banks a transfer; we estimate a banked FT is worth ~0.5 EV."
+                    >
+                      {rollNet >= 0
+                        ? `roll instead: net +${fmt(rollNet, 2)} EV (bank FT)`
+                        : `vs roll: −${fmt(-rollNet, 2)} EV given up by rolling`}
+                    </span>
                   </div>
                 </summary>
-                <div className="px-3 py-3 border-t border-line">
+                <div className="px-3 py-3 border-t border-line space-y-4">
+                  {delta && (
+                    <EvDecompositionBar delta={delta} perGw={perGw} />
+                  )}
                   <TransferWhy
                     outName={t.out.webName}
                     inName={t.in.webName}
@@ -155,9 +208,26 @@ export default async function TransferPlanner() {
                   />
                 </div>
               </details>
-            ))}
+              );
+            })}
           </div>
         )}
+      </Card>
+
+      <Card
+        title="Compare to a competitor suggestion"
+        subtitle="Paste what FPL Review / a creator recommended; see our EV decomposition for that swap."
+      >
+        <CompareToOverlay
+          reference={
+            topTransfers[0]
+              ? {
+                  label: `${topTransfers[0].out.webName} → ${topTransfers[0].in.webName} (our #1)`,
+                  netEv: topTransfers[0].evGain3
+                }
+              : undefined
+          }
+        />
       </Card>
 
       <Card title="Why these routes?">

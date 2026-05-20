@@ -1,0 +1,71 @@
+# YouTube creator-signal ingest, run on a 6-hourly cron from GitHub Actions.
+#
+# Why GitHub Actions and not Vercel:
+#   YouTube rate-limits Vercel / AWS IP ranges aggressively. Actions runs from
+#   Azure-hosted runners which YouTube treats normally — we've seen 100% of
+#   captions returned vs ~10% on Vercel cron.
+#
+# Wiring:
+#   1. Repo Settings → Secrets and variables → Actions
+#        - DATABASE_URL          (pooled Neon URL — pgbouncer-safe)
+#        - DIRECT_DATABASE_URL   (direct Neon URL — used by scripts only)
+#   2. Workflow has no other inputs; the channel list is committed at
+#      data/youtube-channels.json.
+#   3. Logs are kept by Actions for 90 days; see the job summary for per-video
+#      counts of signals / numeric claims / rankings inserted.
+#
+# Safe to re-run: the DB INSERTs are all ON CONFLICT DO NOTHING (signals,
+# numeric_claims, rankings) so multiple runs in the same window are idempotent.
+
+name: ingest-youtube
+
+on:
+  schedule:
+    # Every 6 hours at :17 so we miss the on-the-hour spike of cron traffic.
+    - cron: '17 */6 * * *'
+  # Manual trigger from the Actions tab for one-off catch-up runs.
+  workflow_dispatch: {}
+
+# Don't pile up if a previous run is still going — newer wins.
+concurrency:
+  group: ingest-youtube
+  cancel-in-progress: false
+
+jobs:
+  ingest:
+    name: Pull videos + extract signals
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Run YouTube ingest
+        env:
+          # These map to the same env vars our scripts read locally. The
+          # DIRECT_DATABASE_URL is used by tsx scripts to avoid pgbouncer's
+          # session-mode limitations on prepared statements.
+          DATABASE_URL:        ${{ secrets.DATABASE_URL }}
+          DIRECT_DATABASE_URL: ${{ secrets.DIRECT_DATABASE_URL }}
+        run: npm run ingest:youtube
+
+      - name: Summarise to job summary
+        if: always()
+        run: |
+          {
+            echo "### YouTube ingest"
+            echo ""
+            echo "- Triggered: ${{ github.event_name }}"
+            echo "- Runner: ${{ runner.os }} (${{ runner.arch }})"
+            echo "- Commit: \`${{ github.sha }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

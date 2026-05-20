@@ -4,7 +4,8 @@ import { RecommendationCard } from '@/components/RecommendationCard';
 import { StaleDataWarning } from '@/components/StaleDataWarning';
 import { PlayerCard, PlayerCardData } from '@/components/PlayerCard';
 import { SetupCard } from '@/components/SetupCard';
-import { getGameweeks, lastIngestAt, managerSummary, squadForGameweek, livePoints } from '@/lib/db/queries';
+import { getGameweeks, lastIngestAt, managerSummary, squadForGameweek, livePoints, newsWatch } from '@/lib/db/queries';
+import { NewsWatch } from '@/components/NewsWatch';
 import { compareTransferScenarios } from '@/lib/transfers/optimiser';
 import { rankCaptains } from '@/lib/captaincy/engine';
 import { getManagerId, getLeagueId } from '@/lib/session';
@@ -35,7 +36,7 @@ export default async function DashboardPage() {
           <h1 className="text-2xl font-semibold">Welcome to the Trading Desk</h1>
           <p className="text-sm text-ink-muted mt-1">Connect your FPL team to price your next move.</p>
         </header>
-        <SetupCard prefillManager={null} prefillLeague={null} />
+        <SetupCard prefillManager={null} />
       </div>
     );
   }
@@ -57,6 +58,7 @@ export default async function DashboardPage() {
 
   const summary = await managerSummary(managerId);
   const planningSquad = await squadForGameweek(managerId, planning.id);
+  const news = await newsWatch(managerId, planning.id);
 
   // Live tracking for the in-progress GW (if any). When liveGw is null (early
   // season or just-finished week), this section is hidden.
@@ -161,6 +163,8 @@ export default async function DashboardPage() {
           }} />
         )}
       </div>
+
+      <NewsWatch items={news as any} />
 
       <Card title={`My team for ${planning.name} — minutes & xPts`}>
         <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">

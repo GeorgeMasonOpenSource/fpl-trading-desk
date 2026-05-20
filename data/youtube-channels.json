@@ -1,0 +1,25 @@
+{
+  "$comment": [
+    "FPL creators to monitor. Channel IDs (UC...) — find by visiting the",
+    "channel page, View Source, search for 'channelId' or 'externalId'.",
+    "We use YouTube's public RSS feed (no API key needed) to pull the latest",
+    "videos, then youtube-transcript to fetch captions."
+  ],
+  "channels": [
+    {
+      "id": "UCAPwhbIDMSNtQ78QSlo9f7w",
+      "name": "FPL Harry",
+      "max_age_days": 7
+    },
+    {
+      "id": "UCPm4ocSlxc1_vcxgWQcdxKA",
+      "name": "FPL Focal",
+      "max_age_days": 7
+    },
+    {
+      "id": "UCweDAlFm2LnVcOqaFU4_AGA",
+      "name": "FPL Mate",
+      "max_age_days": 7
+    }
+  ]
+}

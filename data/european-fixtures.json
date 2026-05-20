@@ -1,0 +1,18 @@
+{
+  "$comment": [
+    "Manual list of European fixtures for PL teams. The minutes engine uses this",
+    "to apply a pre-/post-European rotation penalty to the GW that flanks the",
+    "European match. Update as new European games are announced; the ingest",
+    "script is idempotent on (team_short, competition, kickoff_time).",
+    "",
+    "Fields:",
+    "  team_short    — FPL short code (ARS, MCI, LIV, …)",
+    "  competition   — UCL | UEL | UECL | FA | EFL | OTHER",
+    "  kickoff_time  — ISO 8601 UTC",
+    "  opponent      — free text",
+    "  is_home       — boolean",
+    "  importance    — 1.0 default; bump to 2.0 for finals, 1.5 for semis",
+    "  notes         — optional context"
+  ],
+  "fixtures": []
+}

@@ -17,6 +17,8 @@ const NAV = [
   { href: '/captaincy',          label: 'Captaincy' },
   { href: '/chip-planner',       label: 'Chip Planner' },
   { href: '/mini-league',        label: 'Mini League War Room' },
+  { href: '/creator-signals',    label: 'Creator Board' },
+  { href: '/creator-accuracy',   label: 'Creator Accuracy' },
   { href: '/player-explorer',    label: 'Player Explorer' },
   { href: '/minutes-lab',        label: 'Minutes Lab' },
   { href: '/role-matrix',        label: 'Role Matrix' },
@@ -32,6 +34,7 @@ async function loadConnectionContext() {
   const managerId = getManagerId();
   const leagueId  = getLeagueId();
   let managerName: string | null = null;
+  let leagueName: string | null = null;
   let lastIngest: string | null = null;
   try {
     if (managerId) {
@@ -40,6 +43,14 @@ async function loadConnectionContext() {
       `;
       managerName = rows[0]?.name ?? null;
     }
+    if (managerId && leagueId) {
+      const lrows = await sql<Array<{ name: string | null }>>`
+        SELECT name FROM manager_leagues
+        WHERE manager_id = ${managerId} AND league_id = ${leagueId}
+        LIMIT 1
+      `;
+      leagueName = lrows[0]?.name ?? null;
+    }
     const ing = await sql<Array<{ fetched_at: string | null }>>`
       SELECT MAX(fetched_at) AS fetched_at FROM raw_fpl_responses
     `;
@@ -47,7 +58,7 @@ async function loadConnectionContext() {
   } catch {
     // DB might not be reachable in dev / before migrations — render anyway.
   }
-  return { managerId, leagueId, managerName, lastIngest };
+  return { managerId, leagueId, managerName, leagueName, lastIngest };
 }
 
 export default async function RootLayout({ children }: { children: React.ReactNode }) {
@@ -81,6 +92,7 @@ export default async function RootLayout({ children }: { children: React.ReactNo
               managerId={ctx.managerId}
               leagueId={ctx.leagueId}
               managerName={ctx.managerName}
+              leagueName={ctx.leagueName}
               lastIngest={ctx.lastIngest}
             />
             <main className="p-6 max-w-[1600px] flex-1">{children}</main>

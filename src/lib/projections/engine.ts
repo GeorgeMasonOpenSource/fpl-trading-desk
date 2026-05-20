@@ -310,6 +310,7 @@ export async function recomputeProjectionsForGameweek(gameweekId: number) {
       penalties_order: number | null;
       corners_order: number | null; freekicks_order: number | null;
       team_xg_total: number; team_xa_total: number;
+      team_motivation: number; team_attacking: number; team_solidity: number;
     }>>`
       SELECT
         p.id, p.team_id, p.position,
@@ -345,7 +346,10 @@ export async function recomputeProjectionsForGameweek(gameweekId: number) {
         p.corners_and_indirect_freekicks_order AS corners_order,
         p.direct_freekicks_order               AS freekicks_order,
         COALESCE(t.season_xg_total, 0)::numeric AS team_xg_total,
-        COALESCE(t.season_xa_total, 0)::numeric AS team_xa_total
+        COALESCE(t.season_xa_total, 0)::numeric AS team_xa_total,
+        COALESCE(t.motivation_score, 0.7)::numeric AS team_motivation,
+        COALESCE(t.attacking_style, 0.5)::numeric AS team_attacking,
+        COALESCE(t.defensive_solidity, 0.5)::numeric AS team_solidity
       FROM players p
       JOIN teams t ON t.id = p.team_id
       LEFT JOIN player_baselines b ON b.player_id = p.id
@@ -361,6 +365,19 @@ export async function recomputeProjectionsForGameweek(gameweekId: number) {
       ) c ON TRUE
       WHERE p.team_id IN (${fix.team_h}, ${fix.team_a})
     `;
+
+    // Per-team context map so we can read the OPPONENT's style/solidity for
+    // each player (a striker faces the opposing team's defence, not his own).
+    const teamCtx = new Map<number, {
+      motivation: number; attacking: number; solidity: number;
+    }>();
+    for (const p of players) {
+      teamCtx.set(p.team_id, {
+        motivation: Number(p.team_motivation),
+        attacking: Number(p.team_attacking),
+        solidity: Number(p.team_solidity)
+      });
+    }
 
     // Pre-collect override info for this fixture's players in one query.
     const playerIds = players.map(p => p.id);
@@ -383,8 +400,25 @@ export async function recomputeProjectionsForGameweek(gameweekId: number) {
 
     for (const p of players) {
       const isHome = p.team_id === fix.team_h;
-      const teamXgFor = isHome ? exp.xgHome : exp.xgAway;
-      const teamXgAgainst = isHome ? exp.xgAway : exp.xgHome;
+      const opponentTeamId = isHome ? fix.team_a : fix.team_h;
+      const opp = teamCtx.get(opponentTeamId) ?? { motivation: 0.7, attacking: 0.5, solidity: 0.5 };
+      const own = teamCtx.get(p.team_id)     ?? { motivation: 0.7, attacking: 0.5, solidity: 0.5 };
+
+      // --- Style & motivation modulators -----------------------------------
+      // Attackers benefit when the OPPOSITION defence is leaky (solidity < 0.5)
+      // and is itself open/attacking (high attacking_style — counter-attacking
+      // teams trade chances). Compact low blocks (low attacking, high solidity)
+      // suppress xG.
+      //   styleMultiplier ∈ [~0.75, ~1.25]
+      const styleMultiplier =
+        1.0 + 0.25 * (0.5 - opp.solidity) + 0.10 * (opp.attacking - 0.5);
+      // Motivation: if your own team is unmotivated, expect more rotation +
+      // flatter performances. Multiplies expected minutes' headline output.
+      //   motivationMultiplier ∈ [~0.85, 1.0]
+      const motivationMultiplier = 0.85 + 0.15 * own.motivation;
+
+      const teamXgFor     = (isHome ? exp.xgHome : exp.xgAway) * styleMultiplier * motivationMultiplier;
+      const teamXgAgainst =  isHome ? exp.xgAway : exp.xgHome;
       const cs = isHome ? exp.cleanSheetProbHome : exp.cleanSheetProbAway;
 
       const playerOv = ovByPlayer.get(p.id) ?? [];

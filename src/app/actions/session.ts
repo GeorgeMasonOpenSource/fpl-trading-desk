@@ -40,20 +40,22 @@ export interface ConnectResult {
  */
 export async function connectManager(formData: FormData): Promise<ConnectResult> {
   const managerRaw = String(formData.get('managerId') ?? '').trim();
-  const leagueRaw = String(formData.get('leagueId') ?? '').trim();
   const managerId = Number(managerRaw);
   if (!Number.isFinite(managerId) || managerId <= 0) {
     return { ok: false, error: 'Manager ID must be a positive integer.' };
-  }
-  const leagueId = leagueRaw ? Number(leagueRaw) : null;
-  if (leagueRaw && (!Number.isFinite(leagueId!) || (leagueId ?? 0) <= 0)) {
-    return { ok: false, error: 'League ID must be a positive integer (or blank).' };
   }
 
   try {
     // 1. Validate manager via FPL (fast: single endpoint, ~300ms)
     const entry = await fpl.managerEntry(managerId);
     setManagerId(managerId);
+    // Auto-pick the user's top-ranked classic league as the active one
+    // (they can switch later via the LeaguePicker on /mini-league).
+    const classicLeagues = entry.leagues?.classic ?? [];
+    const topClassic = [...classicLeagues]
+      .filter(l => !l.closed)
+      .sort((a, b) => (a.entry_rank ?? 9e9) - (b.entry_rank ?? 9e9))[0];
+    const leagueId = topClassic?.id ?? null;
     setLeagueId(leagueId);
 
     // 2. Free transfer count from history (fast)
@@ -135,21 +137,17 @@ export async function connectManager(formData: FormData): Promise<ConnectResult>
   }
 }
 
-/** Just persist the cookies (no ingest). Used for the inline "edit" form. */
+/** Just persist the manager cookie (no ingest). Used for the inline "edit"
+ *  form. League is not editable here — leagues are auto-pulled from
+ *  /entry/{id}/ on connect and switched via the LeaguePicker on the
+ *  Mini League page. */
 export async function saveIdsOnly(formData: FormData) {
   const managerRaw = String(formData.get('managerId') ?? '').trim();
-  const leagueRaw  = String(formData.get('leagueId') ?? '').trim();
   if (managerRaw) {
     const n = Number(managerRaw);
     if (Number.isFinite(n) && n > 0) setManagerId(n);
   } else {
     setManagerId(null);
-  }
-  if (leagueRaw) {
-    const n = Number(leagueRaw);
-    if (Number.isFinite(n) && n > 0) setLeagueId(n);
-  } else {
-    setLeagueId(null);
   }
   revalidatePath('/', 'layout');
 }

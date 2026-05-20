@@ -11,14 +11,16 @@ const tone = {
 } as const;
 
 export function Badge({
-  tone: t = 'steel', children, className
-}: { tone?: keyof typeof tone; children: ReactNode; className?: string }) {
+  tone: t = 'steel', children, className, title
+}: { tone?: keyof typeof tone; children: ReactNode; className?: string; title?: string }) {
   return (
-    <span className={clsx(
-      'inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-mono font-medium',
-      tone[t],
-      className
-    )}>{children}</span>
+    <span
+      title={title}
+      className={clsx(
+        'inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-mono font-medium',
+        tone[t],
+        className
+      )}>{children}</span>
   );
 }
 

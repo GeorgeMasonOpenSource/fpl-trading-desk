@@ -18,11 +18,14 @@ import { fpl } from '../src/lib/fpl/client';
 import {
   upsertBootstrap, upsertFixtures, upsertManagerEntry, upsertManagerPicks,
   upsertClassicLeague, upsertEventLive, upsertManagerLeagues,
-  backfillPlayerHistory
+  backfillPlayerHistory, upsertEuropeanFixtures
 } from '../src/lib/fpl/normalise';
+import { readFileSync, existsSync } from 'node:fs';
+import { join } from 'node:path';
 import { sql } from '../src/lib/db/client';
 import { recomputeBaselines } from '../src/lib/projections/baseline';
 import { recomputeTeamStrengths } from '../src/lib/projections/team-strength';
+import { recomputeTeamContext } from '../src/lib/projections/team-context';
 import { recomputeMinutesForGameweek } from '../src/lib/minutes/engine';
 import { recomputeProjectionsForGameweek } from '../src/lib/projections/engine';
 
@@ -131,8 +134,26 @@ async function main() {
     console.log(`  fetched ${res.fetched}/${ids.length} · upserted ${res.rows} history rows`);
   }
 
+  // European fixtures from manual JSON. The minutes engine reads
+  // european_fixtures to apply a pre-/post-European rotation penalty.
+  const euPath = join(process.cwd(), 'data', 'european-fixtures.json');
+  if (existsSync(euPath)) {
+    try {
+      const json = JSON.parse(readFileSync(euPath, 'utf8'));
+      const list = Array.isArray(json?.fixtures) ? json.fixtures : [];
+      if (list.length > 0) {
+        const n = await upsertEuropeanFixtures(list);
+        console.log(`→ european fixtures: upserted ${n}`);
+      }
+    } catch (err) {
+      console.warn(`  european fixtures json failed: ${(err as Error).message}`);
+    }
+  }
+
   console.log('→ team strengths');
   await recomputeTeamStrengths();
+  console.log('→ team context (table position, motivation, style)');
+  await recomputeTeamContext();
   console.log('→ baselines');
   await recomputeBaselines();
 
