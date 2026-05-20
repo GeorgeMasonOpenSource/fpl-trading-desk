@@ -6,7 +6,7 @@ import { currentGameweek } from '@/lib/db/queries';
 import { getManagerId, getLeagueId } from '@/lib/session';
 import { NotConnected } from '@/components/NotConnected';
 import { LeaguePicker } from '@/components/LeaguePicker';
-import { listMyLeagues } from '@/app/actions/leagues';
+import { listMyLeagues, selectLeague } from '@/app/actions/leagues';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -135,7 +135,7 @@ export default async function MiniLeague() {
         </>
       )}
 
-      <Card title="All my leagues" subtitle="Auto-pulled from FPL on every refresh">
+      <Card title="All my leagues" subtitle="Click a league to switch the war-room view to it.">
         <Table>
           <THead>
             <TH>League</TH>
@@ -149,9 +149,29 @@ export default async function MiniLeague() {
               const delta = (l.entryRank != null && l.entryLastRank != null)
                 ? l.entryLastRank - l.entryRank
                 : null;
+              const isActive = l.leagueId === leagueId;
+              // Each row becomes a tiny <form> that posts the league_id to
+              // the selectLeague server action on click. Wrapping individual
+              // cells in <form> is awkward; the cleanest pattern is to put
+              // a single full-width button inside the first cell and let
+              // CSS make the table row visually clickable.
               return (
-                <TR key={l.leagueId}>
-                  <TD className="font-semibold">{l.name}</TD>
+                <TR
+                  key={l.leagueId}
+                  className={`group transition ${isActive ? 'bg-bg-inset' : 'hover:bg-bg-inset/60 cursor-pointer'}`}
+                >
+                  <TD className="font-semibold">
+                    <form action={selectLeague}>
+                      <input type="hidden" name="leagueId" value={l.leagueId} />
+                      <button
+                        type="submit"
+                        className="text-left w-full hover:text-accent-blue transition"
+                        title={isActive ? 'Active league' : 'Switch to this league'}
+                      >
+                        {l.name}
+                      </button>
+                    </form>
+                  </TD>
                   <TD className="text-right font-mono">{l.entryRank ?? '—'}</TD>
                   <TD className={`text-right font-mono ${
                     delta == null ? '' : delta > 0 ? 'text-accent-green' : delta < 0 ? 'text-accent-red' : 'text-ink-dim'
@@ -159,7 +179,11 @@ export default async function MiniLeague() {
                     {delta == null ? '—' : delta > 0 ? `+${delta}` : `${delta}`}
                   </TD>
                   <TD className="text-xs text-ink-muted">{l.scoring === 'h' ? 'H2H' : 'classic'}</TD>
-                  <TD>{l.leagueId === leagueId && <Badge tone="green">active</Badge>}</TD>
+                  <TD>
+                    {isActive
+                      ? <Badge tone="green">active</Badge>
+                      : <span className="text-[10px] text-ink-dim group-hover:text-accent-blue">switch →</span>}
+                  </TD>
                 </TR>
               );
             })}

@@ -19,6 +19,7 @@ const NAV = [
   { href: '/mini-league',        label: 'Mini League War Room' },
   { href: '/creator-signals',    label: 'Creator Board' },
   { href: '/decision-matrix',    label: 'Decision Matrix' },
+  { href: '/creator-lineups',    label: 'Creator Lineups' },
   { href: '/creator-accuracy',   label: 'Creator Accuracy' },
   { href: '/player-explorer',    label: 'Player Explorer' },
   { href: '/minutes-lab',        label: 'Minutes Lab' },

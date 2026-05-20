@@ -29,8 +29,19 @@ import { getSignalValidations, alignVerdictToKind, type Verdict } from './valida
  * one row per player per bucket, summarising creators + signal count.
  */
 
-const BUY_KINDS = new Set(['buying', 'recommend', 'start']);
-const SELL_KINDS = new Set(['selling', 'bench']);
+// Only ACTIONABLE intent kinds, not team-selection commentary.
+//
+//   `start` and `bench` are factual claims about a player's MATCHDAY status
+//   (X will start, X is on the bench), not a buy/sell recommendation. They
+//   live on the Manager Quotes tab of the Creator Board where they belong.
+//   Including them here was flooding Strong BUYs with "Tavernier will start"
+//   and similar team-news lines.
+//
+//   `recommend` = "must own / love / great pick" → genuine buy advice.
+//   `buying`    = explicit transfer-in intent.
+//   `selling`   = explicit transfer-out intent.
+const BUY_KINDS = new Set(['buying', 'recommend']);
+const SELL_KINDS = new Set(['selling']);
 
 export interface DecisionMatrixEntry {
   playerId: number;
