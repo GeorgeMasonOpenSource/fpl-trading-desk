@@ -18,7 +18,8 @@
     "ingest:league": "tsx scripts/ingest-league.ts",
     "recompute:projections": "tsx scripts/recompute-projections.ts",
     "backtest:run": "tsx scripts/backtest-run.ts",
-    "ingest:youtube": "tsx scripts/ingest-youtube.ts"
+    "ingest:youtube": "tsx scripts/ingest-youtube.ts",
+    "probe:transcript": "tsx scripts/probe-transcript.ts"
   },
   "dependencies": {
     "@neondatabase/serverless": "^0.9.4",

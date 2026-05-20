@@ -14,6 +14,7 @@ import { sql } from '../src/lib/db/client';
 import { fetchChannelVideos } from '../src/lib/youtube/fetcher';
 import { fetchTranscript } from '../src/lib/youtube/transcript';
 import { extractAll, buildLexicon } from '../src/lib/youtube/extractor';
+import { decideGwFilter } from '../src/lib/youtube/gw-filter';
 import {
   upsertVideo, recordTranscriptStatus, getUnprocessedVideos,
   insertSignals, insertNumericClaims, insertCreatorRankings
@@ -62,12 +63,28 @@ async function main() {
   let totalSignals = 0;
   let totalNumeric = 0;
   let totalRankings = 0;
+  let skippedOldGw = 0;
   for (const v of queue) {
     try {
+      // Skip videos that are clearly about a past gameweek. The decision is
+      // purely from the title — we don't have to fetch the transcript to know
+      // a "GW37 deadline stream" can't help us plan GW38.
+      const gwDecision = decideGwFilter(v.title, planningGwId);
+      if (!gwDecision.keep) {
+        await recordTranscriptStatus(
+          v.video_id,
+          'skipped_old_gw',
+          `Title targets GW${gwDecision.videoGw}, planning is GW${gwDecision.planningGw}`
+        );
+        skippedOldGw++;
+        console.log(`  ${v.title.slice(0, 60)} — skipped (GW${gwDecision.videoGw} ≠ planning GW${gwDecision.planningGw})`);
+        continue;
+      }
+
       const tx = await fetchTranscript(v.video_id);
       if (tx.status !== 'ok') {
         await recordTranscriptStatus(v.video_id, tx.status, tx.error);
-        console.log(`  ${v.title.slice(0, 60)} — ${tx.status}`);
+        console.log(`  ${v.title.slice(0, 60)} — ${tx.status}${tx.error ? ` (${tx.error})` : ''}`);
         continue;
       }
       const out = extractAll(tx.cues, lexicon);
@@ -93,7 +110,7 @@ async function main() {
 
   console.log(
     `done. ${totalSignals} new signals, ${totalNumeric} numeric claims, ` +
-    `${totalRankings} rankings.`
+    `${totalRankings} rankings, ${skippedOldGw} videos skipped (old GW).`
   );
   await sql.end();
 }
