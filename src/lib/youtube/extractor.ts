@@ -290,12 +290,12 @@ export function extractAll(
   }
   let rankingWindow: RankingWindow | null = null;
 
-  // Stitch tokens into rolling 8-cue windows so a sentence spanning a cue
-  // boundary still matches AND the raw quote we slice has enough context on
-  // either side of the player mention. Was 4 cues (~120 chars total) which
-  // forced quotes to truncate mid-word; 8 cues gives ~240 chars to work with.
+  // Stitch tokens into rolling 16-cue windows. Each cue is ~30-50 chars
+  // so 16 cues gives ~500-800 chars of context to slice through. We need
+  // this much because buildSentenceQuote now extends up to 2 sentences
+  // forward (~280 chars on the right side of a mention).
   for (let i = 0; i < tokens.length; i++) {
-    const window = tokens.slice(i, i + 8);
+    const window = tokens.slice(i, i + 16);
     const windowText = window.map(t => t.text).join(' ');
     const lower = windowText.toLowerCase();
     const windowStartSec = Math.round(window[0]!.startSec);
@@ -390,6 +390,24 @@ export function extractAll(
         });
       }
 
+      // §1a-fix — local "X to Y" / "X for Y" direction detection.
+      // A creator saying "Saka to Palmer" means PALMER comes IN (buy). We
+      // need to recognise this BEFORE the section-inversion rule fires,
+      // because the section header that opened the segment ("transfers
+      // out") would otherwise flip the buy interpretation to a sell.
+      //
+      // Rules:
+      //   - "<word> to <PLAYER>"  → PLAYER is incoming (buying)
+      //   - "<word> for <PLAYER>" → PLAYER is incoming (buying)
+      //   - "<PLAYER> to <word>"  → PLAYER is outgoing (selling)
+      //   - "<PLAYER> for <word>" → PLAYER is outgoing (selling)
+      // We look in a tight ±40-char window so we don't get fooled by
+      // unrelated uses of "to" / "for" further away in the sentence.
+      const tightBefore = before.slice(-40);
+      const tightAfter  = after.slice(0, 40);
+      const isIncomingSwap = /\b\w+\s+(?:to|for)\s*$/i.test(tightBefore);
+      const isOutgoingSwap = /^\s*(?:to|for)\s+\w/i.test(tightAfter);
+
       // Main signal panel.
       for (const pat of PATTERNS) {
         let hit = false;
@@ -400,21 +418,27 @@ export function extractAll(
 
         const rawQuote = buildSentenceQuote(windowText, startIdx, endIdx);
 
-        // §1a — re-interpret a "recommend"/"buying"/"love" hit inside a
-        // transfers_out / avoid section as the opposite (`selling`). This is
-        // the inversion that catches "I love Saka… so I'm devastated to be
-        // selling him" being read as buying.
+        // Resolve the signal kind in priority order:
+        //   1. Direction detection wins — if the player is on the right
+        //      side of "X to/for PLAYER", they're a buy no matter what
+        //      section the creator was in.
+        //   2. Otherwise, section context inverts buy↔sell as before,
+        //      but ONLY when no direction was detected.
         let kind: SignalKind = pat.kind;
-        if (currentSection === 'transfers_out' || currentSection === 'avoid') {
+        if (isIncomingSwap) {
+          kind = 'buying';
+        } else if (isOutgoingSwap) {
+          kind = 'selling';
+        } else if (currentSection === 'transfers_out' || currentSection === 'avoid') {
+          // Section context: in a transfers-out segment a "love" / "must
+          // own" hit usually means the creator is reflecting on why they
+          // can't quite let the player go — flip toward selling.
           if (kind === 'recommend' || kind === 'buying' || kind === 'watching') {
             kind = 'selling';
           } else if (kind === 'start' && currentSection === 'avoid') {
             kind = 'bench';
           }
         } else if (currentSection === 'transfers_in') {
-          // Inside transfers-in, a `selling` hit (e.g. "I'm done selling X")
-          // probably means the creator is moving away from selling and TOWARD
-          // buying — flip it to be safe; the user can still dismiss.
           if (kind === 'selling') kind = 'buying';
         }
 
@@ -615,17 +639,21 @@ export function buildLexicon(players: Array<{
  * get reasonable quotes either way.
  * -------------------------------------------------------------------------*/
 function buildSentenceQuote(text: string, mentionStart: number, mentionEnd: number): string {
-  // Max characters to extend on each side of the mention. Tuned so a typical
-  // FPL transcript snippet shows the full surrounding thought (~30–50 words).
-  const MAX_RADIUS = 180;
+  // Max characters to extend on each side. Tuned so quotes capture the
+  // creator's full thought (~50-80 words = 1-3 sentences). Was 180.
+  const MAX_RADIUS = 280;
+  // How many sentence terminators to capture FORWARD. 2 = current sentence
+  // plus the next one — gives much fuller context (e.g. "Gyökeres to
+  // Bowen. I could have a look at selling Cherki out." instead of just
+  // truncating at the first period).
+  const FORWARD_SENTENCES = 2;
 
-  // ----- Backward: look for the start of the current sentence ----------
+  // ----- Backward: walk back to the start of the current sentence -----
+  // We want to begin at a clean sentence boundary, never mid-word.
   const backStart = Math.max(0, mentionStart - MAX_RADIUS);
   const before = text.slice(backStart, mentionStart);
-  // Find the last `. ` / `! ` / `? ` (terminator + whitespace) in the window.
-  // We start AFTER that terminator so the quote begins at a sentence boundary.
   const sentRe = /[.!?]\s+/g;
-  let lastSentEnd = -1;
+  let lastSentEnd = -1;     // position AFTER the last terminator in `before`
   let m: RegExpExecArray | null;
   while ((m = sentRe.exec(before)) !== null) {
     lastSentEnd = m.index + m[0].length;
@@ -634,37 +662,41 @@ function buildSentenceQuote(text: string, mentionStart: number, mentionEnd: numb
   if (lastSentEnd >= 0) {
     start = backStart + lastSentEnd;
   } else if (backStart === 0) {
-    // We've hit the start of the transcript — keep it.
     start = 0;
   } else {
-    // No sentence terminator inside the window. Snap to the NEXT word
-    // boundary so we don't begin mid-word. Walk forward past any
-    // non-whitespace until we find a space, then start just after it.
+    // No sentence terminator inside the window. Snap to the next word
+    // boundary so we don't begin mid-word.
     start = backStart;
     while (start < mentionStart && /\S/.test(text[start] ?? '')) start++;
     while (start < mentionStart && /\s/.test(text[start] ?? '')) start++;
   }
 
-  // ----- Forward: look for the end of the current sentence -------------
+  // ----- Forward: capture up to FORWARD_SENTENCES sentence endings ----
+  // Take the position of the Nth terminator inside the lookahead window,
+  // not the first — gives meaningfully more context after a player mention.
   const fwdEnd = Math.min(text.length, mentionEnd + MAX_RADIUS);
   const after = text.slice(mentionEnd, fwdEnd);
-  // First terminator after the mention that's followed by whitespace or EOS.
-  const fwdMatch = after.match(/[.!?](?:\s|$)/);
+  const fwdRe = /[.!?](?:\s|$)/g;
+  let nthTermEnd = -1;     // 1-indexed position past the Nth terminator
+  let count = 0;
+  while ((m = fwdRe.exec(after)) !== null) {
+    count++;
+    nthTermEnd = m.index + 1; // include the terminator character itself
+    if (count >= FORWARD_SENTENCES) break;
+  }
   let end: number;
-  if (fwdMatch && fwdMatch.index !== undefined) {
-    end = mentionEnd + fwdMatch.index + 1; // include the terminator itself
+  if (nthTermEnd >= 0) {
+    end = mentionEnd + nthTermEnd;
   } else if (fwdEnd === text.length) {
     end = text.length;
   } else {
-    // No terminator — snap back to a word boundary. Walk backward from
-    // fwdEnd to the last whitespace before it.
     end = fwdEnd;
     while (end > mentionEnd && /\S/.test(text[end - 1] ?? '')) end--;
   }
 
   // Guard rails — never emit a quote shorter than the mention itself.
-  if (end <= mentionStart) end = Math.min(text.length, mentionEnd + 40);
-  if (start >= mentionEnd) start = Math.max(0, mentionStart - 40);
+  if (end <= mentionStart) end = Math.min(text.length, mentionEnd + 60);
+  if (start >= mentionEnd) start = Math.max(0, mentionStart - 60);
 
   return text.slice(start, end).trim();
 }

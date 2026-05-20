@@ -174,16 +174,45 @@ export async function getDecisionMatrix(
   modelEdge.sort(byXpts);
   strongSells.sort(byEndorsement);
 
-  // 6. Blind spots: top 30 xPts players for the next 3 GW that have
-  //    NO buy-side signal in the matrix. Excludes players already in any
-  //    quadrant on the buy side.
+  // 6. Filter by ownership status, per quadrant. Logic:
+  //    - BUY quadrants: drop players already in the squad. Suggesting we
+  //      "buy" someone you own is noise — you can't buy them again.
+  //    - SELL quadrants: keep ONLY owned players. You can only sell what
+  //      you own; selling Salah doesn't help if he's not in your team.
+  //    - Blind spots: drop owned (these are candidates to add).
+  //
+  // When no manager is connected we skip the filter entirely so an
+  // anonymous viewer still sees the full matrix.
+  const filterUnowned = (list: DecisionMatrixEntry[]) =>
+    managerId == null ? list : list.filter(e => !e.owned);
+  const filterOwned   = (list: DecisionMatrixEntry[]) =>
+    managerId == null ? list : list.filter(e =>  e.owned);
+  const strongBuysFiltered  = filterUnowned(strongBuys);
+  const expertEdgeFiltered  = filterUnowned(expertEdge);
+  const modelEdgeFiltered   = filterOwned(modelEdge);
+  const strongSellsFiltered = filterOwned(strongSells);
+
+  // 7. Blind spots: top 30 xPts players for the next 3 GW that have
+  //    NO buy-side signal in the matrix (after the ownership filter).
+  //    Excludes players already in any quadrant on the buy side OR
+  //    in the user's squad — they aren't blind spots if you already own them.
   const buyerIds = new Set([
-    ...strongBuys.map(e => e.playerId),
-    ...expertEdge.map(e => e.playerId)
+    ...strongBuysFiltered.map(e => e.playerId),
+    ...expertEdgeFiltered.map(e => e.playerId)
   ]);
   const blindSpots = await loadBlindSpots(buyerIds, startGameweek, managerId);
+  const blindSpotsFiltered = managerId == null
+    ? blindSpots
+    : blindSpots.filter(e => !e.owned);
 
-  return { startGameweek, strongBuys, expertEdge, modelEdge, strongSells, blindSpots };
+  return {
+    startGameweek,
+    strongBuys:  strongBuysFiltered,
+    expertEdge:  expertEdgeFiltered,
+    modelEdge:   modelEdgeFiltered,
+    strongSells: strongSellsFiltered,
+    blindSpots:  blindSpotsFiltered
+  };
 }
 
 function buildEntry(

@@ -37,9 +37,27 @@ interface ConsensusRow {
   creator_names: string[];
 }
 
-export default async function CreatorSignals() {
+// Signal kinds that come straight from press conferences / team news.
+// When the user filters to "Manager Quotes" we keep only these — editorial
+// opinions ("I love Saka", "must own X") drop away, leaving the factual
+// claims a manager would make at a podium.
+const FACTUAL_KINDS = new Set(['start', 'bench', 'injury', 'penalty', 'setpiece']);
+const EDITORIAL_KINDS = new Set(['recommend', 'watching', 'buying', 'selling']);
+
+type ViewMode = 'all' | 'manager_quotes' | 'editorial';
+
+export default async function CreatorSignals({
+  searchParams
+}: { searchParams?: { view?: string } }) {
   const managerId = getManagerId();
   if (!managerId) return <NotConnected where="Creator Signals" />;
+
+  // Default to "all" so the page works without a query string. The two
+  // alternatives filter by signal-kind family.
+  const view: ViewMode =
+    searchParams?.view === 'manager_quotes' ? 'manager_quotes' :
+    searchParams?.view === 'editorial'      ? 'editorial' :
+                                              'all';
 
   const rows = await sql<Row[]>`
     SELECT s.id AS signal_id, s.player_id, p.web_name, p.position, t.short_name AS team_short,
@@ -65,6 +83,14 @@ export default async function CreatorSignals() {
      LIMIT 200
   `;
 
+  // Apply the view filter in-memory — the SQL already paginated and ranked
+  // the full set, so we keep the same ordering across views and just drop
+  // rows that don't belong in the current tab.
+  const filteredRows =
+    view === 'manager_quotes' ? rows.filter(r => FACTUAL_KINDS.has(r.signal_kind)) :
+    view === 'editorial'      ? rows.filter(r => EDITORIAL_KINDS.has(r.signal_kind)) :
+                                rows;
+
   // §2a: validation badges. Pull the planning gameweek so the validation
   // horizon (3 GW) lines up with the planner's top-10 horizon. Falls back to
   // the current GW if there's no upcoming deadline (off-season).
@@ -81,7 +107,7 @@ export default async function CreatorSignals() {
     `;
     startGw = cur[0]?.id;
   }
-  const distinctPlayerIds = Array.from(new Set(rows.map(r => r.player_id)));
+  const distinctPlayerIds = Array.from(new Set(filteredRows.map(r => r.player_id)));
   const validations = startGw
     ? await getSignalValidations(distinctPlayerIds, startGw)
     : new Map();
@@ -104,7 +130,7 @@ export default async function CreatorSignals() {
   // maximum consensus level across that player's signals (so a 3/3 endorsed
   // player jumps to the top), then by total mentions for the tiebreak.
   const byPlayer = new Map<number, Row[]>();
-  for (const r of rows) {
+  for (const r of filteredRows) {
     if (!byPlayer.has(r.player_id)) byPlayer.set(r.player_id, []);
     byPlayer.get(r.player_id)!.push(r);
   }
@@ -122,6 +148,11 @@ export default async function CreatorSignals() {
     return b.length - a.length;
   });
 
+  // Tab counts for the header — derived from the FULL rows array so the
+  // numbers don't change as the user toggles between views.
+  const factualCount   = rows.filter(r => FACTUAL_KINDS.has(r.signal_kind)).length;
+  const editorialCount = rows.filter(r => EDITORIAL_KINDS.has(r.signal_kind)).length;
+
   return (
     <div className="space-y-6">
       <header>
@@ -131,9 +162,24 @@ export default async function CreatorSignals() {
           Deterministically extracted from YouTube captions — every signal links back
           to the exact moment in the video. Accept to translate into a manual override
           (the only path by which creator commentary influences the model). Dismiss to
-          hide. Editorial signals (recommend / watching / buying / selling) don't auto-translate;
-          they're for your judgement.
+          hide. Editorial signals (recommend / watching / buying / selling) don&apos;t auto-translate;
+          they&apos;re for your judgement.
         </p>
+        {/* View tabs — manager-quotes filters to factual kinds (start / bench /
+            injury / penalty / setpiece), which is what creators relay from
+            press conferences. Editorial is the opinions track. */}
+        <nav className="flex gap-1 mt-3 text-xs font-medium">
+          <TabLink href="/creator-signals"                         active={view === 'all'}            label={`All · ${rows.length}`} />
+          <TabLink href="/creator-signals?view=manager_quotes"    active={view === 'manager_quotes'} label={`Manager quotes · ${factualCount}`} />
+          <TabLink href="/creator-signals?view=editorial"         active={view === 'editorial'}      label={`Editorial · ${editorialCount}`} />
+        </nav>
+        {view === 'manager_quotes' && (
+          <p className="text-[11px] text-ink-dim mt-2 max-w-2xl">
+            Filtered to factual claims a manager would make at a podium —
+            starts, benchings, knocks, penalty / set-piece duties. Creator
+            opinions about who to buy or sell are hidden in this tab.
+          </p>
+        )}
       </header>
 
       {groups.length === 0 ? (
@@ -303,4 +349,25 @@ function formatTime(secs: number): string {
   const m = Math.floor(secs / 60);
   const s = secs % 60;
   return `${m}:${s.toString().padStart(2, '0')}`;
+}
+
+/**
+ * Tab-style nav link. Uses a plain anchor (not next/link) because each tab
+ * is a query-string variant of the same page and Next will handle the
+ * RSC navigation cleanly without prefetching. Adds a subtle bottom border
+ * to the active tab so the user always knows which view they're in.
+ */
+function TabLink({ href, active, label }: { href: string; active: boolean; label: string }) {
+  return (
+    <a
+      href={href}
+      className={
+        active
+          ? 'px-3 py-1.5 border-b-2 border-accent-blue text-ink'
+          : 'px-3 py-1.5 border-b-2 border-transparent text-ink-muted hover:text-ink hover:border-line'
+      }
+    >
+      {label}
+    </a>
+  );
 }

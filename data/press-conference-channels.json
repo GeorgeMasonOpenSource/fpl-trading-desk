@@ -1,0 +1,59 @@
+{
+  "$comment": [
+    "Press-conference YouTube channels. These are the official Premier League",
+    "and club channels where pre-match pressers and team news are posted.",
+    "The ingest script doesn't read this yet — the Creator Board's",
+    "'Manager quotes' tab currently filters existing signals to factual",
+    "kinds (start / bench / injury / penalty / setpiece), which catches the",
+    "press-conference quotes that creators have already relayed.",
+    "",
+    "To enable direct ingest, extend scripts/ingest-youtube.ts to load this",
+    "list alongside data/youtube-channels.json and stamp source_type =",
+    "'press_conference' on the resulting youtube_videos rows (schema:",
+    "ALTER TABLE youtube_videos ADD COLUMN source_type TEXT DEFAULT 'creator').",
+    "Channel IDs are in the format UC*. Find one by visiting the channel",
+    "page, viewing source, and grepping for \"channelId\":"
+  ],
+  "channels": [
+    {
+      "id": "UCG5qGWdu8nIRZqJ_GgDwQ-w",
+      "name": "Premier League",
+      "max_age_days": 4
+    },
+    {
+      "id": "UCpryVRk_VDudG8SHXgWcG0w",
+      "name": "Arsenal",
+      "max_age_days": 4
+    },
+    {
+      "id": "UCt4t-jeY85JegMlZ-E5UWtA",
+      "name": "Liverpool FC",
+      "max_age_days": 4
+    },
+    {
+      "id": "UCkzCjdRMrW2vXLx8mvPVLdQ",
+      "name": "Manchester City",
+      "max_age_days": 4
+    },
+    {
+      "id": "UC6yW44UGJJBvYTlfC7CRg2Q",
+      "name": "Manchester United",
+      "max_age_days": 4
+    },
+    {
+      "id": "UCEnq28K_x8KqVTQ-ZbDxYHA",
+      "name": "Tottenham Hotspur",
+      "max_age_days": 4
+    },
+    {
+      "id": "UCU2PacFf99vhb3hNiYDmxww",
+      "name": "Chelsea FC",
+      "max_age_days": 4
+    },
+    {
+      "id": "UCN-EFnGdkbukDmZRrxQhQbA",
+      "name": "Newcastle United",
+      "max_age_days": 4
+    }
+  ]
+}
