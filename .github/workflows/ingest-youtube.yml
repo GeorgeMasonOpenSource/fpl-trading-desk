@@ -47,8 +47,23 @@ jobs:
           node-version: '20'
           cache: 'npm'
 
-      - name: Install deps
+      - name: Install Node deps
         run: npm ci
+
+      # yt-dlp is the most reliable caption fetcher in 2026 — YouTube's
+      # anti-bot has tightened to the point that the plain HTTP / Innertube
+      # strategies in transcript.ts now return HTTP 400 for unauthenticated
+      # requests. yt-dlp's maintainers patch around these changes weekly.
+      - name: Set up Python (for yt-dlp)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install yt-dlp
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --upgrade yt-dlp
+          yt-dlp --version
 
       - name: Run YouTube ingest
         env:

@@ -24,6 +24,8 @@
  * ranges. The recommended run target is a local laptop or a GitHub Actions
  * runner (Azure-hosted), not Vercel functions.
  */
+import { isYtDlpAvailable, fetchViaYtDlp } from './ytdlp';
+
 export interface TranscriptCue {
   text: string;
   startSec: number;
@@ -61,12 +63,27 @@ export async function fetchTranscript(videoId: string): Promise<TranscriptResult
   // Try every strategy in order. First one that returns cues wins. We log
   // each failure into a composite error message so the caller (and the
   // probe script) can see exactly what each strategy said.
-  const attempts: Array<{ name: string; run: () => Promise<TranscriptResult> }> = [
-    { name: 'watch-page',           run: () => fetchViaWatchPage(videoId) },
-    { name: 'innertube-android',    run: () => fetchViaPlayerApi(videoId, ANDROID_CLIENT) },
-    { name: 'innertube-ios',        run: () => fetchViaPlayerApi(videoId, IOS_CLIENT) },
-    { name: 'innertube-tvhtml5',    run: () => fetchViaPlayerApi(videoId, TVHTML5_CLIENT) }
-  ];
+  //
+  // yt-dlp goes FIRST when available — its maintainers actively patch
+  // around YouTube's anti-bot changes (PoToken, visitor IDs, etc), so
+  // it's by far the most reliable. The pure-HTTP strategies are kept as
+  // a fallback for environments without yt-dlp installed.
+  const attempts: Array<{ name: string; run: () => Promise<TranscriptResult> }> = [];
+  if (await isYtDlpAvailable()) {
+    attempts.push({
+      name: 'yt-dlp',
+      run: async () => {
+        const r = await fetchViaYtDlp(videoId);
+        return { status: r.status, cues: r.cues, error: r.error };
+      }
+    });
+  }
+  attempts.push(
+    { name: 'watch-page',        run: () => fetchViaWatchPage(videoId) },
+    { name: 'innertube-android', run: () => fetchViaPlayerApi(videoId, ANDROID_CLIENT) },
+    { name: 'innertube-ios',     run: () => fetchViaPlayerApi(videoId, IOS_CLIENT) },
+    { name: 'innertube-tvhtml5', run: () => fetchViaPlayerApi(videoId, TVHTML5_CLIENT) }
+  );
   const errors: string[] = [];
   for (const a of attempts) {
     try {

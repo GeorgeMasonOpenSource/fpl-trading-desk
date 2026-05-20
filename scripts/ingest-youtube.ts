@@ -15,6 +15,7 @@ import { fetchChannelVideos } from '../src/lib/youtube/fetcher';
 import { fetchTranscript } from '../src/lib/youtube/transcript';
 import { extractAll, buildLexicon } from '../src/lib/youtube/extractor';
 import { decideGwFilter } from '../src/lib/youtube/gw-filter';
+import { isYtDlpAvailable } from '../src/lib/youtube/ytdlp';
 import {
   upsertVideo, recordTranscriptStatus, getUnprocessedVideos,
   insertSignals, insertNumericClaims, insertCreatorRankings
@@ -25,6 +26,20 @@ interface Channel { id: string; name: string; max_age_days?: number; }
 async function main() {
   const cfgPath = join(process.cwd(), 'data', 'youtube-channels.json');
   const cfg = JSON.parse(readFileSync(cfgPath, 'utf8')) as { channels: Channel[] };
+
+  // Probe yt-dlp once up-front so the user gets an early heads-up. Pure-HTTP
+  // strategies are very unreliable in 2026 — without yt-dlp this run will
+  // almost certainly produce zero signals.
+  const ytDlpOk = await isYtDlpAvailable();
+  if (ytDlpOk) {
+    console.log('→ yt-dlp detected — using it as primary caption fetcher');
+  } else {
+    console.warn(
+      '⚠ yt-dlp NOT detected. Pure-HTTP caption scraping is rate-limited / ' +
+      'blocked in 2026. Install with `brew install yt-dlp` (macOS) or ' +
+      '`pip install yt-dlp` (Linux/CI) for a working ingest.'
+    );
+  }
 
   // 1. Pull latest video metadata via RSS for each channel.
   for (const ch of cfg.channels) {
