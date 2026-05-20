@@ -26,35 +26,15 @@ import { sql } from '@/lib/db/client';
 import {
   getTransferEvBreakdown,
   diffComponents,
-  pairPerFixture,
-  type EvComponents,
-  type PerGwDelta
+  pairPerFixture
 } from '@/lib/transfers/insights';
-
-export interface CompareSwapPlayer {
-  playerId: number;
-  webName: string;
-  position: 'GKP' | 'DEF' | 'MID' | 'FWD';
-  teamShort: string;
-  nowCost: number;
-}
-
-export interface CompareSwapMatch {
-  query: string;
-  candidates: CompareSwapPlayer[];
-}
-
-export interface CompareSwapResult {
-  ok: boolean;
-  error?: string;
-  source?: string;                 // e.g. "FPL Review" if the input had a label
-  outResolved?: CompareSwapPlayer;
-  inResolved?: CompareSwapPlayer;
-  ambiguities?: CompareSwapMatch[];
-  delta?: EvComponents;
-  perGw?: PerGwDelta[];
-  netEv?: number;
-}
+// NOTE: types live in compare-swap.types.ts because Next.js requires
+// 'use server' files to export ONLY async functions. Don't move these back.
+import type {
+  CompareSwapPlayer,
+  CompareSwapMatch,
+  CompareSwapResult
+} from './compare-swap.types';
 
 /** Lowercase + strip combining diacritics so "Gyökeres" matches "gyokeres". */
 function normalize(s: string): string {

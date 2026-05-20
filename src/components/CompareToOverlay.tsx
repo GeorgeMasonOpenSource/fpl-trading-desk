@@ -13,7 +13,8 @@
  * resubmit with the disambiguating web_name.
  */
 import { useState, useTransition } from 'react';
-import { priceCompareSwap, type CompareSwapResult } from '@/app/actions/compare-swap';
+import { priceCompareSwap } from '@/app/actions/compare-swap';
+import type { CompareSwapResult } from '@/app/actions/compare-swap.types';
 import { EvDecompositionBar } from './EvDecompositionBar';
 import { fmt } from '@/lib/util/fmt';
 

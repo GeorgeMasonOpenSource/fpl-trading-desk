@@ -2,8 +2,10 @@ import { Card } from '@/components/ui/Card';
 import { Badge } from '@/components/ui/Badge';
 import { PlayerCard, PlayerCardData } from '@/components/PlayerCard';
 import { NotConnected } from '@/components/NotConnected';
+import { SquadRotationWatchlist } from '@/components/SquadRotationWatchlist';
 import { currentGameweek, squadForGameweek, managerSummary } from '@/lib/db/queries';
 import { getManagerId } from '@/lib/session';
+import { getSquadRotationRisk } from '@/lib/risk/squad-risk';
 import { n, fmt } from '@/lib/util/fmt';
 
 export const runtime = 'nodejs';
@@ -14,8 +16,14 @@ export default async function MyTeam() {
   if (!managerId) return <NotConnected where="My Team" />;
   const gw = await currentGameweek();
   if (!gw) return <p className="text-ink-muted">No gameweek data yet — hit Refresh.</p>;
-  const squad = await squadForGameweek(managerId, gw.id);
-  const summary = await managerSummary(managerId);
+  // Run the three reads in parallel — the rotation risk read joins
+  // projections + minutes + recent history so it would otherwise be the
+  // longest serial step.
+  const [squad, summary, rotationRisk] = await Promise.all([
+    squadForGameweek(managerId, gw.id),
+    managerSummary(managerId),
+    getSquadRotationRisk(managerId, gw.id)
+  ]);
   const starters = squad.filter(p => p.position <= 11);
   const bench    = squad.filter(p => p.position >  11);
   return (
@@ -29,6 +37,14 @@ export default async function MyTeam() {
           <Badge tone="violet">FT {n(summary?.free_transfers, 1)}</Badge>
         </div>
       </header>
+
+      <Card
+        title="Rotation watchlist"
+        subtitle="End-of-season rotation risk per squad player, with a safer alternative when one exists. Sorted by composite risk."
+      >
+        <SquadRotationWatchlist rows={rotationRisk} />
+      </Card>
+
       <Card title="Starting XI">
         <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
           {starters.map(p => <PlayerCard key={p.player_id} p={toCard(p)} />)}

@@ -3,6 +3,9 @@ import { Badge } from '@/components/ui/Badge';
 import { Table, THead, TH, TR, TD } from '@/components/ui/Table';
 import { sql } from '@/lib/db/client';
 import { currentGameweek } from '@/lib/db/queries';
+import { getManagerId } from '@/lib/session';
+import { getSquadRotationRisk } from '@/lib/risk/squad-risk';
+import { SquadRotationWatchlist } from '@/components/SquadRotationWatchlist';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -10,6 +13,11 @@ export const dynamic = 'force-dynamic';
 export default async function RotationRadar() {
   const gw = await currentGameweek();
   if (!gw) return <p>Run ingestion first.</p>;
+  // If a manager is connected, lead with their own squad — that's the
+  // question they're actually asking ("am I screwed this week?"). Anonymous
+  // users fall through to the league-wide tables below.
+  const managerId = getManagerId();
+  const squadRisk = managerId ? await getSquadRotationRisk(managerId, gw.id) : [];
 
   const ghostPoints = await sql<any[]>`
     SELECT p.web_name, t.short_name AS team_short, p.position,
@@ -42,6 +50,14 @@ export default async function RotationRadar() {
         <div className="text-xs uppercase tracking-widest text-ink-dim">Rotation radar</div>
         <h1 className="text-2xl font-semibold">Watchlist · {gw.name}</h1>
       </header>
+      {managerId && (
+        <Card
+          title="Your squad — rotation risk"
+          subtitle="Composite per-player risk, last-3-GW minutes trend, and a safer-swap suggestion when one exists."
+        >
+          <SquadRotationWatchlist rows={squadRisk} />
+        </Card>
+      )}
       <Card title="High xPts, bad minutes security" subtitle="Players the model rates but who might not start">
         <Table>
           <THead><TH>Player</TH><TH>Team</TH><TH>Pos</TH><TH className="text-right">xPts</TH><TH className="text-right">Start prob</TH><TH className="text-right">Rotation risk</TH></THead>
