@@ -17,6 +17,7 @@ import { NotConnected } from '@/components/NotConnected';
 import { WhatIfTransfer } from '@/components/WhatIfTransfer';
 import { listMySquad, listCandidates } from '@/app/actions/whatif';
 import { fmt } from '@/lib/util/fmt';
+import { sql } from '@/lib/db/client';
 
 // Horizon (in GWs) used for the EV decomposition bar. We use 3 GW so a fixture
 // swing doesn't dominate (a single big-difficulty week would otherwise paint
@@ -62,9 +63,13 @@ export default async function TransferPlanner() {
   const involvedIds = Array.from(new Set(
     topTransfers.flatMap(t => [t.out.playerId, t.in.playerId])
   ));
-  const [insights, evBreakdowns] = await Promise.all([
+  const [insights, evBreakdowns, defconStats] = await Promise.all([
     getTransferInsights(involvedIds, gw.id),
-    getTransferEvBreakdown(involvedIds, gw.id, EV_BREAKDOWN_HORIZON_GWS)
+    getTransferEvBreakdown(involvedIds, gw.id, EV_BREAKDOWN_HORIZON_GWS),
+    // Pull season DEFCON-per-90 + total DEFCON points for every player on
+    // the top-10. Lets the row table flag "Le Fée scores 4 points because
+    // he averages 9 def-actions/90 — borderline" vs "Anderson is 11/90, safe".
+    loadDefconStats(involvedIds)
   ]);
 
   return (
@@ -156,8 +161,9 @@ export default async function TransferPlanner() {
                         {t.out.webName}
                         <span className="ml-2 font-mono text-xs text-ink-dim">{fmt(t.out.xpts1, 2)} xPts</span>
                       </div>
-                      <div className="text-[10px] text-ink-dim font-mono">
-                        {t.out.position} · {t.out.teamShort} · £{(t.out.cost / 10).toFixed(1)}m
+                      <div className="text-[10px] text-ink-dim font-mono flex items-center gap-1.5">
+                        <span>{t.out.position} · {t.out.teamShort} · £{(t.out.cost / 10).toFixed(1)}m</span>
+                        <DefconChip stat={defconStats.get(t.out.playerId)} pos={t.out.position} />
                       </div>
                     </div>
                     <div>
@@ -165,8 +171,9 @@ export default async function TransferPlanner() {
                         {t.in.webName}
                         <span className="ml-2 font-mono text-xs text-accent-green">{fmt(t.in.xpts1, 2)} xPts</span>
                       </div>
-                      <div className="text-[10px] text-ink-dim font-mono">
-                        {t.in.position} · {t.in.teamShort} · £{(t.in.cost / 10).toFixed(1)}m
+                      <div className="text-[10px] text-ink-dim font-mono flex items-center gap-1.5">
+                        <span>{t.in.position} · {t.in.teamShort} · £{(t.in.cost / 10).toFixed(1)}m</span>
+                        <DefconChip stat={defconStats.get(t.in.playerId)} pos={t.in.position} />
                       </div>
                     </div>
                     <div className={`text-right font-mono ${t.evGain1 > 0.5 ? 'text-accent-green' : ''}`}>
@@ -252,4 +259,83 @@ async function WhatIfPanel() {
     byPos[pos] = await listCandidates(pos, 150);
   }
   return <WhatIfTransfer squad={squad} candidatesByPosition={byPos} />;
+}
+
+/**
+ * Tiny inline chip showing a player's DEFCON reliability tier + per-90
+ * value. Coloured green / amber / red so the user can eyeball whether
+ * a recommended 4-pointer actually earns the +2 defcon points consistently.
+ */
+function DefconChip({ stat, pos }: { stat: DefconStat | undefined; pos: 'GKP'|'DEF'|'MID'|'FWD' }) {
+  if (!stat) return null;
+  // GKP don't get defcon — they have saves instead. Hide the chip.
+  if (pos === 'GKP') return null;
+  const tone =
+    stat.reliability === 'high'    ? 'text-accent-green' :
+    stat.reliability === 'medium'  ? 'text-accent-amber' :
+    stat.reliability === 'low'     ? 'text-accent-red'   :
+                                     'text-ink-dim';
+  const threshold = pos === 'DEF' ? 10 : 12;
+  return (
+    <span
+      title={
+        stat.reliability === 'unknown'
+          ? 'Not enough minutes this season to estimate defcon reliability'
+          : `Season DEFCON ${stat.defconPer90.toFixed(1)}/90 vs ${threshold} threshold for ${pos}`
+      }
+      className={`font-mono ${tone}`}
+    >
+      defcon {stat.defconPer90.toFixed(1)}/90
+    </span>
+  );
+}
+
+interface DefconStat {
+  defconPer90: number;     // mean defensive actions per 90 mins this season
+  defconPoints: number;    // total 2-pt awards earned this season
+  reliability: 'high' | 'medium' | 'low' | 'unknown';
+}
+
+/**
+ * Pull season DEFCON stats for the involved players so the top-10 row UI can
+ * show "how reliable is this 4-pointer". Threshold tiers:
+ *   - high    ≥ 10 def-actions/90 (for DEF) or 12 (for MID/FWD)
+ *   - medium  within 2 of the threshold
+ *   - low     more than 2 below threshold
+ *   - unknown insufficient minutes (< 270 this season)
+ */
+async function loadDefconStats(playerIds: number[]): Promise<Map<number, DefconStat>> {
+  if (playerIds.length === 0) return new Map();
+  const rows = await sql<Array<{
+    id: number; position: 'GKP'|'DEF'|'MID'|'FWD';
+    season_defcon_per_90: number;
+    season_minutes: number;
+  }>>`
+    SELECT id, position,
+           COALESCE(season_defcon_per_90, 0) AS season_defcon_per_90,
+           COALESCE(season_minutes, 0)       AS season_minutes
+      FROM players
+     WHERE id IN ${sql(playerIds as any)}
+  `;
+  // DEFCON awards: 2 pts at 10 def actions for DEF, 12 for MID/FWD. We can
+  // approximate season points-from-defcon as floor(per_90 × games_played
+  // × hit_rate) but we don't have games_played handy without another join,
+  // so we report per_90 and leave points-earned for a future enhancement.
+  const out = new Map<number, DefconStat>();
+  for (const r of rows) {
+    const per90 = Number(r.season_defcon_per_90) || 0;
+    const threshold = r.position === 'DEF' ? 10 : 12;
+    let reliability: DefconStat['reliability'];
+    if (Number(r.season_minutes) < 270) {
+      reliability = 'unknown';
+    } else if (per90 >= threshold) {
+      reliability = 'high';
+    } else if (per90 >= threshold - 2) {
+      reliability = 'medium';
+    } else {
+      reliability = 'low';
+    }
+    out.set(r.id, { defconPer90: per90, defconPoints: 0, reliability });
+  }
+  return out;
 }

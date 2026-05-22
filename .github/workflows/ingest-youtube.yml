@@ -21,8 +21,12 @@ name: ingest-youtube
 
 on:
   schedule:
-    # Every 6 hours at :17 so we miss the on-the-hour spike of cron traffic.
-    - cron: '17 */6 * * *'
+    # Every 2 hours at :17 so we miss the on-the-hour spike of cron traffic.
+    # Was 6h — bumped to 2h so new creator videos land on the Creator
+    # Board within ~2h of upload (most creators post once a week, but the
+    # 24-48h pre-deadline window has a flurry of content we want to catch
+    # quickly).
+    - cron: '17 */2 * * *'
   # Manual trigger from the Actions tab for one-off catch-up runs.
   workflow_dispatch: {}
 
@@ -73,6 +77,18 @@ jobs:
           DATABASE_URL:        ${{ secrets.DATABASE_URL }}
           DIRECT_DATABASE_URL: ${{ secrets.DIRECT_DATABASE_URL }}
         run: npm run ingest:youtube
+
+      # Mini-league ingest piggy-backs on the same cron — rival picks
+      # only change at most twice a week (deadlines), but a 2h refresh
+      # keeps the Mini-League War Room broadly current. Requires the
+      # FPL_MANAGER_ID secret so it knows whose leagues to pull.
+      - name: Run mini-league ingest
+        if: ${{ env.FPL_MANAGER_ID != '' }}
+        env:
+          DATABASE_URL:        ${{ secrets.DATABASE_URL }}
+          DIRECT_DATABASE_URL: ${{ secrets.DIRECT_DATABASE_URL }}
+          FPL_MANAGER_ID:      ${{ secrets.FPL_MANAGER_ID }}
+        run: npm run ingest:league
 
       - name: Summarise to job summary
         if: always()
