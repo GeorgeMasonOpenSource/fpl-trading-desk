@@ -260,18 +260,24 @@ export function projectPlayer(ctx: PlayerProjectionContext): ProjectionResult {
   const defconThreshold = ctx.position === 'DEF' ? 10 : 12;
   let xpts_defcon = 0;
   if (ctx.position !== 'GKP' && ctx.defconPer90 > 0) {
-    // §model-sharpening — opposition-aware DEFCON.
-    // Defensive actions scale with how much the OPPONENT attacks: a
-    // possession-dominant attacking opponent forces more tackles /
-    // interceptions / recoveries; a low-block side gives fewer chances
-    // to act. Multiplier ∈ [0.7, 1.3] around the league-average 0.5
-    // attacking_style. So Le Fée vs Chelsea (≈0.75 attacking) gets a
-    // ~1.25× boost on expected actions; vs Burnley (≈0.30) gets ~0.8×.
-    const oppMultiplier = clamp01(0.5 + 0.6 * ctx.oppAttackingStyle) * 1.4;
+    // §model-sharpening — opposition-aware DEFCON, tightened.
+    //
+    // Defensive actions scale with how much the OPPONENT attacks. After
+    // the Bayesian team rating recompute, `attacking_style` is a
+    // multiplier around 1.0 (was 0..1 in the heuristic days), so the
+    // old `clamp01(0.5 + 0.6 × style) × 1.4` formula saturated at 1.4
+    // for almost every opponent — turning a sub-threshold player into
+    // an above-threshold one purely from the opp adjustment. New
+    // formula: opp multiplier ∈ [0.85, 1.15] centred on 1.0. A 15%
+    // boost for the most attacking side, 15% cut for the most defensive.
+    // Real-world: tackles/interceptions vary by team but ±15% captures
+    // it; the bigger driver is the PLAYER's per-90 rate.
+    const styleDelta = (ctx.oppAttackingStyle ?? 1.0) - 1.0;   // -0.4 .. +1.0 after Bayesian
+    const oppMultiplier = Math.max(0.85, Math.min(1.15, 1.0 + 0.15 * styleDelta));
     const baseExpectedActions = ctx.defconPer90 * (ctx.expectedMinutes / 90);
     const expectedActions = baseExpectedActions * oppMultiplier;
 
-    // P(Poisson(lambda) >= k) — small k so just sum k..k+10.
+    // P(Poisson(lambda) >= k) — sum 0..k-1 for the CDF.
     const lambda = expectedActions;
     let cdf = 0;
     let term = Math.exp(-lambda);
@@ -279,19 +285,43 @@ export function projectPlayer(ctx: PlayerProjectionContext): ProjectionResult {
       cdf += term;
       term = term * lambda / (i + 1);
     }
-    // §model-sharpening — small over-dispersion discount.
-    // Real defensive-action counts have higher variance than Poisson
-    // assumes (defensive activity comes in bursts). At low lambda the
-    // Poisson over-states P(X ≥ threshold) somewhat; we discount by 12%
-    // to be conservative. Cheap fix that matters most for borderline
-    // players around 70-85% of threshold.
-    const pDefcon = clamp01((1 - cdf) * 0.88);
+    let pDefconRaw = Math.max(0, 1 - cdf);
+
+    // §model-sharpening — strong over-dispersion correction for the
+    // SUB-THRESHOLD case. Defensive-action counts are bursty (a player
+    // might log 4 in one match and 14 in the next). When the per-90
+    // average is below the threshold, the Poisson tail OVERESTIMATES
+    // P(X ≥ threshold) because it ignores the wider variance — a
+    // Negative Binomial would be more honest. As a cheap proxy, scale
+    // the tail probability by how close baseExpected is to the
+    // threshold. If baseExpected ≥ threshold the player genuinely
+    // averages above, so no penalty. If baseExpected < threshold by
+    // more than 1.5, the empirical hit rate is much lower than Poisson
+    // suggests — we apply up to a 0.5× discount.
+    const gap = defconThreshold - baseExpectedActions; // positive when sub-threshold
+    let dispersionDiscount = 1.0;
+    if (gap > 0) {
+      // gap=0   → 1.00
+      // gap=1.5 → 0.75
+      // gap=3   → 0.50  (floor)
+      dispersionDiscount = Math.max(0.5, 1.0 - 0.17 * gap);
+    } else {
+      // Even above-threshold players have variance; keep the previous
+      // 12% conservative haircut so we don't overstate confidence.
+      dispersionDiscount = 0.88;
+    }
+    const pDefcon = Math.max(0, Math.min(1, pDefconRaw * dispersionDiscount));
+
     xpts_defcon = pDefcon * 2 * ctx.sixtyPlusProb;
-    if (xpts_defcon > 0.1) {
+    if (xpts_defcon > 0.05) {
       reasons.push({
         kind: 'defcon',
         weight: xpts_defcon,
-        detail: `${baseExpectedActions.toFixed(1)} actions × ${oppMultiplier.toFixed(2)} opp-style = ${expectedActions.toFixed(1)} expected; P(≥${defconThreshold}) ${(pDefcon*100).toFixed(0)}%`
+        detail:
+          `${baseExpectedActions.toFixed(1)} actions/match (per-90 ${ctx.defconPer90.toFixed(1)}) ` +
+          `× ${oppMultiplier.toFixed(2)} opp = ${expectedActions.toFixed(1)} expected. ` +
+          `Threshold ${defconThreshold}: Poisson tail ${(pDefconRaw*100).toFixed(0)}% × dispersion ${dispersionDiscount.toFixed(2)} ` +
+          `= P(≥${defconThreshold}) ${(pDefcon*100).toFixed(0)}%`
       });
     }
   }

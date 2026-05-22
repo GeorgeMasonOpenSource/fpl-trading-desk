@@ -24,11 +24,11 @@
  *   tsx scripts/recompute-all.ts --gw 38 --mc    # include monte carlo
  */
 
-import { sql } from '@/lib/db/client';
-import { recomputeTeamRatings, ratingFixtureXg } from '@/lib/projections/team-rating';
-import { recomputeHierarchicalEstimates } from '@/lib/projections/hierarchical';
-import { recomputeProjectionsForGameweek } from '@/lib/projections/engine';
-import { simulateFixture } from '@/lib/projections/monte-carlo';
+import { sql } from '../src/lib/db/client';
+import { recomputeTeamRatings, ratingFixtureXg } from '../src/lib/projections/team-rating';
+import { recomputeHierarchicalEstimates } from '../src/lib/projections/hierarchical';
+import { recomputeProjectionsForGameweek } from '../src/lib/projections/engine';
+import { simulateFixture } from '../src/lib/projections/monte-carlo';
 
 async function main() {
   const args = process.argv.slice(2);
@@ -92,6 +92,7 @@ async function main() {
   }
 
   console.log('[recompute-all] all stages complete');
+  await sql.end({ timeout: 5 });
   process.exit(0);
 }
 
