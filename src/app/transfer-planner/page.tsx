@@ -2,6 +2,7 @@ import { Card } from '@/components/ui/Card';
 import { Badge } from '@/components/ui/Badge';
 import { Table, THead, TH, TR, TD } from '@/components/ui/Table';
 import { compareTransferScenarios, rankTopTransfers } from '@/lib/transfers/optimiser';
+import { runLpPlan } from '@/lib/transfers/lp-runner';
 import {
   getTransferInsights,
   getTransferEvBreakdown,
@@ -45,14 +46,44 @@ export default async function TransferPlanner() {
   if (!gw) return <p className="text-ink-muted">No gameweek data yet — hit Refresh.</p>;
 
   const summary = await managerSummary(managerId);
-  const [scenarios, topTransfers] = await Promise.all([
+  const [scenarios, topTransfers, lpPlan1, lpPlan3] = await Promise.all([
     compareTransferScenarios({
       managerId, startGameweek: gw.id,
       freeTransfers: summary?.free_transfers ?? 1,
       evThreshold:  Number(process.env.EV_TRANSFER_THRESHOLD ?? 0.6),
       hitThreshold: Number(process.env.EV_HIT_THRESHOLD ?? 1.5)
     }),
-    rankTopTransfers(managerId, gw.id, 10)
+    rankTopTransfers(managerId, gw.id, 10),
+    // LP optimiser, 1-GW horizon: the globally-optimal single move for THIS
+    // gameweek given the budget + 3-per-club + position-shape constraints.
+    // Matches FPLReview's "Linear Optimiser" output.
+    runLpPlan({
+      managerId,
+      startGameweek: gw.id,
+      horizon: 1,
+      freeTransfers: summary?.free_transfers ?? 1,
+      allowHits: false
+    }).catch(err => ({
+      feasible: false as const,
+      reason: (err as Error).message,
+      horizon: 1, totalXpts: 0, hitsTaken: 0, bank: 0, spend: 0,
+      transfersIn: [], transfersOut: [], finalSquad: []
+    })),
+    // 3-GW horizon — useful when you have 2 FTs and want to think about the
+    // medium-term squad. Less critical for GW38 (last GW) but the planner
+    // shows both so the user can compare horizons.
+    runLpPlan({
+      managerId,
+      startGameweek: gw.id,
+      horizon: 3,
+      freeTransfers: summary?.free_transfers ?? 1,
+      allowHits: false
+    }).catch(err => ({
+      feasible: false as const,
+      reason: (err as Error).message,
+      horizon: 3, totalXpts: 0, hitsTaken: 0, bank: 0, spend: 0,
+      transfersIn: [], transfersOut: [], finalSquad: []
+    }))
   ]);
 
   // Pull the recent-form + upcoming-fixture context for every player involved
@@ -82,6 +113,21 @@ export default async function TransferPlanner() {
           only recommended if EV clears the threshold.
         </p>
       </header>
+      <Card
+        title="LP optimiser — globally optimal plan"
+        subtitle="Mirrors FPLReview's Linear Optimiser. Solves jointly across all constraints (budget, 3-per-club, 1/5/5/3 shape, free transfers). Beats the greedy ranker when the best move requires a budget reshuffle."
+      >
+        <LpPlanBlock plan={lpPlan1} horizonLabel={`GW${gw.id}`} />
+        {lpPlan3.feasible && (
+          <div className="mt-6 pt-6 border-t border-line">
+            <div className="text-xs uppercase tracking-widest text-ink-dim mb-3">
+              3-GW horizon (looking ahead, not just GW{gw.id})
+            </div>
+            <LpPlanBlock plan={lpPlan3} horizonLabel="3 GW" />
+          </div>
+        )}
+      </Card>
+
       <Card title="Scenario comparison" subtitle="EV gains over 1, 3, 6 and 8 GW horizons">
         <Table>
           <THead>
@@ -246,6 +292,97 @@ export default async function TransferPlanner() {
       </Card>
 
       <WhatIfPanel />
+    </div>
+  );
+}
+
+/**
+ * Render an LP-solver plan: the recommended IN/OUT swaps and the resulting
+ * total xPts. If infeasible (no candidate squad fits the constraints) shows
+ * the reason instead.
+ */
+function LpPlanBlock({ plan, horizonLabel }: { plan: import('@/lib/transfers/lp-runner').LpPlanResult; horizonLabel: string }) {
+  if (!plan.feasible) {
+    return (
+      <div className="text-sm text-ink-muted">
+        <span className="text-accent-amber">LP solver unavailable</span>
+        {plan.reason && <span className="ml-2 font-mono text-xs">— {plan.reason}</span>}
+        <p className="mt-2 text-xs text-ink-dim">
+          Install the solver locally with <span className="font-mono">npm install javascript-lp-solver</span>,
+          then redeploy. The greedy ranker below still runs in the meantime.
+        </p>
+      </div>
+    );
+  }
+  if (plan.transfersIn.length === 0) {
+    return (
+      <div className="text-sm text-ink-muted">
+        <Badge tone="green">No transfer recommended</Badge>
+        <span className="ml-3">
+          Your current 15 is already the optimal squad over the {horizonLabel} horizon
+          given budget and 3-per-club constraints. Roll the FT.
+        </span>
+        <p className="mt-2 text-xs text-ink-dim font-mono">
+          Total expected xPts over horizon: {plan.totalXpts.toFixed(2)}
+        </p>
+      </div>
+    );
+  }
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-center gap-3 text-sm">
+        <Badge tone={plan.hitsTaken === 0 ? 'green' : 'amber'}>
+          {plan.transfersIn.length} transfer{plan.transfersIn.length === 1 ? '' : 's'}
+          {plan.hitsTaken > 0 ? ` (incl. ${plan.hitsTaken} -4 hit${plan.hitsTaken === 1 ? '' : 's'})` : ''}
+        </Badge>
+        <span className="font-mono text-ink-muted">
+          Total xPts over {horizonLabel}: <span className="text-ink">{plan.totalXpts.toFixed(2)}</span>
+        </span>
+        <span className="font-mono text-ink-muted">
+          Net spend: <span className={plan.spend > 0 ? 'text-accent-amber' : 'text-accent-green'}>
+            {plan.spend === 0 ? '£0.0m' : `${plan.spend > 0 ? '-' : '+'}£${(Math.abs(plan.spend) / 10).toFixed(1)}m`}
+          </span>
+        </span>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div>
+          <div className="text-[10px] uppercase tracking-widest text-ink-dim mb-2">Sell</div>
+          <div className="space-y-1">
+            {plan.transfersOut.map(p => (
+              <div key={p.playerId} className="flex items-center justify-between bg-bg-card border border-line rounded px-3 py-2">
+                <div>
+                  <div className="font-medium">{p.webName}</div>
+                  <div className="text-[10px] text-ink-dim font-mono">
+                    {p.position} · {p.teamShort} · £{(p.sellingPrice / 10).toFixed(1)}m
+                  </div>
+                </div>
+                <div className="font-mono text-xs text-ink-muted">
+                  {p.xptsPerGw.toFixed(2)}/GW
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+        <div>
+          <div className="text-[10px] uppercase tracking-widest text-ink-dim mb-2">Buy</div>
+          <div className="space-y-1">
+            {plan.transfersIn.map(p => (
+              <div key={p.playerId} className="flex items-center justify-between bg-bg-card border border-line rounded px-3 py-2">
+                <div>
+                  <div className="font-medium">{p.webName}</div>
+                  <div className="text-[10px] text-ink-dim font-mono">
+                    {p.position} · {p.teamShort} · £{(p.cost / 10).toFixed(1)}m
+                  </div>
+                </div>
+                <div className="font-mono text-xs text-accent-green">
+                  {p.xptsPerGw.toFixed(2)}/GW
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
     </div>
   );
 }

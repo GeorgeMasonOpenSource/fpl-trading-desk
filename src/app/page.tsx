@@ -10,6 +10,7 @@ import { compareTransferScenarios } from '@/lib/transfers/optimiser';
 import { rankCaptains } from '@/lib/captaincy/engine';
 import { getManagerId, getLeagueId } from '@/lib/session';
 import { n, fmt } from '@/lib/util/fmt';
+import { sql } from '@/lib/db/client';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -63,16 +64,33 @@ export default async function DashboardPage() {
   const safe = async <T,>(fn: () => Promise<T>, fallback: T, label: string): Promise<T> => {
     try { return await fn(); }
     catch (err) {
-      // Vercel runtime log truncates single-line messages, so split into
-      // chunks: message + each line of the stack as its own log entry.
-      const e = err as Error;
+      const e = err as Error & { code?: string; detail?: string };
+      const msg = e?.message ?? String(err);
+      const stack = (e?.stack ?? '').split('\n').slice(0, 8).join(' | ');
       // eslint-disable-next-line no-console
-      console.error(`[Dashboard] ${label} FAIL message: ${e?.message ?? String(err)}`);
-      const stack = (e?.stack ?? '').split('\n').slice(0, 6);
-      for (const line of stack) {
-        // eslint-disable-next-line no-console
-        console.error(`[Dashboard] ${label} STACK: ${line.trim()}`);
-      }
+      console.error(`[Dashboard] ${label} FAIL message: ${msg}`);
+      console.error(`[Dashboard] ${label} STACK: ${stack}`);
+      // Vercel's runtime log table truncates at ~30 chars in the UI. To
+      // actually SEE what went wrong, write the error into a debug table
+      // we can query from psql / a /debug-errors page. Best-effort — if
+      // this insert ALSO fails, swallow it.
+      try {
+        await sql`
+          CREATE TABLE IF NOT EXISTS debug_errors (
+            id          BIGSERIAL PRIMARY KEY,
+            label       TEXT NOT NULL,
+            message     TEXT NOT NULL,
+            pg_code     TEXT,
+            pg_detail   TEXT,
+            stack       TEXT,
+            captured_at TIMESTAMPTZ NOT NULL DEFAULT now()
+          )
+        `;
+        await sql`
+          INSERT INTO debug_errors (label, message, pg_code, pg_detail, stack)
+          VALUES (${label}, ${msg}, ${e?.code ?? null}, ${e?.detail ?? null}, ${stack})
+        `;
+      } catch {/* swallow */}
       return fallback;
     }
   };
