@@ -63,8 +63,16 @@ export default async function DashboardPage() {
   const safe = async <T,>(fn: () => Promise<T>, fallback: T, label: string): Promise<T> => {
     try { return await fn(); }
     catch (err) {
+      // Vercel runtime log truncates single-line messages, so split into
+      // chunks: message + each line of the stack as its own log entry.
+      const e = err as Error;
       // eslint-disable-next-line no-console
-      console.error(`[Dashboard] ${label} failed:`, err);
+      console.error(`[Dashboard] ${label} FAIL message: ${e?.message ?? String(err)}`);
+      const stack = (e?.stack ?? '').split('\n').slice(0, 6);
+      for (const line of stack) {
+        // eslint-disable-next-line no-console
+        console.error(`[Dashboard] ${label} STACK: ${line.trim()}`);
+      }
       return fallback;
     }
   };

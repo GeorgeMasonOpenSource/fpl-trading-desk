@@ -144,19 +144,39 @@ export async function rankCaptains(managerId: number, gameweekId: number, league
     };
   });
 
-  // Stash for audit/replay
+  // Stash for audit/replay. Each row is best-effort — log on failure and
+  // continue so a single overflow/constraint problem doesn't take out the
+  // whole captaincy panel.
+  // NUMERIC(6,3) = max 999.999, NUMERIC(5,4) = max 9.9999. Clamp before
+  // inserting to be safe against any pathological computed values.
+  const clamp = (x: number, hi: number) => {
+    if (!Number.isFinite(x)) return 0;
+    if (x > hi) return hi;
+    if (x < -hi) return -hi;
+    return x;
+  };
   for (const opt of ranked) {
-    await sql`
-      INSERT INTO captaincy_simulations (
-        manager_id, gameweek_id, player_id, projection, ceiling, floor,
-        start_prob, effective_ownership, ml_impact, triple_cap_score, reasons, computed_at
-      ) VALUES (
-        ${managerId}, ${gameweekId}, ${opt.playerId},
-        ${opt.projection}, ${opt.ceiling}, ${opt.floor}, ${opt.startProb},
-        ${opt.effectiveOwnershipPct}, ${opt.miniLeagueImpact}, ${opt.tripleCaptainScore},
-        ${json(opt.reasons)}, now()
-      )
-    `;
+    try {
+      await sql`
+        INSERT INTO captaincy_simulations (
+          manager_id, gameweek_id, player_id, projection, ceiling, floor,
+          start_prob, effective_ownership, ml_impact, triple_cap_score, reasons, computed_at
+        ) VALUES (
+          ${managerId}, ${gameweekId}, ${opt.playerId},
+          ${clamp(opt.projection, 999.999)},
+          ${clamp(opt.ceiling,    999.999)},
+          ${clamp(opt.floor,      999.999)},
+          ${clamp(opt.startProb,  9.9999)},
+          ${clamp(opt.effectiveOwnershipPct, 999.999)},
+          ${clamp(opt.miniLeagueImpact,      999.999)},
+          ${clamp(opt.tripleCaptainScore,    999.999)},
+          ${json(opt.reasons)}, now()
+        )
+      `;
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error(`[rankCaptains] sim-insert failed pid=${opt.playerId}: ${(err as Error).message}`);
+    }
   }
 
   // Re-sort the main `ranked` list by risk-adjusted score so the top of
