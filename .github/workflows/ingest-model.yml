@@ -42,6 +42,16 @@ jobs:
     name: Pull external data + recompute projections
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    # Promote every secret to a job-level env var. This is needed because
+    # GitHub Actions DISALLOWS `secrets.X` in step-level `if:` conditions
+    # (security restriction — secrets can't be evaluated in expressions).
+    # By exposing them as env vars here, the steps below can use
+    # `env.X != ''` in their conditions.
+    env:
+      DATABASE_URL:        ${{ secrets.DATABASE_URL }}
+      DIRECT_DATABASE_URL: ${{ secrets.DIRECT_DATABASE_URL }}
+      ODDS_API_KEY:        ${{ secrets.ODDS_API_KEY }}
+      FPL_MANAGER_ID:      ${{ secrets.FPL_MANAGER_ID }}
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -62,22 +72,15 @@ jobs:
       - name: Ingest Understat shot data
         id: understat
         continue-on-error: true
-        env:
-          DATABASE_URL:        ${{ secrets.DATABASE_URL }}
-          DIRECT_DATABASE_URL: ${{ secrets.DIRECT_DATABASE_URL }}
         run: npm run ingest:understat
 
-      # 2. Bookmaker odds — only runs if the ODDS_API_KEY secret is set.
-      # Adds market-implied per-team xG which the ensemble blender folds
-      # into our model output.
+      # 2. Bookmaker odds — only runs if the ODDS_API_KEY env is non-empty.
+      # We check `env.X` not `secrets.X` because GH Actions disallows
+      # `secrets.*` in if: conditions (security restriction).
       - name: Ingest bookmaker odds
         id: odds
-        if: ${{ secrets.ODDS_API_KEY != '' }}
+        if: env.ODDS_API_KEY != ''
         continue-on-error: true
-        env:
-          DATABASE_URL:        ${{ secrets.DATABASE_URL }}
-          DIRECT_DATABASE_URL: ${{ secrets.DIRECT_DATABASE_URL }}
-          ODDS_API_KEY:        ${{ secrets.ODDS_API_KEY }}
         run: npm run ingest:odds
 
       # 3. FotMob confirmed lineups — only useful in the 60min before
@@ -87,9 +90,6 @@ jobs:
       - name: Ingest FotMob lineups
         id: lineups
         continue-on-error: true
-        env:
-          DATABASE_URL:        ${{ secrets.DATABASE_URL }}
-          DIRECT_DATABASE_URL: ${{ secrets.DIRECT_DATABASE_URL }}
         run: npm run ingest:lineups
 
       # 4. Full recompute. Bayesian team ratings → hierarchical pooling →
@@ -97,9 +97,6 @@ jobs:
       # populated (player_shot_aggregates, market_odds_latest,
       # minutes_projections overrides).
       - name: Recompute projections for next GW
-        env:
-          DATABASE_URL:        ${{ secrets.DATABASE_URL }}
-          DIRECT_DATABASE_URL: ${{ secrets.DIRECT_DATABASE_URL }}
         run: npm run recompute:all
 
       - name: Summarise to job summary

@@ -36,7 +36,14 @@ jobs:
           INGEST_SECRET: ${{ secrets.INGEST_SECRET }}
 
       - name: Ingest manager + league snapshot
-        if: ${{ secrets.FPL_MANAGER_ID != '' }}
+        # GH Actions disallows `secrets.*` in if: conditions, so we
+        # promote the manager id to env first then check `env.X`.
+        env:
+          BASE_URL: ${{ secrets.BASE_URL }}
+          INGEST_SECRET: ${{ secrets.INGEST_SECRET }}
+          FPL_MANAGER_ID: ${{ secrets.FPL_MANAGER_ID }}
+          FPL_LEAGUE_ID: ${{ secrets.FPL_LEAGUE_ID }}
+        if: env.FPL_MANAGER_ID != ''
         run: |
           curl -sS -X POST "${BASE_URL}/api/ingest/manager?managerId=${FPL_MANAGER_ID}" \
             -H "authorization: Bearer ${INGEST_SECRET}" \
@@ -46,8 +53,3 @@ jobs:
               -H "authorization: Bearer ${INGEST_SECRET}" \
               --fail
           fi
-        env:
-          BASE_URL: ${{ secrets.BASE_URL }}
-          INGEST_SECRET: ${{ secrets.INGEST_SECRET }}
-          FPL_MANAGER_ID: ${{ secrets.FPL_MANAGER_ID }}
-          FPL_LEAGUE_ID: ${{ secrets.FPL_LEAGUE_ID }}
