@@ -36,10 +36,10 @@ async function main() {
   const snapRows = await sql<Array<{ player_id: number; xpts_snap: number }>>`
     WITH latest AS (
       SELECT DISTINCT ON (player_id, fixture_id)
-             player_id, fixture_id, ((payload->>'xpts_total')::float8) AS xpts_total
+             player_id, fixture_id, xpts_total::float8 AS xpts_total
         FROM projection_snapshots
        WHERE gameweek_id = ${gw}
-       ORDER BY player_id, fixture_id, taken_at DESC
+       ORDER BY player_id, fixture_id, captured_at DESC
     )
     SELECT player_id, SUM(xpts_total)::float8 AS xpts_snap
       FROM latest

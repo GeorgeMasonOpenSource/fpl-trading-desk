@@ -111,10 +111,10 @@ async function loadTopMovers(gwId: number): Promise<{ climbers: MoverRow[]; fall
     const snapRows = await sql<Array<{ player_id: number; xpts_snap: number }>>`
       WITH latest AS (
         SELECT DISTINCT ON (player_id, fixture_id)
-               player_id, fixture_id, ((payload->>'xpts_total')::float8) AS xpts_total
+               player_id, fixture_id, xpts_total::float8 AS xpts_total
           FROM projection_snapshots
          WHERE gameweek_id = ${gwId}
-         ORDER BY player_id, fixture_id, taken_at DESC
+         ORDER BY player_id, fixture_id, captured_at DESC
       )
       SELECT player_id, SUM(xpts_total)::float8 AS xpts_snap
         FROM latest GROUP BY player_id
@@ -153,10 +153,10 @@ async function loadCalibration(): Promise<CalibrationRow[]> {
   }>>`
     WITH snap AS (
       SELECT DISTINCT ON (player_id, fixture_id)
-             player_id, fixture_id, ((payload->>'xpts_total')::float8) AS xpts_total
+             player_id, fixture_id, xpts_total::float8 AS xpts_total
         FROM projection_snapshots
        WHERE gameweek_id = ${lastGw}
-       ORDER BY player_id, fixture_id, taken_at DESC
+       ORDER BY player_id, fixture_id, captured_at DESC
     ),
     actuals AS (
       SELECT player_id, SUM(total_points)::float8 AS pts

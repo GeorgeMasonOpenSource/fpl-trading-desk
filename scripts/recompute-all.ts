@@ -32,6 +32,7 @@ import { simulateFixture } from '../src/lib/projections/monte-carlo';
 import { recomputePerPositionDefence } from '../src/lib/projections/per-position-defence';
 import { recomputeMinutesCalibration } from '../src/lib/minutes/per-position-calibration';
 import { recomputeSetPieceRoles } from '../src/lib/projections/set-piece-roles';
+import { recomputeMinutesForGameweek } from '../src/lib/minutes/engine';
 
 async function main() {
   const args = process.argv.slice(2);
@@ -111,6 +112,19 @@ async function main() {
     `;
   }
 
+  // 2b. Minutes engine — writes minutes_projections rows that the
+  // projection engine reads in step 3. Without this step, rotation_risk
+  // and expected_minutes are stale (from the last db:seed). Must run
+  // BEFORE the projection engine.
+  const t2a = Date.now();
+  console.log('[recompute-all] step 2b — minutes engine');
+  try {
+    const minutesRows = await recomputeMinutesForGameweek(targetGw);
+    console.log(`[recompute-all] step 2b done in ${Date.now() - t2a}ms (${minutesRows} fixtures processed)`);
+  } catch (err) {
+    console.warn(`[recompute-all] step 2b FAILED: ${(err as Error).message}`);
+  }
+
   // 3. Projection engine ------------------------------------------------
   const t2 = Date.now();
   console.log('[recompute-all] step 3/4 — projection engine');
@@ -175,11 +189,26 @@ async function runMonteCarloForGameweek(gameweekId: number) {
       bonus_per_90: number | null;
     }>>`
       SELECT p.id, p.position,
-             COALESCE(psa.shot_share_open_play, 0)::float8       AS shot_share,
-             COALESCE(psa.mean_xg_per_shot, 0.10)::float8        AS mean_xg_per_shot,
-             COALESCE(psa.assist_share, 0)::float8               AS assist_share,
-             COALESCE(p.minutes_per_app, 75)::float8             AS minutes_per_app,
-             COALESCE(p.bonus_per_90, 0.5)::float8               AS bonus_per_90
+             -- shot share = open-play shots / team total open-play shots.
+             -- Approximated: own shots / 250 (typical PL team season shots).
+             COALESCE(psa.shots_open_play::float8 / 250.0, 0)    AS shot_share,
+             -- xG per shot = total open-play xG / shots, fallback 0.10.
+             CASE WHEN psa.shots_open_play > 0
+                  THEN (psa.xg_open_play::float8 / psa.shots_open_play)
+                  ELSE 0.10
+             END                                                  AS mean_xg_per_shot,
+             -- Assist share: approximate from season_xa as % of team xA.
+             COALESCE(p.season_xa::float8 / 30.0, 0)::float8     AS assist_share,
+             -- Minutes per app: season_minutes / max(1, starts).
+             CASE WHEN p.season_starts > 0
+                  THEN p.season_minutes::float8 / p.season_starts
+                  ELSE 75.0
+             END                                                  AS minutes_per_app,
+             -- Bonus per 90: season_bonus × 90 / minutes.
+             CASE WHEN p.season_minutes > 0
+                  THEN (p.season_bonus::float8 * 90) / p.season_minutes
+                  ELSE 0.3
+             END                                                  AS bonus_per_90
         FROM players p
         LEFT JOIN player_shot_aggregates psa ON psa.player_id = p.id
        WHERE p.team_id = ${f.team_h} AND p.status <> 'u'
@@ -193,11 +222,26 @@ async function runMonteCarloForGameweek(gameweekId: number) {
       bonus_per_90: number | null;
     }>>`
       SELECT p.id, p.position,
-             COALESCE(psa.shot_share_open_play, 0)::float8       AS shot_share,
-             COALESCE(psa.mean_xg_per_shot, 0.10)::float8        AS mean_xg_per_shot,
-             COALESCE(psa.assist_share, 0)::float8               AS assist_share,
-             COALESCE(p.minutes_per_app, 75)::float8             AS minutes_per_app,
-             COALESCE(p.bonus_per_90, 0.5)::float8               AS bonus_per_90
+             -- shot share = open-play shots / team total open-play shots.
+             -- Approximated: own shots / 250 (typical PL team season shots).
+             COALESCE(psa.shots_open_play::float8 / 250.0, 0)    AS shot_share,
+             -- xG per shot = total open-play xG / shots, fallback 0.10.
+             CASE WHEN psa.shots_open_play > 0
+                  THEN (psa.xg_open_play::float8 / psa.shots_open_play)
+                  ELSE 0.10
+             END                                                  AS mean_xg_per_shot,
+             -- Assist share: approximate from season_xa as % of team xA.
+             COALESCE(p.season_xa::float8 / 30.0, 0)::float8     AS assist_share,
+             -- Minutes per app: season_minutes / max(1, starts).
+             CASE WHEN p.season_starts > 0
+                  THEN p.season_minutes::float8 / p.season_starts
+                  ELSE 75.0
+             END                                                  AS minutes_per_app,
+             -- Bonus per 90: season_bonus × 90 / minutes.
+             CASE WHEN p.season_minutes > 0
+                  THEN (p.season_bonus::float8 * 90) / p.season_minutes
+                  ELSE 0.3
+             END                                                  AS bonus_per_90
         FROM players p
         LEFT JOIN player_shot_aggregates psa ON psa.player_id = p.id
        WHERE p.team_id = ${f.team_a} AND p.status <> 'u'

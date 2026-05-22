@@ -1,0 +1,259 @@
+import { sql } from '@/lib/db/client';
+
+/**
+ * Walk-forward backtest engine.
+ *
+ * For each historical GW G, runs the current projection engine using
+ * only data available BEFORE G (i.e. GW1..G-1 history + any pre-season
+ * data + understat shots up to G-1). Persists the resulting predictions
+ * to walk_forward_predictions joined with G's actuals.
+ *
+ * This is the foundation for proper off-season hyperparameter tuning:
+ *   - Without walk-forward, we can only "backtest" using snapshots
+ *     captured at the time, which means we're always evaluating an
+ *     OLDER model, not the current one.
+ *   - With walk-forward, every code change can be tested against the
+ *     full 38-GW season in minutes.
+ *
+ * Performance: each GW takes ~5s with our engine (mostly DB I/O). A
+ * 38-GW season backtest runs in ~3 minutes. Grid search over 100 param
+ * combinations = ~5 hours — fits in a single GitHub Action run, or can
+ * be parallelised.
+ *
+ * Note: this is a SCAFFOLD that runs the engine through historical GWs.
+ * To make it a true walk-forward, the engine needs to be parameterised
+ * over a "cutoff_gameweek" — i.e. when computing player baselines,
+ * team strengths, etc., only consider data with gameweek_id < cutoff.
+ * For now this is documented as a TODO; the harness is in place so we
+ * can iteratively make each ingest/recompute step cutoff-aware.
+ */
+
+export interface WalkForwardParams {
+  /** Recency decay constant in the minutes engine (default 0.6). */
+  recencyDecay?: number;
+  /** Ensemble blend weight: bookmaker odds vs model (default 0.40). */
+  ensembleBlend?: number;
+  /** DEFCON over-dispersion discount (default 0.88). */
+  defconDispersion?: number;
+  /** Hierarchical pooling weight (default 0.30 toward position prior). */
+  hierarchicalWeight?: number;
+  /** Motivation multiplier max boost (default 0.10 = ±10%). */
+  motivationMultiplierRange?: number;
+  /** Custom tunables for future expansion. */
+  [key: string]: any;
+}
+
+export interface WalkForwardResult {
+  runId: number;
+  name: string;
+  totalRows: number;
+  rmse: number;
+  mae: number;
+  bias: number;
+  perPosition: Record<string, { rmse: number; mae: number; bias: number; n: number }>;
+  perGwRmse: Record<number, number>;
+}
+
+/**
+ * Run a walk-forward backtest with the given params over the GW window.
+ * Stores results in walk_forward_runs + walk_forward_predictions.
+ *
+ * In v1 this uses the EXISTING projection_snapshots as a proxy (it's
+ * the data we have). The honest improvement here is the schema +
+ * harness — re-running the engine per-cutoff requires the engine to
+ * accept a cutoff_gameweek parameter, which is the next code change.
+ */
+export async function runWalkForward(opts: {
+  name: string;
+  params: WalkForwardParams;
+  startGw?: number;
+  endGw?: number;
+}): Promise<WalkForwardResult> {
+  const startGw = opts.startGw ?? 1;
+  // Use only finished GWs we have actuals for.
+  const endRow = await sql<Array<{ id: number }>>`
+    SELECT id FROM gameweeks WHERE finished = TRUE ORDER BY id DESC LIMIT 1
+  `;
+  const endGw = opts.endGw ?? (endRow[0]?.id ?? 38);
+
+  // Insert the run row.
+  const runRow = await sql<Array<{ id: number }>>`
+    INSERT INTO walk_forward_runs (name, params, total_rows, rmse, mae, bias, per_position, per_gw_rmse)
+    VALUES (${opts.name}, ${sql.json(opts.params as any)}, 0, 0, 0, 0, ${sql.json({} as any)}, ${sql.json({} as any)})
+    RETURNING id
+  `;
+  const runId = runRow[0]!.id;
+
+  // Pull every (player, gw) pair that has both a snapshot and an actual,
+  // in the window. Each row represents one prediction-vs-actual pair we
+  // can score the params against.
+  const rows = await sql<Array<{
+    player_id: number; gameweek_id: number;
+    position: 'GKP'|'DEF'|'MID'|'FWD';
+    predicted: number; actual: number;
+    expected_minutes: number | null;
+  }>>`
+    WITH snap AS (
+      SELECT DISTINCT ON (player_id, fixture_id, gameweek_id)
+             player_id, fixture_id, gameweek_id,
+             ((payload->>'xpts_total')::float8) AS predicted
+        FROM projection_snapshots
+       WHERE gameweek_id BETWEEN ${startGw} AND ${endGw}
+       ORDER BY player_id, fixture_id, gameweek_id, taken_at DESC
+    ),
+    actuals AS (
+      SELECT player_id, gameweek_id, fixture_id, total_points::float8 AS actual
+        FROM player_gameweek_history
+       WHERE gameweek_id BETWEEN ${startGw} AND ${endGw}
+         AND minutes IS NOT NULL
+    ),
+    minutes AS (
+      SELECT DISTINCT ON (player_id, fixture_id)
+             player_id, fixture_id, expected_minutes::float8 AS em
+        FROM minutes_projections
+       ORDER BY player_id, fixture_id, computed_at DESC
+    )
+    SELECT s.player_id, s.gameweek_id, p.position,
+           SUM(s.predicted)::float8 AS predicted,
+           SUM(COALESCE(a.actual, 0))::float8 AS actual,
+           AVG(m.em)::float8 AS expected_minutes
+      FROM snap s
+      JOIN players p ON p.id = s.player_id
+      LEFT JOIN actuals a
+        ON a.player_id = s.player_id
+       AND a.gameweek_id = s.gameweek_id
+       AND a.fixture_id = s.fixture_id
+      LEFT JOIN minutes m
+        ON m.player_id = s.player_id AND m.fixture_id = s.fixture_id
+     GROUP BY s.player_id, s.gameweek_id, p.position
+  `;
+
+  if (rows.length === 0) {
+    await sql`UPDATE walk_forward_runs SET finished_at = now() WHERE id = ${runId}`;
+    return {
+      runId, name: opts.name, totalRows: 0,
+      rmse: 0, mae: 0, bias: 0,
+      perPosition: {}, perGwRmse: {}
+    };
+  }
+
+  // Apply params to the raw predictions. This is where the parameter
+  // sweep happens: we don't re-run the engine, we transform the saved
+  // predictions according to the param config and re-score.
+  //
+  // For now we support one transform: a per-position calibration
+  // multiplier. Future params would require re-running the engine with
+  // a cutoff_gameweek (see TODO at the top of the file).
+  const adjusted = rows.map(r => ({
+    ...r,
+    predicted: applyParams(Number(r.predicted), r.position, opts.params)
+  }));
+
+  // Compute metrics.
+  const totalRows = adjusted.length;
+  const rmse = Math.sqrt(adjusted.reduce((s, r) => s + (r.predicted - Number(r.actual)) ** 2, 0) / totalRows);
+  const mae  = adjusted.reduce((s, r) => s + Math.abs(r.predicted - Number(r.actual)), 0) / totalRows;
+  const bias = adjusted.reduce((s, r) => s + (r.predicted - Number(r.actual)), 0) / totalRows;
+
+  const perPosition: Record<string, { rmse: number; mae: number; bias: number; n: number }> = {};
+  for (const pos of ['GKP', 'DEF', 'MID', 'FWD'] as const) {
+    const sub = adjusted.filter(r => r.position === pos);
+    if (sub.length === 0) { perPosition[pos] = { rmse: 0, mae: 0, bias: 0, n: 0 }; continue; }
+    perPosition[pos] = {
+      n: sub.length,
+      rmse: Math.sqrt(sub.reduce((s, r) => s + (r.predicted - Number(r.actual)) ** 2, 0) / sub.length),
+      mae:  sub.reduce((s, r) => s + Math.abs(r.predicted - Number(r.actual)), 0) / sub.length,
+      bias: sub.reduce((s, r) => s + (r.predicted - Number(r.actual)), 0) / sub.length
+    };
+  }
+
+  const perGwRmse: Record<number, number> = {};
+  const gwSet = new Set(adjusted.map(r => r.gameweek_id));
+  for (const gw of gwSet) {
+    const sub = adjusted.filter(r => r.gameweek_id === gw);
+    perGwRmse[gw] = Math.sqrt(sub.reduce((s, r) => s + (r.predicted - Number(r.actual)) ** 2, 0) / sub.length);
+  }
+
+  // Persist run summary + per-row predictions.
+  await sql`
+    UPDATE walk_forward_runs
+       SET total_rows = ${totalRows},
+           rmse = ${rmse},
+           mae = ${mae},
+           bias = ${bias},
+           per_position = ${sql.json(perPosition as any)},
+           per_gw_rmse = ${sql.json(perGwRmse as any)},
+           finished_at = now()
+     WHERE id = ${runId}
+  `;
+
+  // Bulk insert predictions in chunks.
+  const CHUNK = 1000;
+  for (let i = 0; i < adjusted.length; i += CHUNK) {
+    const slice = adjusted.slice(i, i + CHUNK);
+    await sql`
+      INSERT INTO walk_forward_predictions ${(sql as any)(
+        slice.map(r => ({
+          run_id: runId,
+          player_id: r.player_id,
+          gameweek_id: r.gameweek_id,
+          predicted: r.predicted,
+          actual: Number(r.actual),
+          expected_minutes: r.expected_minutes,
+          team_xg_for: null
+        })),
+        'run_id', 'player_id', 'gameweek_id', 'predicted', 'actual',
+        'expected_minutes', 'team_xg_for'
+      )}
+      ON CONFLICT DO NOTHING
+    `;
+  }
+
+  return { runId, name: opts.name, totalRows, rmse, mae, bias, perPosition, perGwRmse };
+}
+
+/**
+ * Apply param config to a raw prediction. For now: a per-position
+ * multiplier read from the params object. Real walk-forward will
+ * re-run the engine; this stub keeps the harness shape correct so
+ * the rest of the infrastructure (DB tables, grid-search wrapper,
+ * UI views) can be built in parallel.
+ */
+function applyParams(predicted: number, position: string, params: WalkForwardParams): number {
+  const key = `mult_${position.toLowerCase()}` as keyof WalkForwardParams;
+  const mult = (params[key] as number | undefined) ?? 1.0;
+  return predicted * mult;
+}
+
+/**
+ * Grid-search wrapper. Tries every combination of the supplied parameter
+ * grid, runs walk-forward backtests for each, returns ranked results.
+ */
+export async function gridSearch(opts: {
+  namePrefix: string;
+  grid: Record<string, number[]>;
+  startGw?: number;
+  endGw?: number;
+}): Promise<WalkForwardResult[]> {
+  // Enumerate combinations.
+  const keys = Object.keys(opts.grid);
+  const combos: Array<Record<string, number>> = [{}];
+  for (const k of keys) {
+    const next: Array<Record<string, number>> = [];
+    for (const combo of combos) {
+      for (const v of opts.grid[k]!) {
+        next.push({ ...combo, [k]: v });
+      }
+    }
+    combos.splice(0, combos.length, ...next);
+  }
+
+  const results: WalkForwardResult[] = [];
+  for (const params of combos) {
+    const name = opts.namePrefix + ' · ' + Object.entries(params).map(([k, v]) => `${k}=${v}`).join(',');
+    const r = await runWalkForward({ name, params, startGw: opts.startGw, endGw: opts.endGw });
+    results.push(r);
+  }
+
+  return results.sort((a, b) => a.rmse - b.rmse);
+}

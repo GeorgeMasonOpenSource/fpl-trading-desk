@@ -40,12 +40,16 @@ async function main() {
     actual: number;
   }>>`
     WITH snap AS (
+      -- projection_snapshots stores values in a JSONB payload column;
+      -- the xpts_total we want lives at payload->>xpts_total. The
+      -- timestamp column is taken_at, not captured_at.
       SELECT DISTINCT ON (player_id, fixture_id, gameweek_id)
              player_id, fixture_id, gameweek_id,
-             xpts_total::float8 AS predicted
+             (payload->>'xpts_total')::float8 AS predicted
         FROM projection_snapshots
        WHERE gameweek_id IN (SELECT id FROM gameweeks WHERE finished = TRUE)
-       ORDER BY player_id, fixture_id, gameweek_id, captured_at DESC
+         AND payload ? 'xpts_total'
+       ORDER BY player_id, fixture_id, gameweek_id, taken_at DESC
     ),
     actuals AS (
       SELECT player_id, gameweek_id, fixture_id,
