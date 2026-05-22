@@ -62,6 +62,17 @@ interface PlayerProjectionContext {
   // New-signing / manager-change adjustments:
   newSigningPenalty: number;
   managerChangePenalty: number;
+  // §model-sharpening additions:
+  // Recency-weighted per-90 — when present, dominates the shrunk current
+  // value because it already captures form trajectory better than a flat sum.
+  recencyXg90: number | null;
+  recencyXa90: number | null;
+  recencyMinutes: number;
+  // Season yellow count for suspension penalty (5/10/15 thresholds).
+  seasonYellows: number;
+  // Opposition attacking style 0..1 — used to scale expected defensive
+  // actions. Possession-dominant opponents = more chances to act.
+  oppAttackingStyle: number;
 }
 
 export interface ProjectionResult {
@@ -96,10 +107,60 @@ export function projectPlayer(ctx: PlayerProjectionContext): ProjectionResult {
   // Equivalent-sample-size shrinkage: small current sample = mostly baseline.
   const priorN = 540;        // 6 PL matches' worth
   const minutesSeen = ctx.currentSampleMinutes;
-  const xg90 = shrink(ctx.currentXg90 ?? ctx.baselineXg90, minutesSeen,
-                      ctx.baselineXg90, priorN);
-  const xa90 = shrink(ctx.currentXa90 ?? ctx.baselineXa90, minutesSeen,
-                      ctx.baselineXa90, priorN);
+  // CRITICAL: strip the penalty contribution from xG inputs BEFORE shrinking,
+  // because the pen component is added separately later. Without this, pen
+  // takers get their pen xG counted twice:
+  //   1. inside `currentXg90` / `baselineXg90` (which derive from total xG)
+  //   2. via `playerExpectedPenGoals` added below
+  //
+  // Estimated pen xG per 90:
+  //   penalty_share × (5 pens / season ÷ 38 matches) × 0.78 (conversion)
+  // ≈ penalty_share × 0.103 per 90.
+  // We subtract this from xG before shrinking so the shrunk value reflects
+  // open-play threat only. The pen-derived component is then added in §2.
+  const PENS_PER_90 = 5 / 38;
+  const penXg90 = ctx.penaltyShare * PENS_PER_90 * 0.78;
+  const adjustedBaselineXg90 = Math.max(0, ctx.baselineXg90 - penXg90);
+
+  // §model-sharpening: prefer the recency-weighted per-90 over the flat
+  // current-season average. Same logic for xA. We still shrink toward the
+  // long-term baseline using the EFFECTIVE sample size (recency-weighted
+  // minutes), so a player with only 2 recent starts doesn't override their
+  // long-term baseline based on those 2 games.
+  //
+  // PENALTY ADJUSTMENT is applied to BOTH recency and current values so
+  // we never feed pen-inflated xG into the shrinker.
+  const recencyXg90Adj = ctx.recencyXg90 != null
+    ? Math.max(0, ctx.recencyXg90 - penXg90) : null;
+  const recencyXa90 = ctx.recencyXa90;
+  const currentXg90Adj = ctx.currentXg90 != null
+    ? Math.max(0, ctx.currentXg90 - penXg90) : null;
+
+  // Effective sample for shrinkage: recency-weighted minutes when we have
+  // them, else flat season minutes. Recency-weighted minutes ARE smaller
+  // numerically (older games down-weighted) — that's intentional, it means
+  // the shrinker correctly demands recent evidence to override the baseline.
+  const effectiveSampleN = ctx.recencyMinutes > 0 ? ctx.recencyMinutes : minutesSeen;
+  const xg90Input = recencyXg90Adj ?? currentXg90Adj ?? adjustedBaselineXg90;
+  const xa90Input = recencyXa90    ?? ctx.currentXa90 ?? ctx.baselineXa90;
+  const xg90 = shrink(xg90Input, effectiveSampleN, adjustedBaselineXg90, priorN);
+  const xa90 = shrink(xa90Input, effectiveSampleN, ctx.baselineXa90,     priorN);
+
+  if (penXg90 > 0) {
+    reasons.push({
+      kind: 'open_play_xg_only',
+      weight: penXg90,
+      detail: `stripped ${penXg90.toFixed(2)} pen xG/90 from baseline (pen share ${(ctx.penaltyShare*100).toFixed(0)}%); pen goals added separately`
+    });
+  }
+  if (recencyXg90Adj != null && currentXg90Adj != null &&
+      Math.abs(recencyXg90Adj - currentXg90Adj) > 0.05) {
+    reasons.push({
+      kind: 'recency_weighted_form',
+      weight: recencyXg90Adj - currentXg90Adj,
+      detail: `recency-weighted xG/90 ${recencyXg90Adj.toFixed(2)} vs flat ${currentXg90Adj.toFixed(2)} — ${recencyXg90Adj > currentXg90Adj ? 'trending UP' : 'trending DOWN'}`
+    });
+  }
   const bonus90 = shrink(ctx.currentBonus90 ?? ctx.baselineBonus90, minutesSeen,
                           ctx.baselineBonus90, priorN);
 
@@ -199,7 +260,17 @@ export function projectPlayer(ctx: PlayerProjectionContext): ProjectionResult {
   const defconThreshold = ctx.position === 'DEF' ? 10 : 12;
   let xpts_defcon = 0;
   if (ctx.position !== 'GKP' && ctx.defconPer90 > 0) {
-    const expectedActions = ctx.defconPer90 * (ctx.expectedMinutes / 90);
+    // §model-sharpening — opposition-aware DEFCON.
+    // Defensive actions scale with how much the OPPONENT attacks: a
+    // possession-dominant attacking opponent forces more tackles /
+    // interceptions / recoveries; a low-block side gives fewer chances
+    // to act. Multiplier ∈ [0.7, 1.3] around the league-average 0.5
+    // attacking_style. So Le Fée vs Chelsea (≈0.75 attacking) gets a
+    // ~1.25× boost on expected actions; vs Burnley (≈0.30) gets ~0.8×.
+    const oppMultiplier = clamp01(0.5 + 0.6 * ctx.oppAttackingStyle) * 1.4;
+    const baseExpectedActions = ctx.defconPer90 * (ctx.expectedMinutes / 90);
+    const expectedActions = baseExpectedActions * oppMultiplier;
+
     // P(Poisson(lambda) >= k) — small k so just sum k..k+10.
     const lambda = expectedActions;
     let cdf = 0;
@@ -208,22 +279,58 @@ export function projectPlayer(ctx: PlayerProjectionContext): ProjectionResult {
       cdf += term;
       term = term * lambda / (i + 1);
     }
-    const pDefcon = clamp01(1 - cdf);
+    // §model-sharpening — small over-dispersion discount.
+    // Real defensive-action counts have higher variance than Poisson
+    // assumes (defensive activity comes in bursts). At low lambda the
+    // Poisson over-states P(X ≥ threshold) somewhat; we discount by 12%
+    // to be conservative. Cheap fix that matters most for borderline
+    // players around 70-85% of threshold.
+    const pDefcon = clamp01((1 - cdf) * 0.88);
     xpts_defcon = pDefcon * 2 * ctx.sixtyPlusProb;
     if (xpts_defcon > 0.1) {
       reasons.push({
         kind: 'defcon',
         weight: xpts_defcon,
-        detail: `${expectedActions.toFixed(1)} expected def-actions → P(≥${defconThreshold}) ${(pDefcon*100).toFixed(0)}%`
+        detail: `${baseExpectedActions.toFixed(1)} actions × ${oppMultiplier.toFixed(2)} opp-style = ${expectedActions.toFixed(1)} expected; P(≥${defconThreshold}) ${(pDefcon*100).toFixed(0)}%`
       });
     }
   }
 
-  // Total
+  // §model-sharpening — yellow-card suspension penalty.
+  // FPL rule: 5 yellows triggers a 1-game ban; 10 triggers 2; 15 triggers 3.
+  // If a player is 1 yellow short of a threshold AND has shown a high
+  // yellow rate, they're at meaningful risk of missing the next match.
+  // We dock half the expected appearance + base points pro-rata to that
+  // probability. Conservative because thresholds reset after each
+  // suspension and we don't track exact discipline reset history.
+  const NEXT_YELLOW_THRESHOLDS = [5, 10, 15];
+  const cardsToNextThreshold = NEXT_YELLOW_THRESHOLDS
+    .map(t => t - ctx.seasonYellows)
+    .filter(g => g > 0 && g <= 1)
+    .pop();
+  let suspensionPenalty = 0;
+  if (cardsToNextThreshold === 1 && ctx.baselineYellow90 > 0.2) {
+    // Probability of picking up a yellow this match ≈ baseline yellow/90
+    // × P(plays 60+). Conservative.
+    const pYellow = clamp01(ctx.baselineYellow90 * ctx.sixtyPlusProb);
+    // Cost of missing the NEXT match ≈ 2/3 of a typical projection (5 pts).
+    suspensionPenalty = pYellow * 3.3;
+    if (suspensionPenalty > 0.1) {
+      reasons.push({
+        kind: 'suspension_risk',
+        weight: -suspensionPenalty,
+        detail: `${ctx.seasonYellows} yellows so far — 1 short of suspension; P(yellow this match) ${(pYellow*100).toFixed(0)}%`
+      });
+    }
+  }
+
+  // Total — suspension risk is a NEGATIVE contribution (expected lost points
+  // from missing the next match). Subtracted from the headline xpts so the
+  // user sees the risk-adjusted value, not the raw "if-he-plays" number.
   const xpts_total =
     xpts_appearance + xpts_goals + xpts_assists + xpts_clean_sheet +
     xpts_bonus + xpts_saves + xpts_pen_save + xpts_cards + xpts_concede +
-    xpts_owngoal + xpts_defcon;
+    xpts_owngoal + xpts_defcon - suspensionPenalty;
 
   // ---------- 4. Floor / Ceiling -----------------------------------------------
   // Floor: outcome where player plays but doesn't score/assist or doesn't play.
@@ -305,8 +412,13 @@ export async function recomputeProjectionsForGameweek(gameweekId: number) {
       sub_prob: number; bench_unused_prob: number; injury_absence_prob: number;
       early_sub_risk: number; expected_minutes: number; minutes_confidence: number;
       current_minutes: number; current_xg: number; current_xa: number; current_bonus: number;
+      // Recency-weighted form (exponential decay, half-life ~3 GW). Heavier
+      // weight on the player's most recent matches — beats the flat
+      // season-sum which treats GW1 the same as last week.
+      recency_minutes: number; recency_xg: number; recency_xa: number; recency_yellow: number;
       season_xg: number; season_xa: number; season_bonus: number;
       season_defcon_per_90: number;
+      season_yellows: number;
       penalties_order: number | null;
       corners_order: number | null; freekicks_order: number | null;
       team_xg_total: number; team_xa_total: number;
@@ -342,6 +454,11 @@ export async function recomputeProjectionsForGameweek(gameweekId: number) {
         COALESCE(p.season_xa, 0)::numeric                                        AS season_xa,
         COALESCE(p.season_bonus, 0)::numeric                                     AS season_bonus,
         COALESCE(p.season_defcon_per_90, 0)::numeric                             AS season_defcon_per_90,
+        COALESCE(y.season_yellows, 0)::int                                       AS season_yellows,
+        COALESCE(recency.minutes, 0)::numeric AS recency_minutes,
+        COALESCE(recency.xg, 0)::numeric      AS recency_xg,
+        COALESCE(recency.xa, 0)::numeric      AS recency_xa,
+        COALESCE(recency.yellow, 0)::numeric  AS recency_yellow,
         p.penalties_order,
         p.corners_and_indirect_freekicks_order AS corners_order,
         p.direct_freekicks_order               AS freekicks_order,
@@ -360,9 +477,27 @@ export async function recomputeProjectionsForGameweek(gameweekId: number) {
           SUM(minutes) AS minutes,
           SUM(expected_goals)::numeric AS xg,
           SUM(expected_assists)::numeric AS xa,
-          SUM(bonus)::numeric AS bonus
+          SUM(bonus)::numeric AS bonus,
+          SUM(yellow_cards)::int AS yellow_cards
         FROM player_gameweek_history WHERE player_id = p.id
       ) c ON TRUE
+      LEFT JOIN LATERAL (
+        -- Recency-weighted xG / xA / minutes via exponential decay. The
+        -- decay factor 0.80 has a half-life of ~3 GW so a player's
+        -- last 5 starts dominate; a goal scored in GW1 carries ~5% the
+        -- weight of one scored in GW37. We use the gameweek_id gap
+        -- against the planning gameweek as the exponent.
+        SELECT
+          SUM(pgh.minutes        * POWER(0.80, GREATEST(0, ${gameweekId}::int - pgh.gameweek_id)))::numeric AS minutes,
+          SUM(pgh.expected_goals * POWER(0.80, GREATEST(0, ${gameweekId}::int - pgh.gameweek_id)))::numeric AS xg,
+          SUM(pgh.expected_assists * POWER(0.80, GREATEST(0, ${gameweekId}::int - pgh.gameweek_id)))::numeric AS xa,
+          SUM(pgh.yellow_cards * POWER(0.80, GREATEST(0, ${gameweekId}::int - pgh.gameweek_id)))::numeric AS yellow
+          FROM player_gameweek_history pgh
+         WHERE pgh.player_id = p.id
+      ) recency ON TRUE,
+      LATERAL (
+        SELECT COALESCE((c.yellow_cards)::int, 0) AS season_yellows
+      ) y
       WHERE p.team_id IN (${fix.team_h}, ${fix.team_a})
     `;
 
@@ -442,8 +577,19 @@ export async function recomputeProjectionsForGameweek(gameweekId: number) {
       // isn't treated like a fringe forward. We clamp the share to 60% so the
       // model never collapses to "Haaland gets everything"; the rest is shared
       // with the other 10 outfielders implicitly.
-      const goalShare   = p.team_xg_total > 0
-        ? Math.min(0.60, Number(p.season_xg) / Number(p.team_xg_total))
+      //
+      // PENALTY ADJUSTMENT: same rationale as the baseline xG strip — total
+      // season_xg includes pen xG. For a pen-taker that inflates their share
+      // of the team's open-play threat. Subtract estimated pen xG from BOTH
+      // the player's season_xg AND the team's season_xg_total before the
+      // ratio so we measure share of open-play scoring only.
+      const seasonPenXg = penaltyShare * 5 * 0.78;     // ~5 pens/team/season
+      const playerOpenPlayXg = Math.max(0, Number(p.season_xg) - seasonPenXg);
+      // Team pen xG approx: 5 pens × 0.78 × team's penalty rate factor.
+      // We approximate team-level pen xG at ~3.9 (5 × 0.78) per team-season.
+      const teamOpenPlayXg = Math.max(0, Number(p.team_xg_total) - 3.9);
+      const goalShare   = teamOpenPlayXg > 0
+        ? Math.min(0.60, playerOpenPlayXg / teamOpenPlayXg)
         : 0.15;
       const assistShare = p.team_xa_total > 0
         ? Math.min(0.60, Number(p.season_xa) / Number(p.team_xa_total))
@@ -460,6 +606,13 @@ export async function recomputeProjectionsForGameweek(gameweekId: number) {
 
       const newSigningPenalty = (p.current_minutes < 270) ? weights.newSigningUncertainty * 0.20 : 0;
       const managerChangePenalty = 0;
+
+      // Recency-weighted per-90 from the decayed history sums.
+      const recencyMinutes = Number(p.recency_minutes) || 0;
+      const recencyXg90 = recencyMinutes > 0
+        ? (Number(p.recency_xg) * 90) / recencyMinutes : null;
+      const recencyXa90 = recencyMinutes > 0
+        ? (Number(p.recency_xa) * 90) / recencyMinutes : null;
 
       const projection = projectPlayer({
         playerId: p.id, fixtureId: fix.id, gameweekId,
@@ -483,7 +636,11 @@ export async function recomputeProjectionsForGameweek(gameweekId: number) {
         defconPer90: Number(p.season_defcon_per_90) || 0,
         reliability: p.reliability_index,
         minutesConfidence: p.minutes_confidence,
-        newSigningPenalty, managerChangePenalty
+        newSigningPenalty, managerChangePenalty,
+        // §model-sharpening inputs
+        recencyXg90, recencyXa90, recencyMinutes,
+        seasonYellows: Number(p.season_yellows) || 0,
+        oppAttackingStyle: opp.attacking
       });
 
       projRows.push({

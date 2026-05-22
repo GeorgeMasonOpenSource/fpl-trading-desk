@@ -19,6 +19,8 @@
     "recompute:projections": "tsx scripts/recompute-projections.ts",
     "backtest:run": "tsx scripts/backtest-run.ts",
     "ingest:youtube": "tsx scripts/ingest-youtube.ts",
+    "ingest:odds": "tsx scripts/ingest-odds.ts",
+    "ingest:lineups": "tsx scripts/ingest-lineups.ts",
     "probe:transcript": "tsx scripts/probe-transcript.ts"
   },
   "dependencies": {

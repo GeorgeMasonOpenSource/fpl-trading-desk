@@ -103,6 +103,20 @@ function PlayerPanel({ label, name, ins, tone }: {
               {' '}xG {fmt(ins.season.xg, 1)} · xA {fmt(ins.season.xa, 1)} ·
               {' '}{ins.season.bonus} bonus
             </span>
+            {/* Open-play xG split. If the player is a pen taker, the
+                headline xG above includes their penalty xG. We strip an
+                estimate of pen xG (penalty_share × 5 pens/season × 0.78)
+                so the open-play number reflects underlying goal threat
+                from open play only. */}
+            {ins.roles.penaltyOrder && ins.roles.penaltyOrder <= 2 && (
+              <span className="block text-[10px] text-ink-dim mt-0.5 font-mono">
+                pen-adj open-play xG ≈ {fmt(
+                  Math.max(0, ins.season.xg - estimatePenXg(ins.roles.penaltyOrder)),
+                  1
+                )}
+                {' '}(stripped ≈ {fmt(estimatePenXg(ins.roles.penaltyOrder), 1)} pen xG)
+              </span>
+            )}
           </Section>
 
           <Section title="Next 3 fixtures">
@@ -154,4 +168,24 @@ function fdrTone(fdr: number) {
   if (fdr === 3) return 'text-ink';
   if (fdr === 4) return 'text-accent-amber';
   return 'text-accent-red';
+}
+
+/**
+ * Rough estimate of how much of a player's season xG came from penalties,
+ * based on their FPL penalties_order. Used to surface "open-play xG" so the
+ * user can see the underlying goal threat without the penalty inflation that
+ * the headline xG number carries for pen takers.
+ *
+ *   #1 taker  → ~0.95 share of team's ~5 pens × 0.78 conversion ≈ 3.7 xG
+ *   #2 taker  → ~0.30 share ≈ 1.17 xG
+ *   #3+ or none → ~0
+ *
+ * Conservative — real team pen-rate varies (Liverpool earn more pens than
+ * Burnley) but 5/season is a reasonable league mean.
+ */
+function estimatePenXg(penOrder: number | null): number {
+  if (!penOrder) return 0;
+  if (penOrder === 1) return 5 * 0.95 * 0.78;
+  if (penOrder === 2) return 5 * 0.30 * 0.78;
+  return 0;
 }
