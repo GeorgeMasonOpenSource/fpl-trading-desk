@@ -18,6 +18,7 @@
     "ingest:league": "tsx scripts/ingest-league.ts",
     "recompute:projections": "tsx scripts/recompute-projections.ts",
     "recompute:all": "tsx scripts/recompute-all.ts",
+    "player:xray": "tsx scripts/player-xray.ts",
     "backtest:run": "tsx scripts/backtest-run.ts",
     "ingest:youtube": "tsx scripts/ingest-youtube.ts",
     "ingest:odds": "tsx scripts/ingest-odds.ts",
