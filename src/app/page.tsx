@@ -56,24 +56,48 @@ export default async function DashboardPage() {
     );
   }
 
-  const summary = await managerSummary(managerId);
-  const planningSquad = await squadForGameweek(managerId, planning.id);
-  const news = await newsWatch(managerId, planning.id);
+  // All these reads are defensive — if the DB is in a partially-seeded state
+  // for the hard-coded manager (e.g. picks loaded but projections not yet),
+  // any individual await might throw. Wrap each in a try/catch returning a
+  // null/empty sentinel so the page still renders with the bits that DO work.
+  const safe = async <T,>(fn: () => Promise<T>, fallback: T, label: string): Promise<T> => {
+    try { return await fn(); }
+    catch (err) {
+      // eslint-disable-next-line no-console
+      console.error(`[Dashboard] ${label} failed:`, err);
+      return fallback;
+    }
+  };
 
-  // Live tracking for the in-progress GW (if any). When liveGw is null (early
-  // season or just-finished week), this section is hidden.
-  const live = liveGw ? await livePoints(managerId, liveGw.id) : null;
+  // The postgres.js helpers return a RowList<T[]>, not a plain T[]. We cast
+  // the fallback empty arrays through `as any` to satisfy the `safe<T>` widen
+  // — runtime behaviour is the same (empty iteration) but TypeScript can't
+  // infer RowList from a literal `[]`.
+  const summary       = await safe(() => managerSummary(managerId), null, 'managerSummary');
+  const planningSquad = await safe(
+    () => squadForGameweek(managerId, planning.id),
+    [] as any as Awaited<ReturnType<typeof squadForGameweek>>,
+    'squadForGameweek'
+  );
+  const news = await safe(
+    () => newsWatch(managerId, planning.id),
+    [] as any as Awaited<ReturnType<typeof newsWatch>>,
+    'newsWatch'
+  );
+  const live = liveGw
+    ? await safe(() => livePoints(managerId, liveGw.id), null, 'livePoints')
+    : null;
 
-  const hasProjections = planningSquad.some(p => Number(p.xpts_total) > 0);
+  const hasProjections = planningSquad.some((p: any) => Number(p.xpts_total) > 0);
   const scenarios = hasProjections
-    ? await compareTransferScenarios({
+    ? await safe(() => compareTransferScenarios({
         managerId, startGameweek: planning.id,
         freeTransfers: summary?.free_transfers ?? 1,
         evThreshold, hitThreshold
-      })
+      }), [], 'compareTransferScenarios')
     : [];
   const captains = hasProjections
-    ? await rankCaptains(managerId, planning.id, leagueId ?? undefined)
+    ? await safe(() => rankCaptains(managerId, planning.id, leagueId ?? undefined), null, 'rankCaptains')
     : null;
 
   const recommendedScenario = scenarios.slice().sort((a, b) => b.ev - a.ev)[0] ?? null;
