@@ -15,8 +15,9 @@
  */
 import { cookies } from 'next/headers';
 
-const MANAGER_COOKIE = 'fpl_td_manager';
-const LEAGUE_COOKIE  = 'fpl_td_league';
+const MANAGER_COOKIE    = 'fpl_td_manager';
+const LEAGUE_COOKIE     = 'fpl_td_league';
+const CHIPS_USED_COOKIE = 'fpl_td_chips_used'; // CSV of chip codes used: WC,FH,BB,TC
 const COOKIE_OPTS    = {
   path: '/',
   // 1 year — this is a single-user product. Adjust when we add real auth.
@@ -89,4 +90,49 @@ export function setLeagueId(id: number | null) {
 /** Quick boolean for "is this user connected?" — used by setup gating. */
 export function isConnected() {
   return getManagerId() != null;
+}
+
+/**
+ * Chip availability — which chips the user has ALREADY USED this season.
+ * The chip planner / chip simulator should hide these so the recommended
+ * chip never points at one you can't play.
+ *
+ * Valid codes:
+ *   WC = Wildcard            (the first or second wildcard — we don't yet
+ *        distinguish between WC1 and WC2; treat as "no WC left")
+ *   FH = Free Hit
+ *   BB = Bench Boost
+ *   TC = Triple Captain
+ *
+ * Stored as a comma-separated string in a cookie so it persists across
+ * sessions without needing a DB column. If the cookie is empty, no chips
+ * have been used.
+ */
+export type ChipCode = 'WC' | 'FH' | 'BB' | 'TC';
+const ALL_CHIPS: ChipCode[] = ['WC', 'FH', 'BB', 'TC'];
+
+export function getUsedChips(): Set<ChipCode> {
+  const raw = cookies().get(CHIPS_USED_COOKIE)?.value ?? '';
+  const parts = raw.split(',').map(s => s.trim().toUpperCase());
+  const used = new Set<ChipCode>();
+  for (const p of parts) {
+    if ((ALL_CHIPS as string[]).includes(p)) used.add(p as ChipCode);
+  }
+  return used;
+}
+
+export function getAvailableChips(): Set<ChipCode> {
+  const used = getUsedChips();
+  return new Set(ALL_CHIPS.filter(c => !used.has(c)));
+}
+
+/** Server-only — call from server actions or route handlers. */
+export function setUsedChips(used: Iterable<ChipCode>) {
+  const jar = cookies();
+  const arr = Array.from(new Set(used)).filter(c => (ALL_CHIPS as string[]).includes(c));
+  if (arr.length === 0) {
+    jar.delete(CHIPS_USED_COOKIE);
+    return;
+  }
+  jar.set(CHIPS_USED_COOKIE, arr.join(','), COOKIE_OPTS);
 }

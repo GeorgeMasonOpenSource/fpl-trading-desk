@@ -220,6 +220,20 @@ export function projectMinutes(input: MinutesInputs): MinutesDistribution {
     0.2 * (input.manualMinutesCap ? 0.4 : 1.0)        // manual cap means uncertainty
   );
 
+  // Observed rotation: the inverse of the player's actual start rate. A
+  // player who has started 95% of recent matches has 5% observed-rotation;
+  // someone splitting starts 50/50 has 50%. This is the dominant signal
+  // when there are no forward-looking penalties (e.g. late-season fixtures
+  // after European competition ends) — without it, rotationRisk collapses
+  // to 0 for everyone and the UI shows green badges for genuine rotation
+  // risks. Weighted at 0.8 so a perfect 100% starter still surfaces as ~0%
+  // and a 40% starter surfaces as ~48% — landing them in the yellow zone.
+  const observedStartRate = Math.max(
+    input.recentStartRate ?? input.currentSeasonStartRate,
+    input.currentSeasonStartRate
+  );
+  const observedRotation = 0.8 * (1 - clamp01(observedStartRate));
+
   return {
     startProb,
     sixtyPlusProb,
@@ -229,7 +243,11 @@ export function projectMinutes(input: MinutesInputs): MinutesDistribution {
     injuryAbsenceProb,
     expectedMinutes,
     earlySubRisk,
-    rotationRisk: clamp01(rotationPenalty + input.competitorPressure * 0.5),
+    rotationRisk: clamp01(
+      observedRotation
+      + rotationPenalty
+      + input.competitorPressure * 0.5
+    ),
     rotationResistance: input.rotationResistance,
     reliability: input.reliability,
     confidence,
