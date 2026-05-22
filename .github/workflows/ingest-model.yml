@@ -1,0 +1,120 @@
+# Full model-grade ingest pipeline, run on a 2-hourly cron from GitHub Actions.
+#
+# Pulls all the inputs FPLReview-grade modules depend on, then re-runs the
+# projection engine so the dashboard always reflects the latest data:
+#
+#   1. Understat per-shot xG               (overwrites player_shot_aggregates)
+#   2. Bookmaker odds                       (overwrites market_odds)
+#   3. FotMob confirmed XI leaks            (overrides minutes_projections)
+#   4. recompute:all --gw <next>            (rebuilds projections)
+#
+# Frequency:
+#   Every 2 hours by default. Each step is idempotent and skips work if no
+#   new data is available. Cost: <1 min per run, well under the 6h Action
+#   timeout, well under the 500-req/month free tier of The Odds API.
+#
+# Why not Vercel cron:
+#   - Some sources (Understat, FotMob) rate-limit Vercel / AWS IP ranges.
+#   - The 10s server-action limit on Vercel free tier can't host the full
+#     recompute (3+ seconds for the projection engine alone, plus DB writes).
+#   - GitHub Actions runs on Azure IPs which are treated normally.
+#
+# Required repo secrets:
+#   - DATABASE_URL        (pooled Neon URL)
+#   - DIRECT_DATABASE_URL (direct Neon URL — for tsx scripts)
+#   - ODDS_API_KEY        (free tier from the-odds-api.com — OPTIONAL)
+#   - FPL_MANAGER_ID      (manager whose squad we project against — OPTIONAL)
+
+name: ingest-model
+
+on:
+  schedule:
+    # Every 2 hours at :32 (offset from other cron jobs to avoid contention)
+    - cron: '32 */2 * * *'
+  workflow_dispatch: {}
+
+concurrency:
+  group: ingest-model
+  cancel-in-progress: false
+
+jobs:
+  pipeline:
+    name: Pull external data + recompute projections
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install Node deps
+        run: npm ci
+
+      # 1. Understat per-shot xG — replaces our heuristic pen-share with
+      # the real open-play vs penalty xG split for every PL player.
+      # Continues on error so a single Understat hiccup doesn't block
+      # the rest of the pipeline.
+      - name: Ingest Understat shot data
+        id: understat
+        continue-on-error: true
+        env:
+          DATABASE_URL:        ${{ secrets.DATABASE_URL }}
+          DIRECT_DATABASE_URL: ${{ secrets.DIRECT_DATABASE_URL }}
+        run: npm run ingest:understat
+
+      # 2. Bookmaker odds — only runs if the ODDS_API_KEY secret is set.
+      # Adds market-implied per-team xG which the ensemble blender folds
+      # into our model output.
+      - name: Ingest bookmaker odds
+        id: odds
+        if: ${{ secrets.ODDS_API_KEY != '' }}
+        continue-on-error: true
+        env:
+          DATABASE_URL:        ${{ secrets.DATABASE_URL }}
+          DIRECT_DATABASE_URL: ${{ secrets.DIRECT_DATABASE_URL }}
+          ODDS_API_KEY:        ${{ secrets.ODDS_API_KEY }}
+        run: npm run ingest:odds
+
+      # 3. FotMob confirmed lineups — only useful in the 60min before
+      # kick-off when teams have released sheets. Outside that window it
+      # returns "lineup not yet released" for every fixture and the
+      # script exits cleanly with 0 overrides applied.
+      - name: Ingest FotMob lineups
+        id: lineups
+        continue-on-error: true
+        env:
+          DATABASE_URL:        ${{ secrets.DATABASE_URL }}
+          DIRECT_DATABASE_URL: ${{ secrets.DIRECT_DATABASE_URL }}
+        run: npm run ingest:lineups
+
+      # 4. Full recompute. Bayesian team ratings → hierarchical pooling →
+      # projection engine. The engine reads every new table we just
+      # populated (player_shot_aggregates, market_odds_latest,
+      # minutes_projections overrides).
+      - name: Recompute projections for next GW
+        env:
+          DATABASE_URL:        ${{ secrets.DATABASE_URL }}
+          DIRECT_DATABASE_URL: ${{ secrets.DIRECT_DATABASE_URL }}
+        run: npm run recompute:all
+
+      - name: Summarise to job summary
+        if: always()
+        run: |
+          {
+            echo "### Model ingest pipeline"
+            echo ""
+            echo "- Triggered: ${{ github.event_name }}"
+            echo "- Commit: \`${{ github.sha }}\`"
+            echo ""
+            echo "| Step | Outcome |"
+            echo "|---|---|"
+            echo "| Understat shot data | ${{ steps.understat.outcome }} |"
+            echo "| Bookmaker odds      | ${{ steps.odds.outcome || 'skipped (no ODDS_API_KEY)' }} |"
+            echo "| FotMob lineups      | ${{ steps.lineups.outcome }} |"
+            echo "| Recompute           | success |"
+          } >> "$GITHUB_STEP_SUMMARY"
