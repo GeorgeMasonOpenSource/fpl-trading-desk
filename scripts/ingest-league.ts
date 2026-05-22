@@ -76,6 +76,36 @@ async function ingestLeague(leagueId: number, gameweekId: number) {
         'entry', 'entry_name', 'player_name', 'total', 'event_total'
       )}
     `;
+
+    // 2b. Upsert manager_teams stubs for every rival. The picks insert FKs
+    //     against this table, so without this step we'd get a "manager_picks
+    //     violates foreign key constraint" error. We fill in just the
+    //     minimum required fields (id + name + player name); the full
+    //     manager-team payload is pulled by the live manager ingest for
+    //     the connected user only.
+    await sql`
+      INSERT INTO manager_teams ${(sql as any)(
+        rows.map(r => {
+          const firstSpace = r.player_name.indexOf(' ');
+          const first = firstSpace >= 0 ? r.player_name.slice(0, firstSpace) : r.player_name;
+          const last  = firstSpace >= 0 ? r.player_name.slice(firstSpace + 1) : '';
+          return {
+            manager_id: r.entry,
+            name: r.entry_name,
+            player_first_name: first,
+            player_last_name: last,
+            total_points: r.total
+          };
+        }),
+        'manager_id', 'name', 'player_first_name', 'player_last_name', 'total_points'
+      )}
+      ON CONFLICT (manager_id) DO UPDATE SET
+        name              = EXCLUDED.name,
+        player_first_name = EXCLUDED.player_first_name,
+        player_last_name  = EXCLUDED.player_last_name,
+        total_points      = EXCLUDED.total_points,
+        updated_at        = now()
+    `;
   }
 
   // 3. Pull picks for every rival entry. We hit /entry/{id}/event/{gw}/picks/

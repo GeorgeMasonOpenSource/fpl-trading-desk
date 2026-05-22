@@ -46,10 +46,14 @@ interface FotMobMatchListItem {
   away: { name: string };
 }
 
-async function findFotMobMatchId(homeTeamName: string, awayTeamName: string, dateIso: string): Promise<number | null> {
+async function findFotMobMatchId(homeTeamName: string, awayTeamName: string, dateIso: string | Date): Promise<number | null> {
   // FotMob's listing endpoint by date returns ALL matches on the day.
   // Filter to ours by team-name fuzzy match. The API has no key.
-  const ymd = dateIso.slice(0, 10);
+  // postgres.js returns TIMESTAMPTZ as Date, not string — coerce safely.
+  const isoStr = dateIso instanceof Date
+    ? dateIso.toISOString()
+    : String(dateIso);
+  const ymd = isoStr.slice(0, 10);
   const url = `${FOTMOB_BASE}/matches?date=${ymd}`;
   const res = await fetch(url, { headers: { 'user-agent': 'Mozilla/5.0' }, cache: 'no-store' });
   if (!res.ok) return null;
@@ -89,7 +93,7 @@ async function main() {
   const fixtures = await sql<Array<{
     id: number; team_h: number; team_a: number;
     home_name: string; away_name: string;
-    kickoff_time: string | null;
+    kickoff_time: string | Date | null;
   }>>`
     SELECT f.id, f.team_h, f.team_a,
            th.name AS home_name, ta.name AS away_name,
