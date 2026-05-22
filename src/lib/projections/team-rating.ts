@@ -89,9 +89,36 @@ export async function recomputeTeamRatings(): Promise<void> {
     // are almost always small-sample artefacts.
     const obsAttack  = clamp(observedFor / leagueXgPerMatch, 0.4, 2.0);
     const obsDefence = clamp(observedAgainst / leagueXgPerMatch, 0.4, 2.0);
-    // Kalman gain shrinks as we get more matches (prior tightens).
-    const sigmaPrior2 = SIGMA_PRIOR_2_INIT / Math.max(1, matches);
-    const gain = sigmaPrior2 / (sigmaPrior2 + SIGMA_OBS_2);
+    // §kalman — proper Bayesian update.
+    //
+    // CORRECTED MATH: as we observe more matches, our uncertainty about
+    // the observed mean SHRINKS (sigma_obs² / n). The prior's uncertainty
+    // stays fixed at SIGMA_PRIOR_2_INIT — that's how much we believed in
+    // "team = league average" BEFORE seeing data. After N matches, the
+    // gain should tend to 1 (trust the observation).
+    //
+    // Old (buggy) math:
+    //   sigmaPrior2 = SIGMA_PRIOR_2_INIT / matches    ← shrunk wrong term
+    //   gain = sigmaPrior2 / (sigmaPrior2 + SIGMA_OBS_2)
+    //   → gain → 0 as matches → ∞  (model trusts the prior more with more data!)
+    //
+    // New (correct) math:
+    //   sigmaPrior2 = SIGMA_PRIOR_2_INIT                 (fixed prior uncertainty)
+    //   sigmaObsMean2 = SIGMA_OBS_2 / matches            (sample-mean variance)
+    //   gain = sigmaPrior2 / (sigmaPrior2 + sigmaObsMean2)
+    //   → gain → 1 as matches → ∞  (model trusts the data with more samples)
+    //
+    // For matches = 38, SIGMA_PRIOR_2_INIT = 0.16, SIGMA_OBS_2 = 0.36:
+    //   sigmaObsMean2 = 0.36/38 = 0.0095
+    //   gain = 0.16 / (0.16 + 0.0095) = 0.944
+    // So a 38-game season gives the observation ~94% weight — correct.
+    // For matches = 3 (start of season):
+    //   sigmaObsMean2 = 0.36/3 = 0.12
+    //   gain = 0.16 / (0.16 + 0.12) = 0.571
+    // So 3 games gives the obs ~57% weight — sensible early-season shrinkage.
+    const sigmaPrior2 = SIGMA_PRIOR_2_INIT;
+    const sigmaObsMean2 = SIGMA_OBS_2 / Math.max(1, matches);
+    const gain = sigmaPrior2 / (sigmaPrior2 + sigmaObsMean2);
     const priorAttack  = 1.0;          // start each team at league average
     const priorDefence = 1.0;
     const attack  = priorAttack  + gain * (obsAttack  - priorAttack);

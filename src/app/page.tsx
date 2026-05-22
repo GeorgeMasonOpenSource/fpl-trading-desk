@@ -8,7 +8,7 @@ import { getGameweeks, lastIngestAt, managerSummary, squadForGameweek, livePoint
 import { NewsWatch } from '@/components/NewsWatch';
 import { compareTransferScenarios } from '@/lib/transfers/optimiser';
 import { rankCaptains } from '@/lib/captaincy/engine';
-import { getManagerId, getLeagueId } from '@/lib/session';
+import { getManagerId, getLeagueId, getUsedChips } from '@/lib/session';
 import { n, fmt } from '@/lib/util/fmt';
 import { sql } from '@/lib/db/client';
 
@@ -126,8 +126,23 @@ export default async function DashboardPage() {
     ? await safe(() => rankCaptains(managerId, planning.id, leagueId ?? undefined), null, 'rankCaptains')
     : null;
 
-  const recommendedScenario = scenarios.slice().sort((a, b) => b.ev - a.ev)[0] ?? null;
-  const rollScenario = scenarios.find(s => s.scenario === 'roll');
+  // §used-chips — never recommend a chip the user has already played.
+  // Dashboard used to pick "wildcard" as the top scenario even when WC
+  // had been used; now we strip the corresponding scenarios out first.
+  const usedChips = getUsedChips();
+  const scenarioBlockedByChip: Record<string, string> = {
+    wildcard:        'WC',
+    free_hit:        'FH',
+    bench_boost:     'BB',
+    triple_captain:  'TC'
+  };
+  const availableScenarios = scenarios.filter(s => {
+    const chipCode = scenarioBlockedByChip[s.scenario];
+    if (!chipCode) return true; // not a chip — keep it
+    return !usedChips.has(chipCode as 'WC'|'FH'|'BB'|'TC');
+  });
+  const recommendedScenario = availableScenarios.slice().sort((a, b) => b.ev - a.ev)[0] ?? null;
+  const rollScenario = availableScenarios.find(s => s.scenario === 'roll');
   const recommend = (recommendedScenario && recommendedScenario.ev >= evThreshold)
     ? recommendedScenario
     : rollScenario;
