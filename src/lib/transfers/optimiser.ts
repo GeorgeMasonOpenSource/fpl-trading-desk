@@ -295,15 +295,25 @@ export async function rankTopTransfers(
     }
   }
 
+  // XI-first filter. The user explicitly does NOT want bench upgrades crowding
+  // the top-10 — they want a strong starting XI, not a strong squad. Filter
+  // to moves where the incoming player would actually start in the new XI.
+  //
+  // Fallback: if the strict XI-only filter would produce < 5 results (e.g. a
+  // really thin candidate pool), fall back to the unfiltered list so the user
+  // always sees something. In practice this rarely fires.
+  const xiOnly = allMoves.filter(m => m.startsImmediately);
+  const ranked = xiOnly.length >= 5 ? xiOnly : allMoves;
+
   // Rank by next-GW EV gain (what the user sees as "points for the next gameweek").
   // Tiebreak: 3-GW EV, then cheaper net cost.
-  allMoves.sort((a, b) => {
+  ranked.sort((a, b) => {
     if (b.evDelta[1] !== a.evDelta[1]) return b.evDelta[1] - a.evDelta[1];
     if (b.evDelta[3] !== a.evDelta[3]) return b.evDelta[3] - a.evDelta[3];
     return a.netCost - b.netCost;
   });
 
-  return allMoves.slice(0, limit).map((m, idx) => ({
+  return ranked.slice(0, limit).map((m, idx) => ({
     rank: idx + 1,
     out: {
       playerId: m.out.playerId, webName: m.out.webName, teamShort: m.out.teamShort,

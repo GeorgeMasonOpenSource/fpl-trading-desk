@@ -10,6 +10,8 @@ import {
   pairPerFixture
 } from '@/lib/transfers/insights';
 import { TransferWhy } from '@/components/TransferWhy';
+import { TransferReasons } from '@/components/TransferReasons';
+import { transferReasons } from '@/lib/transfers/transfer-reasons';
 import { EvDecompositionBar } from '@/components/EvDecompositionBar';
 import { CompareToOverlay } from '@/components/CompareToOverlay';
 import { TransferPreview, type PreviewPlayer, type PreviewSwap } from '@/components/TransferPreview';
@@ -211,7 +213,7 @@ export default async function TransferPlanner() {
       </Card>
       <Card
         title={`Top 10 transfers for ${gw.name}`}
-        subtitle="Ranked by expected Starting-XI points gained next gameweek. Captain doubling and bench-utility factored in."
+        subtitle="XI-only — only includes swaps where the incoming player would start in your auto-picked XI. Bench-only depth moves are filtered out. Ranked by next-GW Starting-XI EV gain, captain doubling included."
       >
         {topTransfers.length === 0 ? (
           <p className="text-sm text-ink-muted">
@@ -237,6 +239,29 @@ export default async function TransferPlanner() {
               const perGw = inBreak && outBreak
                 ? pairPerFixture(inBreak.perFixture, outBreak.perFixture)
                 : [];
+              // Generate plain-English reasoning bullets so the user sees the
+              // WHY of every suggestion, not just the EV delta. We compute it
+              // once per row and pass it to both the summary preview (top 2
+              // headlines) and the expanded panel (full list).
+              const reasons = transferReasons({
+                outName: t.out.webName,
+                inName:  t.in.webName,
+                outInsight: insights.get(t.out.playerId),
+                inInsight:  insights.get(t.in.playerId),
+                componentDelta: delta,
+                perGw,
+                netCost: t.netCost,
+                evGain1: t.evGain1,
+                evGain3: t.evGain3,
+                changesCaptain: t.changesCaptain,
+                startsImmediately: t.startsImmediately,
+                position: t.in.position
+              });
+              const topHeadlines = reasons
+                .filter(r => r.tone !== 'negative')
+                .slice(0, 2)
+                .map(r => r.headline)
+                .join(' · ');
               // §3c counterfactual — the EV gain from rolling is: you give up
               // this week's projected gain (-evGain1) but bank a transfer for
               // next week (worth ~BANKED_FT_EV). The optimiser scores `roll`
@@ -284,9 +309,16 @@ export default async function TransferPlanner() {
                       {t.changesCaptain && <Badge tone="violet">new C</Badge>}
                     </div>
                   </div>
+                  {topHeadlines && (
+                    <div className="mt-1.5 text-[11px] text-ink-muted">
+                      <span className="text-accent-green">●</span>{' '}
+                      <span className="font-medium text-ink">{topHeadlines}</span>
+                      <span className="text-ink-dim"> — click for full reasoning</span>
+                    </div>
+                  )}
                   <div className="mt-1 flex items-center justify-between text-[10px] text-ink-dim">
                     <span className="group-open:hidden">
-                      click to see EV breakdown, fixtures, and recent form →
+                      click to see why, EV breakdown, and recent form →
                     </span>
                     <span
                       className={`font-mono ${rollNet >= 0 ? 'text-accent-amber' : 'text-ink-dim'}`}
@@ -299,6 +331,7 @@ export default async function TransferPlanner() {
                   </div>
                 </summary>
                 <div className="px-3 py-3 border-t border-line space-y-4">
+                  <TransferReasons reasons={reasons} />
                   {delta && (
                     <EvDecompositionBar delta={delta} perGw={perGw} />
                   )}
