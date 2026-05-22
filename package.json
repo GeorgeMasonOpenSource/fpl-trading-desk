@@ -21,11 +21,13 @@
     "ingest:youtube": "tsx scripts/ingest-youtube.ts",
     "ingest:odds": "tsx scripts/ingest-odds.ts",
     "ingest:lineups": "tsx scripts/ingest-lineups.ts",
+    "ingest:understat": "tsx scripts/ingest-understat.ts",
     "probe:transcript": "tsx scripts/probe-transcript.ts"
   },
   "dependencies": {
     "@neondatabase/serverless": "^0.9.4",
     "clsx": "^2.1.1",
+    "javascript-lp-solver": "^0.4.24",
     "next": "14.2.5",
     "postgres": "^3.4.4",
     "react": "^18.3.1",

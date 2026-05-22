@@ -419,6 +419,10 @@ export async function recomputeProjectionsForGameweek(gameweekId: number) {
       season_xg: number; season_xa: number; season_bonus: number;
       season_defcon_per_90: number;
       season_yellows: number;
+      xg_open_play_understat: number | null;
+      xg_penalty_understat: number | null;
+      xg_set_piece_understat: number | null;
+      shots_open_play: number | null;
       penalties_order: number | null;
       corners_order: number | null; freekicks_order: number | null;
       team_xg_total: number; team_xa_total: number;
@@ -455,6 +459,14 @@ export async function recomputeProjectionsForGameweek(gameweekId: number) {
         COALESCE(p.season_bonus, 0)::numeric                                     AS season_bonus,
         COALESCE(p.season_defcon_per_90, 0)::numeric                             AS season_defcon_per_90,
         COALESCE(y.season_yellows, 0)::int                                       AS season_yellows,
+        -- §shot-data — Understat per-situation xG. Falls back to NULL when
+        -- the player has no Understat row (new signings; off-season ingest
+        -- not yet run). The engine handles NULL by reverting to the
+        -- season_xg pen-share heuristic.
+        psa.xg_open_play::numeric                                                AS xg_open_play_understat,
+        psa.xg_penalty::numeric                                                  AS xg_penalty_understat,
+        psa.xg_set_piece::numeric                                                AS xg_set_piece_understat,
+        psa.shots_open_play::int                                                 AS shots_open_play,
         COALESCE(recency.minutes, 0)::numeric AS recency_minutes,
         COALESCE(recency.xg, 0)::numeric      AS recency_xg,
         COALESCE(recency.xa, 0)::numeric      AS recency_xa,
@@ -481,6 +493,10 @@ export async function recomputeProjectionsForGameweek(gameweekId: number) {
           SUM(yellow_cards)::int AS yellow_cards
         FROM player_gameweek_history WHERE player_id = p.id
       ) c ON TRUE
+      -- §shot-data — pull Understat per-situation xG aggregates. Used by
+      -- the engine downstream to compute TRUE open-play xG without the
+      -- season_xg pen-inflation heuristic.
+      LEFT JOIN player_shot_aggregates psa ON psa.player_id = p.id
       LEFT JOIN LATERAL (
         -- Recency-weighted xG / xA / minutes via exponential decay. The
         -- decay factor 0.80 has a half-life of ~3 GW so a player's
@@ -578,15 +594,17 @@ export async function recomputeProjectionsForGameweek(gameweekId: number) {
       // model never collapses to "Haaland gets everything"; the rest is shared
       // with the other 10 outfielders implicitly.
       //
-      // PENALTY ADJUSTMENT: same rationale as the baseline xG strip — total
-      // season_xg includes pen xG. For a pen-taker that inflates their share
-      // of the team's open-play threat. Subtract estimated pen xG from BOTH
-      // the player's season_xg AND the team's season_xg_total before the
-      // ratio so we measure share of open-play scoring only.
-      const seasonPenXg = penaltyShare * 5 * 0.78;     // ~5 pens/team/season
-      const playerOpenPlayXg = Math.max(0, Number(p.season_xg) - seasonPenXg);
-      // Team pen xG approx: 5 pens × 0.78 × team's penalty rate factor.
-      // We approximate team-level pen xG at ~3.9 (5 × 0.78) per team-season.
+      // §shot-data — when Understat aggregates exist for the player, use the
+      // TRUE per-situation xG split (open_play vs penalty vs set_piece) instead
+      // of the season_xg pen-share heuristic. The heuristic was ~5 pens/season
+      // × 0.78; the actual number is in xg_penalty_understat with zero noise.
+      // For players without Understat data we fall back to the heuristic.
+      const hasUnderstat = (p as any).xg_open_play_understat != null;
+      const playerOpenPlayXg = hasUnderstat
+        ? Number((p as any).xg_open_play_understat) || 0
+        : Math.max(0, Number(p.season_xg) - penaltyShare * 5 * 0.78);
+      // Team open-play xG: still heuristic-derived for now (a future
+      // iteration will pull team_shot_aggregates for the exact number).
       const teamOpenPlayXg = Math.max(0, Number(p.team_xg_total) - 3.9);
       const goalShare   = teamOpenPlayXg > 0
         ? Math.min(0.60, playerOpenPlayXg / teamOpenPlayXg)
