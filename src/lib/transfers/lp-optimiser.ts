@@ -99,16 +99,28 @@ export interface LpOptimiserResult {
  * solver package so the rest of the app compiles without it.
  */
 export async function runLpOptimiser(input: LpOptimiserInput): Promise<LpOptimiserResult> {
-  // Dynamic import — the package is JS-only so the type signature is
-  // loose. If the user hasn't installed it, throw a clear error.
+  // Dynamic require — the package is CommonJS and MUTATES its own module
+  // object during Solve() (sets `lastSolvedModel`). ESM dynamic import()
+  // returns a frozen Module Namespace Object so the assignment fails with
+  // "Cannot set property lastSolvedModel of [object Module] which has only
+  // a getter". Use Node's createRequire to load as CommonJS, giving us a
+  // mutable export object the library can write to.
   let solver: { Solve: (m: SolverModel) => SolverResult };
   try {
-    // @ts-expect-error - dynamic import of CommonJS package without types
-    solver = await import('javascript-lp-solver');
-  } catch {
+    const { createRequire } = await import('node:module');
+    const req = createRequire(import.meta.url);
+    const mod = req('javascript-lp-solver') as any;
+    // Some bundlers wrap CJS in .default; handle both shapes.
+    const inner = mod && mod.Solve ? mod : (mod && mod.default ? mod.default : mod);
+    if (!inner || typeof inner.Solve !== 'function') {
+      throw new Error('javascript-lp-solver export shape unexpected — no Solve function found');
+    }
+    solver = inner;
+  } catch (err) {
     throw new Error(
       'LP optimiser needs javascript-lp-solver. ' +
-      'Install with: npm install javascript-lp-solver --save'
+      'Install with: npm install javascript-lp-solver --save. ' +
+      `Underlying: ${(err as Error).message}`
     );
   }
 

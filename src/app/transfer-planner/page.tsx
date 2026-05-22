@@ -12,6 +12,7 @@ import {
 import { TransferWhy } from '@/components/TransferWhy';
 import { EvDecompositionBar } from '@/components/EvDecompositionBar';
 import { CompareToOverlay } from '@/components/CompareToOverlay';
+import { TransferPreview, type PreviewPlayer, type PreviewSwap } from '@/components/TransferPreview';
 import { getGameweeks, managerSummary } from '@/lib/db/queries';
 import { getManagerId } from '@/lib/session';
 import { NotConnected } from '@/components/NotConnected';
@@ -94,14 +95,58 @@ export default async function TransferPlanner() {
   const involvedIds = Array.from(new Set(
     topTransfers.flatMap(t => [t.out.playerId, t.in.playerId])
   ));
-  const [insights, evBreakdowns, defconStats] = await Promise.all([
+  const [insights, evBreakdowns, defconStats, currentSquadForPreview] = await Promise.all([
     getTransferInsights(involvedIds, gw.id),
     getTransferEvBreakdown(involvedIds, gw.id, EV_BREAKDOWN_HORIZON_GWS),
     // Pull season DEFCON-per-90 + total DEFCON points for every player on
     // the top-10. Lets the row table flag "Le Fée scores 4 points because
     // he averages 9 def-actions/90 — borderline" vs "Anderson is 11/90, safe".
-    loadDefconStats(involvedIds)
+    loadDefconStats(involvedIds),
+    loadCurrentSquadForPreview(managerId, gw.id)
   ]);
+
+  // Build the swap list for the Transfer Preview: LP top pick first, then
+  // the top-5 greedy suggestions so the user can flip between them and see
+  // exactly which players come in / out for each. Each PreviewSwap carries
+  // the metrics needed for the badges.
+  const previewSwaps: PreviewSwap[] = [];
+  if (lpPlan1.feasible && lpPlan1.transfersIn.length > 0) {
+    previewSwaps.push({
+      label: `LP optimal · GW${gw.id} · ${lpPlan1.transfersOut.map(p => p.webName).join(', ')} → ${lpPlan1.transfersIn.map(p => p.webName).join(', ')}`,
+      transfersOut: lpPlan1.transfersOut,
+      transfersIn:  lpPlan1.transfersIn,
+      metrics: [
+        { label: 'Total xPts', value: lpPlan1.totalXpts.toFixed(2), tone: 'green' },
+        { label: 'Hits',       value: String(lpPlan1.hitsTaken), tone: lpPlan1.hitsTaken === 0 ? 'green' : 'amber' },
+        { label: 'Net spend',  value: lpPlan1.spend === 0 ? '£0' : `${lpPlan1.spend > 0 ? '-' : '+'}£${(Math.abs(lpPlan1.spend) / 10).toFixed(1)}m`, tone: lpPlan1.spend > 0 ? 'amber' : 'green' }
+      ]
+    });
+  }
+  for (const t of topTransfers.slice(0, 5)) {
+    const outP = currentSquadForPreview.find(s => s.playerId === t.out.playerId);
+    if (!outP) continue;
+    previewSwaps.push({
+      label: `Top-${t.rank} · ${t.out.webName} → ${t.in.webName}`,
+      transfersOut: [{
+        playerId: t.out.playerId, webName: t.out.webName,
+        position: t.out.position as 'GKP'|'DEF'|'MID'|'FWD',
+        teamShort: t.out.teamShort, cost: t.out.cost,
+        sellingPrice: outP.sellingPrice,
+        xptsPerGw: t.out.xpts1
+      }],
+      transfersIn: [{
+        playerId: t.in.playerId, webName: t.in.webName,
+        position: t.in.position as 'GKP'|'DEF'|'MID'|'FWD',
+        teamShort: t.in.teamShort, cost: t.in.cost,
+        xptsPerGw: t.in.xpts1
+      }],
+      metrics: [
+        { label: 'Gain (1 GW)', value: `+${t.evGain1.toFixed(2)}`, tone: t.evGain1 > 1 ? 'green' : 'steel' },
+        { label: 'Gain (3 GW)', value: `+${t.evGain3.toFixed(2)}`, tone: t.evGain3 > 1 ? 'green' : 'steel' },
+        { label: 'Net £',       value: t.netCost === 0 ? '—' : `${t.netCost > 0 ? '-' : '+'}£${(Math.abs(t.netCost) / 10).toFixed(1)}m`, tone: t.netCost <= 0 ? 'green' : 'amber' }
+      ]
+    });
+  }
 
   return (
     <div className="space-y-6">
@@ -127,6 +172,10 @@ export default async function TransferPlanner() {
           </div>
         )}
       </Card>
+
+      {previewSwaps.length > 0 && currentSquadForPreview.length === 15 && (
+        <TransferPreview currentSquad={currentSquadForPreview} swaps={previewSwaps} defaultSelected={0} />
+      )}
 
       <Card title="Scenario comparison" subtitle="EV gains over 1, 3, 6 and 8 GW horizons">
         <Table>
@@ -441,6 +490,54 @@ interface DefconStat {
  *   - low     more than 2 below threshold
  *   - unknown insufficient minutes (< 270 this season)
  */
+/**
+ * Pull the user's current 15 in a shape ready for the TransferPreview
+ * component: position, team-short, current cost, owner's selling_price,
+ * and the player's 1-GW xPts. Sorted by position so the GKP appears
+ * first, then DEF/MID/FWD.
+ */
+async function loadCurrentSquadForPreview(managerId: number, gameweekId: number): Promise<PreviewPlayer[]> {
+  const rows = await sql<Array<{
+    player_id: number; web_name: string;
+    position: 'GKP'|'DEF'|'MID'|'FWD';
+    team_short: string;
+    now_cost: number;
+    selling_price: number | null;
+    xpts: number;
+  }>>`
+    SELECT mp.player_id,
+           p.web_name,
+           p.position,
+           t.short_name AS team_short,
+           p.now_cost,
+           mp.selling_price,
+           COALESCE((
+             SELECT SUM(pr.xpts_total)
+               FROM projections pr
+              WHERE pr.player_id = p.id
+                AND pr.gameweek_id = ${gameweekId}
+           ), 0)::float8 AS xpts
+      FROM manager_picks mp
+      JOIN players p ON p.id = mp.player_id
+      JOIN teams   t ON t.id = p.team_id
+     WHERE mp.manager_id = ${managerId}
+       AND mp.gameweek_id = (
+         SELECT MAX(gameweek_id) FROM manager_picks
+          WHERE manager_id = ${managerId}
+            AND gameweek_id <= ${gameweekId}
+       )
+  `;
+  return rows.map(r => ({
+    playerId:     r.player_id,
+    webName:      r.web_name,
+    position:     r.position,
+    teamShort:    r.team_short,
+    cost:         Number(r.now_cost),
+    sellingPrice: r.selling_price == null ? Number(r.now_cost) : Number(r.selling_price),
+    xptsPerGw:    Number(r.xpts) || 0
+  }));
+}
+
 async function loadDefconStats(playerIds: number[]): Promise<Map<number, DefconStat>> {
   if (playerIds.length === 0) return new Map();
   const rows = await sql<Array<{
