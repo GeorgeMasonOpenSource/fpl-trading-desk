@@ -25,7 +25,25 @@ const COOKIE_OPTS    = {
   secure:   process.env.NODE_ENV === 'production'
 };
 
-/** Active manager id: cookie wins, env is fallback. Returns null if neither. */
+/**
+ * Hard-coded fallback manager / league IDs for this deployment. The
+ * "Connect & ingest" server action keeps timing out on Vercel's 10s
+ * limit so the cookie never gets set; making the manager ID a code-level
+ * default means every page renders with George's squad regardless.
+ *
+ * If you ever want to use this app for a different manager, override
+ * via the FPL_MANAGER_ID env var (still wins over this default) or
+ * delete the constant.
+ */
+const DEFAULT_MANAGER_ID: number | null = 319921;
+const DEFAULT_LEAGUE_ID:  number | null = 1646336;
+
+/**
+ * Active manager id resolution order:
+ *   1. Browser cookie  (set explicitly by the connect flow)
+ *   2. FPL_MANAGER_ID env var  (CI / cron jobs)
+ *   3. DEFAULT_MANAGER_ID constant above  (single-user deployment)
+ */
 export function getManagerId(): number | null {
   const fromCookie = cookies().get(MANAGER_COOKIE)?.value;
   if (fromCookie) {
@@ -33,10 +51,11 @@ export function getManagerId(): number | null {
     if (Number.isFinite(n) && n > 0) return n;
   }
   const fromEnv = Number(process.env.FPL_MANAGER_ID ?? 0);
-  return fromEnv > 0 ? fromEnv : null;
+  if (fromEnv > 0) return fromEnv;
+  return DEFAULT_MANAGER_ID;
 }
 
-/** Active league id: cookie wins, env is fallback. */
+/** Same precedence as getManagerId(). */
 export function getLeagueId(): number | null {
   const fromCookie = cookies().get(LEAGUE_COOKIE)?.value;
   if (fromCookie) {
@@ -44,7 +63,8 @@ export function getLeagueId(): number | null {
     if (Number.isFinite(n) && n > 0) return n;
   }
   const fromEnv = Number(process.env.FPL_LEAGUE_ID ?? 0);
-  return fromEnv > 0 ? fromEnv : null;
+  if (fromEnv > 0) return fromEnv;
+  return DEFAULT_LEAGUE_ID;
 }
 
 /** Write/clear cookies. Server-only — call from server actions or route handlers. */
