@@ -111,7 +111,7 @@ async function runMonteCarloForGameweek(gameweekId: number) {
   // Pull the gameweek's fixtures and the relevant 22-player rosters.
   const fixtures = await sql<Array<{
     id: number; team_h: number; team_a: number;
-  }>>`SELECT id, team_h, team_a FROM fixtures WHERE event = ${gameweekId}`;
+  }>>`SELECT id, team_h, team_a FROM fixtures WHERE gameweek_id = ${gameweekId}`;
   await sql`
     CREATE TABLE IF NOT EXISTS projection_distributions (
       player_id     INTEGER NOT NULL,

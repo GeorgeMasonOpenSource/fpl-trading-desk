@@ -29,6 +29,7 @@ const NAV = [
   { href: '/rotation-radar',     label: 'Rotation Radar' },
   { href: '/fixture-congestion', label: 'Fixture Congestion' },
   { href: '/model-lab',          label: 'Model Lab' },
+  { href: '/model-audit',        label: 'Model Audit' },
   { href: '/backtesting',        label: 'Backtesting' },
   { href: '/settings',           label: 'Settings' },
   { href: '/manual-overrides',   label: 'Manual Overrides' }

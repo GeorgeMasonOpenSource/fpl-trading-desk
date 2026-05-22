@@ -1,0 +1,46 @@
+# Weekly model report — emails a model-health + top-movers digest every
+# Monday 09:00 UTC. Includes data-source coverage, last-GW calibration,
+# top climbers / fallers, and the GW's top-15 xPts list.
+#
+# Requires repo secrets:
+#   - DATABASE_URL          (pooled Neon URL)
+#   - DIRECT_DATABASE_URL   (direct Neon URL)
+#   - RESEND_API_KEY        (https://resend.com — free tier 100 emails/day)
+#   - REPORT_EMAIL          (optional, defaults to george@open-source.io)
+
+name: weekly-report
+
+on:
+  schedule:
+    - cron: '0 9 * * 1'     # Mondays 09:00 UTC
+  workflow_dispatch: {}
+
+concurrency:
+  group: weekly-report
+  cancel-in-progress: false
+
+jobs:
+  send:
+    name: Build + email weekly report
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      DATABASE_URL:        ${{ secrets.DATABASE_URL }}
+      DIRECT_DATABASE_URL: ${{ secrets.DIRECT_DATABASE_URL }}
+      RESEND_API_KEY:      ${{ secrets.RESEND_API_KEY }}
+      REPORT_EMAIL:        ${{ secrets.REPORT_EMAIL }}
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install Node deps
+        run: npm ci
+
+      - name: Build + send report
+        run: npm run report:weekly

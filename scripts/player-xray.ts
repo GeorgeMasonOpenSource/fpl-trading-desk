@@ -94,7 +94,7 @@ async function main() {
       FROM fixtures f
       JOIN teams th ON th.id = f.team_h
       JOIN teams ta ON ta.id = f.team_a
-     WHERE f.event = ${gw.id}
+     WHERE f.gameweek_id = ${gw.id}
        AND (f.team_h = ${p.team_id} OR f.team_a = ${p.team_id})
   `;
 
@@ -122,7 +122,7 @@ async function main() {
            expected_minutes::float8, rotation_risk::float8, reasons
       FROM minutes_projections
      WHERE player_id = ${p.id}
-       AND fixture_id IN (SELECT id FROM fixtures WHERE event = ${gw.id})
+       AND fixture_id IN (SELECT id FROM fixtures WHERE gameweek_id = ${gw.id})
   `;
 
   // Projection output

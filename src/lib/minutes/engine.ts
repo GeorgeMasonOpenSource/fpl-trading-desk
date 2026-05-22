@@ -41,6 +41,14 @@ export interface MinutesInputs {
   recentNinetyRate?: number;
   recentAppearanceRate?: number;
   recentStartSample?: number;       // 0..~2.31 — effective sample size after decay
+  // §observed-mins-floor — the player's actual mean minutes-per-appearance
+  // over the last 5 played fixtures + the season-long average. These let us
+  // floor expected_minutes at what the player has ACTUALLY played, not at
+  // a hand-wavy "75 if not 90" heuristic. A player who logs 88 mins/app
+  // every game shouldn't be predicted at 75 just because our structural
+  // formula has rounding losses.
+  recentAvgMinsPerApp?: number;     // mean of m.minutes where m.minutes > 0, over last 5
+  seasonAvgMinsPerApp?: number;     // season total minutes / appearances
   fplStatus: 'a' | 'd' | 'i' | 'n' | 's' | 'u';
   chanceOfPlayingNext: number | null; // 0..100 from FPL
   // Context for this specific fixture:
@@ -49,6 +57,15 @@ export interface MinutesInputs {
   daysRestBefore: number | null;
   daysRestAfter: number | null;
   fixtureImportance: number;        // 0..2 — late season title race etc.
+  // §team-motivation — how much the team has to play for. Mid-season this
+  // is ~1.0; final 3 GWs of a relegated/safe team it collapses to 0.5;
+  // top-4 chase or relegation fight pushes it to 1.0+. Affects mins by
+  // ±10% — relegated teams rest starters; teams fighting for stakes don't.
+  teamMotivation?: number;          // 0..1 (sweet spot ~0.7 = no stakes left)
+  // §depth — how many of the team's other regular starters are currently
+  // OUT (status='i' or 'u' or doubt). When teammates are injured, the
+  // remaining starters play more (no fresh legs on bench to rotate in).
+  teamInjuredStarters?: number;     // 0..6 typically
   // Depth-chart signal: number of stronger alternatives currently available
   // (computed from current season role evidence).
   competitorPressure: number;       // 0..1
@@ -204,13 +221,66 @@ export function projectMinutes(input: MinutesInputs): MinutesDistribution {
   // 6. Expected minutes -------------------------------------------------------
   // Honour any manual cap (e.g. "manager said 60 max").
   const cap = input.manualMinutesCap ?? 90;
-  const expectedMinutes =
+
+  // §structural — the original heuristic. Decomposes by start/sub bucket
+  // and assigns canonical mid-points (90, 75, 35, 20). Theoretically clean
+  // but loses minutes whenever ninetyProb < 1 (a 95% 90-min starter
+  // gets ~85 mins instead of ~90).
+  const structuralExpectedMinutes =
     ninetyProb * Math.min(90, cap) +
     (startProb - ninetyProb) * Math.min(75, cap) +    // 60-89 starters average ~75
     earlySubRisk * Math.min(35, cap) +
     subProb * Math.min(20, cap) +
     benchUnusedProb * 0 +
     injuryAbsenceProb * 0;
+
+  // §observed — what the player has ACTUALLY logged per appearance over
+  // recent and season. If Bowen averages 87 mins/app, that's the right
+  // anchor — not "75 because his ninetyRate is 0.92". We use a 70/30
+  // recent/season blend (same recencyWeight as elsewhere) when recent
+  // data exists; otherwise fall back to season-only.
+  const observedAvgMinsPerApp =
+    input.recentAvgMinsPerApp != null
+      ? recencyWeight * input.recentAvgMinsPerApp +
+        (1 - recencyWeight) * (input.seasonAvgMinsPerApp ?? input.recentAvgMinsPerApp)
+      : (input.seasonAvgMinsPerApp ?? 65);
+  // Probability the player will appear at all (start OR sub).
+  const appearanceProb = clamp01(startProb + subProb);
+  const observedExpectedMinutes = appearanceProb * Math.min(observedAvgMinsPerApp, cap);
+
+  // §team-motivation multiplier — relegated/safe teams rest starters,
+  // teams with stakes don't. teamMotivation ~0.7 default → 1.0 multiplier;
+  // 0.3 (no stakes) → 0.93 mult; 1.0 (max stakes) → 1.03 mult.
+  // Asymmetric: motivation pushes UP harder than down because once a team
+  // has nothing to play for they DO actually rotate, but a team chasing
+  // top-4 plays first-choice 90s.
+  const motivation = input.teamMotivation ?? 0.7;
+  const motivationMultiplier = motivation >= 0.7
+    ? 1.0 + 0.10 * Math.min(1, (motivation - 0.7) / 0.3)   // 0.7→1.0, 1.0→1.10
+    : 1.0 - 0.07 * Math.min(1, (0.7 - motivation) / 0.7);   // 0.7→1.0, 0→0.93
+  if (motivation < 0.4) {
+    reasons.push({ kind: 'team_motivation', weight: 1 - motivationMultiplier, detail: `team has little to play for (motivation ${(motivation*100).toFixed(0)}%)` });
+  }
+
+  // §injury depth — when teammates are out, the available starters play
+  // more (no fresh bench legs to rotate in). +2% per missing starter,
+  // capped at +10% (5+ injuries).
+  const injuredCount = Math.min(5, Math.max(0, input.teamInjuredStarters ?? 0));
+  const injuryDepthMultiplier = 1.0 + 0.02 * injuredCount;
+  if (injuredCount >= 2) {
+    reasons.push({ kind: 'team_injuries', weight: injuryDepthMultiplier - 1, detail: `${injuredCount} teammates out — fewer rotation options` });
+  }
+
+  // §floor — the final answer is the MAX of structural vs observed, then
+  // adjusted by motivation + injury depth. We use MAX (not blend) because
+  // observed is empirical truth and structural is theoretical; if the
+  // player actually plays 87 mins on average we shouldn't predict less
+  // than that, only more (for stake/injury reasons).
+  const baseMinutes = Math.max(structuralExpectedMinutes, observedExpectedMinutes);
+  const expectedMinutes = Math.min(
+    cap,
+    baseMinutes * motivationMultiplier * injuryDepthMultiplier
+  );
 
   // 7. Confidence -------------------------------------------------------------
   // Higher current-season sample + higher reliability => higher confidence.
@@ -371,6 +441,39 @@ export async function recomputeMinutesForGameweek(gw: number) {
     overridesByPlayer.get(o.scope_id)!.push({ kind: o.kind, value: o.value });
   }
 
+  // §team-motivation — pull motivation_score per team. ~0.7 default
+  // mid-season; collapses to 0.1-0.3 for relegated/safe teams in the
+  // final 3 GWs; pushes to 1.0 for top-4 chase / relegation fight.
+  const teamMotivationRows = teamIds.length === 0 ? [] : await sql<Array<{
+    id: number; motivation_score: number | null;
+  }>>`
+    SELECT id, motivation_score FROM teams WHERE id IN ${sql(teamIds as any)}
+  `;
+  const teamMotivationByTeam = new Map<number, number>();
+  for (const t of teamMotivationRows) {
+    if (t.motivation_score != null) {
+      teamMotivationByTeam.set(t.id, Number(t.motivation_score));
+    }
+  }
+
+  // §injured-starters — count of teammates currently OUT (status='i' or
+  // 'u') OR doubtful (chance_of_playing_next_round <= 50). This is the
+  // depth signal: fewer healthy alternatives → starters play more mins.
+  const injuredCountByTeam = new Map<number, number>();
+  for (const p of players) {
+    const isOut = p.status === 'i' || p.status === 'u'
+      || (p.status === 'd' && (p.chance_of_playing_next_round ?? 100) <= 50);
+    if (!isOut) continue;
+    // Only count "starter-grade" missing players — those who normally play
+    // 60+ mins/app. A 4th-choice CB being out doesn't reduce rotation
+    // options for the front line. Use season_minutes / season_starts.
+    const startsAvg = (Number(p.season_starts) || 0) > 0
+      ? (Number(p.season_minutes) || 0) / (Number(p.season_starts) || 1)
+      : 0;
+    if (startsAvg < 50) continue;
+    injuredCountByTeam.set(p.team_id, (injuredCountByTeam.get(p.team_id) ?? 0) + 1);
+  }
+
   // European fixtures within the GW window — small table, one query.
   const euFixtures = teamIds.length === 0 ? [] : await sql<Array<{
     team_id: number; kickoff_time: string;
@@ -439,8 +542,11 @@ export async function recomputeMinutesForGameweek(gw: number) {
 
       // Recency-weighted rates over the last 5 played fixtures. Decay 0.6
       // per step → weights [1.0, 0.6, 0.36, 0.22, 0.13], effN ≤ 2.31.
+      // §observed-mins-floor — also accumulate weighted total minutes so
+      // we can compute the average minutes-per-appearance over recent.
       const recent = recentByPlayer.get(p.id) ?? [];
       let rN = 0, rS = 0, rA = 0, rNine = 0, rStartedAcc = 0;
+      let rMinsTotal = 0, rApperanceWeights = 0;
       let w = 1;
       for (const m of recent) {
         const started = m.starts > 0 ? 1 : 0;
@@ -452,12 +558,41 @@ export async function recomputeMinutesForGameweek(gw: number) {
           rNine += w * ninety;
           rStartedAcc += w;
         }
+        if (appeared) {
+          // Only count matches where the player actually appeared. A DNP
+          // shouldn't drag the avg-mins-per-app down — that's what
+          // appearanceProb handles upstream.
+          rMinsTotal += w * m.minutes;
+          rApperanceWeights += w;
+        }
         rN += w;
         w *= 0.6;
       }
       const recentStartRate      = rN > 0 ? rS / rN : undefined;
       const recentAppearanceRate = rN > 0 ? rA / rN : undefined;
       const recentNinetyRate     = rStartedAcc > 0 ? rNine / rStartedAcc : undefined;
+      const recentAvgMinsPerApp  = rApperanceWeights > 0
+        ? rMinsTotal / rApperanceWeights
+        : undefined;
+
+      // §season-avg-mins-per-app — total minutes ÷ appearances, NOT ÷
+      // games-played. A player who logs 2700 mins in 32 appearances
+      // averages 84 mins/app; the rate is what matters for predicting
+      // the NEXT appearance, not their start frequency.
+      const seasonAvgMinsPerApp = reliabilityInput.appearancesAvailable > 0
+        ? seasonMinutes / reliabilityInput.appearancesAvailable
+        : undefined;
+
+      // §team-motivation — pulled from teams.motivation_score (recomputed
+      // weekly by team-context.ts). 0..1 scale; ~0.7 default mid-season,
+      // collapses to 0.1-0.3 for relegated/safe teams in final 3 GWs,
+      // pushes to 1.0 for top-4 chase / relegation fight.
+      const teamMotivation = teamMotivationByTeam.get(p.team_id);
+
+      // §injured-starters — count teammates with FPL status 'i', 'u', or
+      // doubt (chance_of_playing_next_round <= 50). Pulled from the
+      // already-loaded players list filtered to same team.
+      const teamInjuredStarters = injuredCountByTeam.get(p.team_id) ?? 0;
 
       const distribution = projectMinutes({
         playerId: p.id, fixtureId: fix.id,
@@ -467,6 +602,10 @@ export async function recomputeMinutesForGameweek(gw: number) {
         currentSeasonAppearanceRate: appearanceRate,
         recentStartRate, recentNinetyRate, recentAppearanceRate,
         recentStartSample: rN,
+        recentAvgMinsPerApp,
+        seasonAvgMinsPerApp,
+        teamMotivation,
+        teamInjuredStarters,
         fplStatus: p.status,
         chanceOfPlayingNext: p.chance_of_playing_next_round,
         isPostEuropeanFixture: postEu,

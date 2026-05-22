@@ -20,6 +20,11 @@ export interface LpPlanInput {
   freeTransfers: number;        // user's current FT count (usually 1, sometimes 2)
   allowHits?: boolean;          // default false. true → solver may suggest -4 hits.
   maxHits?: number;             // default 1
+  // §XI-first — when true, the LP maximises the STARTING XI's xPts and
+  // treats bench players as cheap filler. For the final GW we want this.
+  // Default true for 1-GW plans (where bench is mostly worthless),
+  // false for multi-GW plans (where bench rotation matters).
+  xiFirst?: boolean;
 }
 
 export interface LpPlanResult {
@@ -134,6 +139,10 @@ export async function runLpPlan(input: LpPlanInput): Promise<LpPlanResult> {
   });
 
   // 6. Solve.
+  // §XI-first default: ON for 1-GW horizon (last GW or matchday-only
+  // optimisation where bench is worthless); OFF for multi-GW (bench
+  // rotation matters across rotations). User can override.
+  const xiFirst = input.xiFirst ?? (input.horizon === 1);
   let result: LpOptimiserResult;
   try {
     result = await runLpOptimiser({
@@ -141,7 +150,8 @@ export async function runLpPlan(input: LpPlanInput): Promise<LpPlanResult> {
       bank,
       freeTransfers: input.freeTransfers,
       allowHits: input.allowHits ?? false,
-      maxHits:   input.maxHits   ?? 1
+      maxHits:   input.maxHits   ?? 1,
+      xiFirst
     });
   } catch (err) {
     // The LP package is dynamic-imported and might not be installed.

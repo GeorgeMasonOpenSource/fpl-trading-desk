@@ -55,9 +55,9 @@ export default async function PredictedLineupsPage() {
     is_home: boolean; kickoff_time: string | Date | null;
   }>>`
     WITH fx AS (
-      SELECT f.id, f.team_h, f.team_a, f.kickoff_time, f.event
+      SELECT f.id, f.team_h, f.team_a, f.kickoff_time, f.gameweek_id
         FROM fixtures f
-       WHERE f.event = ${gw.id} AND f.finished = FALSE
+       WHERE f.gameweek_id = ${gw.id} AND f.finished = FALSE
     )
     SELECT t.id        AS team_id,
            t.name      AS team_name,
@@ -102,7 +102,7 @@ export default async function PredictedLineupsPage() {
            COALESCE(MAX(pr.xpts_total), 0)::float8        AS xpts
       FROM players p
       LEFT JOIN minutes_projections mn ON mn.player_id = p.id
-        AND mn.fixture_id IN (SELECT id FROM fixtures WHERE event = ${gw.id})
+        AND mn.fixture_id IN (SELECT id FROM fixtures WHERE gameweek_id = ${gw.id})
       LEFT JOIN projections pr ON pr.player_id = p.id AND pr.gameweek_id = ${gw.id}
      WHERE p.status <> 'u'
      GROUP BY p.id
