@@ -10,7 +10,8 @@ export const metadata = {
 };
 
 const NAV = [
-  { href: '/',                   label: 'Dashboard' },
+  { href: '/gw',                 label: '★ This Gameweek' },
+  { href: '/',                   label: 'Dashboard (full)' },
   { href: '/gw-checklist',       label: 'GW Checklist' },
   { href: '/pitch',              label: 'Pitch view' },
   { href: '/predicted-lineups',  label: 'Predicted Lineups' },

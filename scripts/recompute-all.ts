@@ -29,6 +29,9 @@ import { recomputeTeamRatings, ratingFixtureXg } from '../src/lib/projections/te
 import { recomputeHierarchicalEstimates } from '../src/lib/projections/hierarchical';
 import { recomputeProjectionsForGameweek } from '../src/lib/projections/engine';
 import { simulateFixture } from '../src/lib/projections/monte-carlo';
+import { recomputePerPositionDefence } from '../src/lib/projections/per-position-defence';
+import { recomputeMinutesCalibration } from '../src/lib/minutes/per-position-calibration';
+import { recomputeSetPieceRoles } from '../src/lib/projections/set-piece-roles';
 
 async function main() {
   const args = process.argv.slice(2);
@@ -42,6 +45,39 @@ async function main() {
   console.log('[recompute-all] step 1/4 — Bayesian team ratings');
   await recomputeTeamRatings();
   console.log(`[recompute-all] step 1 done in ${Date.now() - t0}ms`);
+
+  // 1b. Per-position defensive ratings — the structural improvement
+  // FPLReview doesn't have. Decomposes single defensive_solidity into
+  // per-(team, opponent_position) multipliers from observed xG-conceded.
+  // Cheap (single SQL pass). Run after 1.
+  const t0b = Date.now();
+  console.log('[recompute-all] step 1b — per-position defensive ratings');
+  try {
+    await recomputePerPositionDefence();
+    console.log(`[recompute-all] step 1b done in ${Date.now() - t0b}ms`);
+  } catch (err) {
+    console.warn(`[recompute-all] step 1b SKIPPED (${(err as Error).message}) — apply migration 0011 to enable`);
+  }
+
+  // 1c. Minutes calibration — per-position multiplier from snapshot-vs-actuals.
+  const t0c = Date.now();
+  console.log('[recompute-all] step 1c — minutes calibration');
+  try {
+    await recomputeMinutesCalibration();
+    console.log(`[recompute-all] step 1c done in ${Date.now() - t0c}ms`);
+  } catch (err) {
+    console.warn(`[recompute-all] step 1c SKIPPED (${(err as Error).message})`);
+  }
+
+  // 1d. Set-piece roles — derive pen / DFK / corner takers from shot data.
+  const t0d = Date.now();
+  console.log('[recompute-all] step 1d — set-piece role tracking');
+  try {
+    await recomputeSetPieceRoles();
+    console.log(`[recompute-all] step 1d done in ${Date.now() - t0d}ms`);
+  } catch (err) {
+    console.warn(`[recompute-all] step 1d SKIPPED (${(err as Error).message})`);
+  }
 
   // 2. Hierarchical estimates -------------------------------------------
   const t1 = Date.now();
