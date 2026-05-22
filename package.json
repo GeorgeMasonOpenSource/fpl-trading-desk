@@ -21,6 +21,7 @@
     "player:xray": "tsx scripts/player-xray.ts",
     "report:weekly": "tsx scripts/weekly-report.ts",
     "train:xg": "tsx scripts/train-our-xg.ts",
+    "train:engine": "tsx scripts/train-engine.ts",
     "backtest:run": "tsx scripts/backtest-run.ts",
     "ingest:youtube": "tsx scripts/ingest-youtube.ts",
     "ingest:odds": "tsx scripts/ingest-odds.ts",

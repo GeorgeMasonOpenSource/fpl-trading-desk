@@ -1,50 +1,43 @@
 /**
- * GW Decision page — mobile-first, single-purpose.
+ * GW Decision page — clean homepage.
  *
- * Replaces the wall-of-cards dashboard with one screen that answers:
- *   "What should I do this gameweek?"
+ * Mobile-first, decision-first. One screen, three core cards
+ * (transfer / captain / chip) plus contextual alerts. Everything else
+ * accessible via the bottom nav grid.
  *
- * Stacked, narrow, no horizontal scroll. Each card answers ONE question:
- *   1. Make this transfer (LP-optimal or top-1 greedy)
- *   2. Captain this player (risk-adjusted recommended)
- *   3. Bank or play chip (chip recommendation if any are available)
- *   4. Squad-news watch (only if there's actually urgent news)
- *   5. Mini-league context (only if EO data exists)
- *
- * Everything else is one tap away on the existing /transfer-planner,
- * /captaincy, etc. pages — but the user doesn't need them for the basic
- * gameweek decision.
+ * Visual system: DecisionCard primitive does all the heavy lifting.
+ * Generous whitespace, single visual primitive, no nested borders.
  */
-import { Card } from '@/components/ui/Card';
-import { Badge } from '@/components/ui/Badge';
-import { getGameweeks, managerSummary, newsWatch, squadForGameweek } from '@/lib/db/queries';
+import { getGameweeks, managerSummary, newsWatch } from '@/lib/db/queries';
 import { compareTransferScenarios, rankTopTransfers } from '@/lib/transfers/optimiser';
 import { rankCaptains } from '@/lib/captaincy/engine';
 import { getManagerId, getLeagueId, getUsedChips } from '@/lib/session';
 import { NotConnected } from '@/components/NotConnected';
-import { sql } from '@/lib/db/client';
+import { DecisionCard, AccentNumber, NavGrid } from '@/components/DecisionCard';
 import { loadCalibrationContext, calibrateOne } from '@/lib/projections/calibration';
-import Link from 'next/link';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 export const revalidate = 60;
 
-export default async function GwDecisionPage() {
+export default async function GwPage() {
   const managerId = getManagerId();
-  if (!managerId) return <NotConnected where="GW Decision" />;
+  if (!managerId) return <NotConnected where="This Gameweek" />;
   const leagueId = getLeagueId() ?? undefined;
   const { planning } = await getGameweeks();
   if (!planning) {
-    return <p className="text-ink-muted">No upcoming gameweek. Run db:seed.</p>;
+    return (
+      <div className="max-w-md mx-auto p-4">
+        <p className="text-ink-muted text-sm">No upcoming gameweek yet.</p>
+      </div>
+    );
   }
 
-  // Pull data in parallel for snappy load.
   const safe = async <T,>(fn: () => Promise<T>, fallback: T): Promise<T> => {
     try { return await fn(); } catch { return fallback; }
   };
 
-  const [summary, scenarios, topTransfers, captains, squad, news, calCtx, urgentNewsCount] = await Promise.all([
+  const [summary, scenarios, topTransfers, captains, news, calCtx] = await Promise.all([
     safe(() => managerSummary(managerId), null),
     safe(() => compareTransferScenarios({
       managerId, startGameweek: planning.id,
@@ -52,72 +45,66 @@ export default async function GwDecisionPage() {
     }), [] as any),
     safe(() => rankTopTransfers(managerId, planning.id, 3), []),
     safe(() => rankCaptains(managerId, planning.id, leagueId), null),
-    safe(() => squadForGameweek(managerId, planning.id), [] as any),
     safe(() => newsWatch(managerId, planning.id), [] as any),
     safe(() => loadCalibrationContext(planning.id), {
       calibrationByPosition: new Map(),
       benchmarksByPlayer: new Map(),
       consensusByPlayer: new Map()
-    }),
-    safe(() => sql<Array<{ c: number }>>`
-      SELECT COUNT(*)::int AS c
-        FROM player_news_log pnl
-        JOIN manager_picks mp ON mp.player_id = pnl.player_id
-       WHERE mp.manager_id = ${managerId}
-         AND mp.gameweek_id = ${planning.id}
-         AND pnl.created_at > now() - interval '48 hours'
-    `, [{ c: 0 }] as any)
+    })
   ]);
 
   // Filter chip scenarios by used chips.
   const usedChips = getUsedChips();
-  const scenarioBlockedByChip: Record<string, string> = {
-    wildcard:       'WC', free_hit:       'FH',
-    bench_boost:    'BB', triple_captain: 'TC'
+  const blockedByChip: Record<string, string> = {
+    wildcard: 'WC', free_hit: 'FH', bench_boost: 'BB', triple_captain: 'TC'
   };
   const availableScenarios = scenarios.filter((s: any) => {
-    const chipCode = scenarioBlockedByChip[s.scenario];
-    if (!chipCode) return true;
-    return !usedChips.has(chipCode as any);
+    const chip = blockedByChip[s.scenario];
+    return !chip || !usedChips.has(chip as any);
   });
-  const recommendedScenario = availableScenarios
-    .slice().sort((a: any, b: any) => b.ev - a.ev)[0] ?? null;
 
-  // The headline transfer: prefer LP/top-1 greedy ranker.
   const headline = topTransfers[0] ?? null;
-  // Apply calibration to headline xPts.
-  const calibrateHeadline = (p: { playerId: number; position: string; xpts1: number }) => {
-    return calibrateOne({
-      rawXpts: p.xpts1,
-      playerId: p.playerId,
-      position: p.position as 'GKP'|'DEF'|'MID'|'FWD',
+  const calibrateXpts = (playerId: number, position: string, rawXpts: number) =>
+    calibrateOne({
+      rawXpts, playerId,
+      position: position as 'GKP'|'DEF'|'MID'|'FWD',
       calibrationByPosition: calCtx.calibrationByPosition,
-      benchmarkForPlayer: calCtx.benchmarksByPlayer.get(p.playerId),
-      consensusForPlayer: calCtx.consensusByPlayer.get(p.playerId)
+      benchmarkForPlayer: calCtx.benchmarksByPlayer.get(playerId),
+      consensusForPlayer: calCtx.consensusByPlayer.get(playerId)
     });
-  };
+  const headlineInCal = headline ? calibrateXpts(headline.in.playerId, headline.in.position, headline.in.xpts1) : null;
 
-  // Captain: recommended from the risk-adjusted ranker.
   const captainPick = captains?.recommended ?? captains?.aggressive ?? null;
-  const safeCaptain = captains?.safe ?? null;
+  const safeCap = captains?.safe ?? null;
+
+  // Chip recommendation only if it clears the threshold.
+  const chipRec = availableScenarios
+    .filter((s: any) => Object.values(blockedByChip).includes(blockedByChip[s.scenario]))
+    .sort((a: any, b: any) => b.ev - a.ev)[0];
+  const showChipCard = chipRec && chipRec.ev >= 1.0;
+
+  // Urgent news = high-severity items only.
+  const urgentNews = (news as any[]).filter((n: any) => n.severity === 'high' || (n.chance_of_playing_next_round != null && n.chance_of_playing_next_round <= 50));
 
   return (
-    <div className="space-y-4 max-w-md mx-auto">
-      {/* Header — minimal */}
-      <header className="pt-2">
-        <div className="text-[11px] uppercase tracking-widest text-ink-dim">{planning.name}</div>
-        <h1 className="text-xl font-semibold mt-0.5">Your move</h1>
+    <div className="max-w-lg mx-auto px-3 py-4 space-y-3">
+      {/* Header — minimal, breathing room */}
+      <header className="px-1">
+        <div className="text-[10px] uppercase tracking-[0.2em] text-ink-dim">
+          {planning.name} · Decision
+        </div>
+        <h1 className="mt-2 text-2xl font-semibold tracking-tight leading-none">
+          Your move
+        </h1>
         {summary?.free_transfers != null && (
-          <div className="mt-1 flex gap-2 text-[11px] text-ink-muted">
-            <span>{summary.free_transfers} FT</span>
+          <div className="mt-2 text-[11px] font-mono text-ink-dim flex gap-2 items-center">
+            <span className="text-ink-muted">{summary.free_transfers} FT</span>
             <span>·</span>
-            <span>£{(Number(summary.bank ?? 0) / 10).toFixed(1)}m bank</span>
-            {urgentNewsCount?.[0]?.c > 0 && (
+            <span className="text-ink-muted">£{(Number(summary.bank ?? 0) / 10).toFixed(1)}m</span>
+            {urgentNews.length > 0 && (
               <>
                 <span>·</span>
-                <Link href="/my-team" className="text-accent-amber">
-                  ⚠ {urgentNewsCount[0].c} news
-                </Link>
+                <a href="/my-team" className="text-accent-amber">⚠ {urgentNews.length}</a>
               </>
             )}
           </div>
@@ -125,190 +112,148 @@ export default async function GwDecisionPage() {
       </header>
 
       {/* HEADLINE: Recommended transfer */}
-      {headline ? (
-        <Card title="" subtitle="">
-          <div className="text-[10px] uppercase tracking-widest text-ink-dim mb-2">
-            Recommended transfer
-          </div>
-          <div className="flex items-center justify-between gap-3">
-            <div className="flex-1">
-              <div className="text-xs text-ink-muted line-through">
-                {headline.out.webName} <span className="font-mono text-[10px]">{headline.out.xpts1.toFixed(1)}</span>
-              </div>
-              <div className="text-xl font-semibold mt-0.5 flex items-center gap-2">
-                {headline.in.webName}
-                <span className="font-mono text-sm text-accent-green">
-                  {calibrateHeadline(headline.in).calibrated.toFixed(1)}
-                </span>
-              </div>
-              <div className="text-[10px] text-ink-dim font-mono mt-0.5">
-                {headline.in.position} · {headline.in.teamShort} · £{(headline.in.cost / 10).toFixed(1)}m
-              </div>
-            </div>
-            <Badge tone={headline.evGain1 > 1.5 ? 'green' : headline.evGain1 > 0.5 ? 'amber' : 'steel'}>
-              +{headline.evGain1.toFixed(1)} EV
-            </Badge>
-          </div>
-          {/* Why it's the move — collapsible, hidden by default on mobile */}
-          <details className="mt-3 group">
-            <summary className="text-[11px] text-ink-dim cursor-pointer list-none flex items-center">
-              <span className="group-open:rotate-90 transition-transform inline-block w-3">›</span>
-              <span className="ml-1">Why this transfer</span>
-            </summary>
-            <div className="mt-2 text-[11px] text-ink-muted space-y-1.5 pl-4">
+      {headline && headlineInCal ? (
+        <DecisionCard
+          eyebrow="Transfer"
+          main={
+            <span>
+              <span className="text-ink-muted line-through font-normal text-base">{headline.out.webName}</span>
+              <span className="text-ink-dim mx-2">→</span>
+              {headline.in.webName}
+            </span>
+          }
+          meta={`${headline.in.position} · ${headline.in.teamShort} · £${(headline.in.cost / 10).toFixed(1)}m`}
+          accent={
+            <AccentNumber
+              value={`+${headline.evGain1.toFixed(1)}`}
+              unit="EV"
+              tone={headline.evGain1 > 1.5 ? 'positive' : 'neutral'}
+            />
+          }
+          tone={headline.evGain1 > 1.5 ? 'positive' : 'neutral'}
+          details={
+            <>
               <div>
-                <span className="text-accent-green">+ {headline.in.webName}</span> projects{' '}
-                <span className="font-mono">{headline.in.xpts1.toFixed(1)}</span> xPts ({headline.in.position}, {headline.in.teamShort})
+                <span className="text-accent-green">+</span>{' '}
+                <span className="text-ink">{headline.in.webName}</span> projects{' '}
+                <span className="font-mono tabular-nums">{headlineInCal.calibrated.toFixed(1)}</span> xPts
+                {headlineInCal.consensusAdjustment !== 0 && (
+                  <span className="ml-1 text-ink-dim">(incl. {headlineInCal.consensusAdjustment > 0 ? '+' : ''}{headlineInCal.consensusAdjustment.toFixed(2)} creator)</span>
+                )}
               </div>
               <div>
-                <span className="text-accent-red">− {headline.out.webName}</span> projects{' '}
-                <span className="font-mono">{headline.out.xpts1.toFixed(1)}</span> xPts
+                <span className="text-accent-red">−</span>{' '}
+                <span className="text-ink">{headline.out.webName}</span> projects{' '}
+                <span className="font-mono tabular-nums">{headline.out.xpts1.toFixed(1)}</span> xPts
               </div>
-              <div className="text-ink-dim">
-                Net £{headline.netCost === 0 ? '0' : `${headline.netCost > 0 ? '-' : '+'}${(Math.abs(headline.netCost) / 10).toFixed(1)}m`} ·
-                Δ 3 GW {headline.evGain3.toFixed(1)} ·
-                {headline.changesCaptain ? ' new captain' : ' same captain'}
+              <div className="text-ink-dim text-[11px]">
+                Net £{headline.netCost === 0 ? '0' : `${headline.netCost > 0 ? '-' : '+'}${(Math.abs(headline.netCost) / 10).toFixed(1)}m`}
+                {' · '}
+                3 GW {headline.evGain3 >= 0 ? '+' : ''}{headline.evGain3.toFixed(1)} EV
+                {headline.changesCaptain ? ' · new captain' : ''}
               </div>
               {(() => {
                 const cs = calCtx.consensusByPlayer.get(headline.in.playerId);
                 if (!cs || cs.distinctCreators === 0) return null;
-                return <div className="text-accent-violet">📺 {cs.reason}</div>;
+                return (
+                  <div className="text-accent-violet">
+                    📺 {cs.reason}
+                  </div>
+                );
               })()}
-              <Link href="/transfer-planner" className="block mt-2 text-accent-green underline">
+              <a href="/transfer-planner" className="inline-block mt-2 text-accent-green text-[11px] hover:underline">
                 see top 10 →
-              </Link>
-            </div>
-          </details>
-        </Card>
+              </a>
+            </>
+          }
+        />
       ) : (
-        <Card title="No move recommended">
-          <p className="text-sm text-ink-muted">
-            No transfer clears the EV threshold. Roll your FT.
-          </p>
-        </Card>
+        <DecisionCard
+          eyebrow="Transfer"
+          main="Roll your FT"
+          meta="No move clears the EV threshold this week"
+          tone="neutral"
+        />
       )}
 
       {/* CAPTAIN */}
       {captainPick && (
-        <Card>
-          <div className="text-[10px] uppercase tracking-widest text-ink-dim mb-2">
-            Captain
-          </div>
-          <div className="flex items-center justify-between gap-3">
-            <div className="flex-1">
-              <div className="text-xl font-semibold flex items-center gap-2">
-                {captainPick.webName}
-                <Badge tone="violet">C</Badge>
-              </div>
-              <div className="text-[10px] text-ink-dim font-mono mt-0.5">
-                {captainPick.position} · {captainPick.teamShort}
-              </div>
-            </div>
-            <div className="text-right">
-              <div className="font-mono text-lg text-accent-green">
-                {captainPick.projection.toFixed(1)}
-              </div>
-              <div className="text-[9px] text-ink-dim uppercase tracking-widest">×2 xPts</div>
-            </div>
-          </div>
-          <details className="mt-3 group">
-            <summary className="text-[11px] text-ink-dim cursor-pointer list-none flex items-center">
-              <span className="group-open:rotate-90 transition-transform inline-block w-3">›</span>
-              <span className="ml-1">Alternatives + risk</span>
-            </summary>
-            <div className="mt-2 text-[11px] text-ink-muted space-y-1.5 pl-4">
+        <DecisionCard
+          eyebrow="Captain"
+          main={captainPick.webName}
+          meta={`${captainPick.position} · ${captainPick.teamShort}`}
+          accent={
+            <AccentNumber
+              value={captainPick.projection.toFixed(1)}
+              unit="xPts ×2"
+              tone="positive"
+            />
+          }
+          tone="positive"
+          details={
+            <>
               <div>
-                Floor <span className="font-mono">{captainPick.floor.toFixed(1)}</span> ·
-                Ceiling <span className="font-mono">{captainPick.ceiling.toFixed(1)}</span> ·
-                Start <span className="font-mono">{(captainPick.startProb * 100).toFixed(0)}%</span>
+                Floor <span className="font-mono tabular-nums">{captainPick.floor.toFixed(1)}</span>
+                {' · '}
+                Ceiling <span className="font-mono tabular-nums">{captainPick.ceiling.toFixed(1)}</span>
+                {' · '}
+                Start <span className="font-mono tabular-nums">{(captainPick.startProb * 100).toFixed(0)}%</span>
               </div>
-              {safeCaptain && safeCaptain.playerId !== captainPick.playerId && (
+              {safeCap && safeCap.playerId !== captainPick.playerId && (
                 <div>
-                  Safer: <span className="text-ink">{safeCaptain.webName}</span>{' '}
-                  <span className="font-mono">{safeCaptain.projection.toFixed(1)}</span>
+                  Safer pick: <span className="text-ink">{safeCap.webName}</span>{' '}
+                  <span className="font-mono tabular-nums text-ink-muted">{safeCap.projection.toFixed(1)}</span>
                 </div>
               )}
-              {captainPick.reasons?.length > 0 && (
-                <ul className="space-y-0.5 mt-1">
-                  {captainPick.reasons.slice(0, 3).map((r: string, i: number) => (
-                    <li key={i} className="text-ink-dim">· {r}</li>
-                  ))}
-                </ul>
-              )}
-              <Link href="/captaincy" className="block mt-2 text-accent-green underline">
+              <a href="/captaincy" className="inline-block mt-1 text-accent-green text-[11px] hover:underline">
                 full ranking →
-              </Link>
-            </div>
-          </details>
-        </Card>
+              </a>
+            </>
+          }
+        />
       )}
 
-      {/* CHIPS — only if any are still available and any scenario has EV > 1 */}
-      {(() => {
-        const availableChips = (['WC','FH','BB','TC'] as const).filter(c => !usedChips.has(c));
-        if (availableChips.length === 0) return null;
-        const chipScenario = availableScenarios.find((s: any) => Object.values(scenarioBlockedByChip).includes(scenarioBlockedByChip[s.scenario]));
-        if (!chipScenario || chipScenario.ev < 1.0) {
-          return (
-            <Card>
-              <div className="text-[10px] uppercase tracking-widest text-ink-dim">
-                Chips available
-              </div>
-              <div className="mt-1 text-sm">
-                {availableChips.join(' · ')}
-                <span className="ml-2 text-ink-dim text-xs">— no chip clears 1 EV threshold this week</span>
-              </div>
-            </Card>
-          );
-        }
-        return null;
-      })()}
-
-      {/* SQUAD NEWS — only urgent items, only show count + link */}
-      {Array.isArray(news) && news.length > 0 && (
-        <Card>
-          <div className="text-[10px] uppercase tracking-widest text-ink-dim mb-2">
-            ⚠ {news.length} squad alert{news.length === 1 ? '' : 's'}
-          </div>
-          <ul className="space-y-1.5 text-sm">
-            {news.slice(0, 3).map((n: any, i: number) => (
-              <li key={i} className="flex items-center justify-between">
-                <span>{n.web_name ?? n.webName} <span className="text-[10px] text-ink-dim">({n.team_short})</span></span>
-                <Badge tone={n.severity === 'high' ? 'red' : 'amber'}>
-                  {n.status_label ?? n.statusLabel ?? '?'}
-                </Badge>
-              </li>
-            ))}
-          </ul>
-          {news.length > 3 && (
-            <Link href="/my-team" className="block mt-2 text-[11px] text-accent-green underline">
-              {news.length - 3} more →
-            </Link>
-          )}
-        </Card>
+      {/* CHIP — only if a chip clears the threshold */}
+      {showChipCard && (
+        <DecisionCard
+          eyebrow="Chip"
+          main={chipRec.scenario.replace('_', ' ')}
+          meta={`Projected EV +${chipRec.ev.toFixed(1)} · ${(chipRec.risk * 100).toFixed(0)}% risk`}
+          accent={
+            <AccentNumber value={`+${chipRec.ev.toFixed(1)}`} unit="EV" tone="warning" />
+          }
+          tone="warning"
+          href="/chip-planner"
+        />
       )}
 
-      {/* Footer nav to old pages */}
-      <div className="grid grid-cols-2 gap-2 pt-4">
-        <Link href="/transfer-planner" className="bg-bg-card border border-line rounded-lg px-3 py-3 text-sm text-center hover:bg-bg-inset">
-          Transfer planner
-        </Link>
-        <Link href="/captaincy" className="bg-bg-card border border-line rounded-lg px-3 py-3 text-sm text-center hover:bg-bg-inset">
-          Captaincy
-        </Link>
-        <Link href="/predicted-lineups" className="bg-bg-card border border-line rounded-lg px-3 py-3 text-sm text-center hover:bg-bg-inset">
-          Lineups
-        </Link>
-        <Link href="/model-audit" className="bg-bg-card border border-line rounded-lg px-3 py-3 text-sm text-center hover:bg-bg-inset">
-          Why?
-        </Link>
-        <Link href="/my-team" className="bg-bg-card border border-line rounded-lg px-3 py-3 text-sm text-center hover:bg-bg-inset">
-          My team
-        </Link>
-        <Link href="/mini-league" className="bg-bg-card border border-line rounded-lg px-3 py-3 text-sm text-center hover:bg-bg-inset">
-          Mini-league
-        </Link>
-      </div>
+      {/* URGENT NEWS — only if any */}
+      {urgentNews.length > 0 && (
+        <DecisionCard
+          eyebrow={`⚠ ${urgentNews.length} alert${urgentNews.length === 1 ? '' : 's'}`}
+          main={urgentNews.slice(0, 2).map(n => n.web_name ?? n.webName).join(', ') + (urgentNews.length > 2 ? '…' : '')}
+          meta="Tap to triage on My Team"
+          href="/my-team"
+          tone="warning"
+        />
+      )}
+
+      {/* Bottom nav */}
+      <NavGrid
+        items={[
+          { href: '/transfer-planner',  label: 'Transfers',      sublabel: 'top 10' },
+          { href: '/captaincy',         label: 'Captaincy',      sublabel: 'risk-adjusted' },
+          { href: '/predicted-lineups', label: 'Lineups',        sublabel: 'predicted XI' },
+          { href: '/model-audit',       label: 'Why?',           sublabel: 'per-player' },
+          { href: '/my-team',           label: 'My team',        sublabel: 'minutes view' },
+          { href: '/mini-league',       label: 'Mini league',    sublabel: 'differentials' }
+        ]}
+      />
+
+      {/* Footer — trained-on-season badge */}
+      <footer className="pt-6 text-center text-[10px] text-ink-dim uppercase tracking-widest">
+        Trained on 37 GWs · {planning.name}
+      </footer>
     </div>
   );
 }
