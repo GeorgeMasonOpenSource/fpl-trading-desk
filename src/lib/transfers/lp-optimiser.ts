@@ -201,6 +201,8 @@ export interface LpOptimiserResult {
   transfersIn: LpPlayer[];
   transfersOut: LpPlayer[];
   spend: number;
+  /** Populated when feasible=false. Explains the specific violation(s). */
+  reason?: string;
 }
 
 /**
@@ -381,7 +383,8 @@ export async function runLpOptimiser(input: LpOptimiserInput): Promise<LpOptimis
   if (!r.feasible) {
     return {
       feasible: false, totalXpts: 0, hitsTaken: 0,
-      squad15: [], transfersIn: [], transfersOut: [], spend: 0
+      squad15: [], transfersIn: [], transfersOut: [], spend: 0,
+      reason: 'LP relaxation infeasible — likely budget too tight or constraint set contradictory.'
     };
   }
   const totalXpts = r.result as number;
@@ -396,6 +399,57 @@ export async function runLpOptimiser(input: LpOptimiserInput): Promise<LpOptimis
   const transfersOut = candidates.filter(p => p.isCurrentlyOwned && !newIds.has(p.playerId));
   const spend = transfersIn.reduce((s, p) => s + p.cost, 0)
               - transfersOut.reduce((s, p) => s + p.sellingPrice, 0);
+
+  // ── Post-LP validation ───────────────────────────────────────────────
+  // javascript-lp-solver returns feasible:true even when its branch-and-
+  // bound search times out / aborts with an integer-infeasible solution
+  // (e.g. Σ x_p = 9 instead of 15 because the search tree was too large
+  // under the xiFirst formulation). Verify the result honours every hard
+  // FPL constraint before handing it to the UI. If anything violates,
+  // return feasible:false with a precise reason so the planner falls
+  // back to the greedy ranker rather than displaying nonsense.
+  const violations: string[] = [];
+  if (squad15.length !== 15) {
+    violations.push(`squad size ${squad15.length} (expected 15)`);
+  }
+  const posCount = { GKP: 0, DEF: 0, MID: 0, FWD: 0 };
+  for (const p of squad15) posCount[p.position]++;
+  if (posCount.GKP !== 2) violations.push(`GKP ${posCount.GKP} (expected 2)`);
+  if (posCount.DEF !== 5) violations.push(`DEF ${posCount.DEF} (expected 5)`);
+  if (posCount.MID !== 5) violations.push(`MID ${posCount.MID} (expected 5)`);
+  if (posCount.FWD !== 3) violations.push(`FWD ${posCount.FWD} (expected 3)`);
+  // 3-per-club
+  const clubCount = new Map<number, number>();
+  for (const p of squad15) clubCount.set(p.teamId, (clubCount.get(p.teamId) ?? 0) + 1);
+  for (const [tid, n] of clubCount) {
+    if (n > 3) violations.push(`${n} players from team_id ${tid} (max 3)`);
+  }
+  // Budget: must spend ≤ bank + Σ selling-price of dropped owned
+  const droppedRevenue = transfersOut.reduce((s, p) => s + p.sellingPrice, 0);
+  const maxAllowedSpend = input.bank + droppedRevenue;
+  const actualSpend = transfersIn.reduce((s, p) => s + p.cost, 0);
+  if (actualSpend > maxAllowedSpend + 0.5) {
+    // 0.5 tenths slack for rounding
+    violations.push(`spend ${actualSpend} > budget ${maxAllowedSpend} (bank ${input.bank} + sell ${droppedRevenue})`);
+  }
+  // Transfer count: in.length ≤ freeTransfers + hits (when allowHits)
+  const allowedTransfers = input.freeTransfers + (input.allowHits ? hitsTaken : 0);
+  if (transfersIn.length > allowedTransfers) {
+    violations.push(`${transfersIn.length} transfers in, only ${allowedTransfers} allowed (FT=${input.freeTransfers}${input.allowHits ? `, hits=${hitsTaken}` : ', hits disabled'})`);
+  }
+  // And transfers in MUST equal transfers out (squad stays at 15).
+  if (transfersIn.length !== transfersOut.length) {
+    violations.push(`transfer-count mismatch: ${transfersIn.length} in vs ${transfersOut.length} out`);
+  }
+
+  if (violations.length > 0) {
+    return {
+      feasible: false, totalXpts: 0, hitsTaken: 0,
+      squad15: [], transfersIn: [], transfersOut: [], spend: 0,
+      reason: `LP solver returned an invalid solution (${violations.join('; ')}). Falling back.`
+    };
+  }
+
   return { feasible: true, totalXpts, hitsTaken, squad15, transfersIn, transfersOut, spend };
 }
 

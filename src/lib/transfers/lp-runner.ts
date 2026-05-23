@@ -139,10 +139,15 @@ export async function runLpPlan(input: LpPlanInput): Promise<LpPlanResult> {
   });
 
   // 6. Solve.
-  // §XI-first default: ON for 1-GW horizon (last GW or matchday-only
-  // optimisation where bench is worthless); OFF for multi-GW (bench
-  // rotation matters across rotations). User can override.
-  const xiFirst = input.xiFirst ?? (input.horizon === 1);
+  // §XI-first formulation doubles the variable count and adds N coupling
+  // constraints (one per player). At ~600 candidates that's >1,200 ints
+  // and >600 extra constraints — javascript-lp-solver's branch-and-bound
+  // chokes on the search tree, returns feasible=true with a partial squad
+  // (Σ x_p ≈ 9 instead of 15). Until we either move to a real MILP backend
+  // or shrink the candidate pool aggressively, xiFirst must be OFF by
+  // default. The post-LP autoPick (in xi-narrative) handles the XI
+  // selection from the 15 anyway.
+  const xiFirst = input.xiFirst ?? false;
   let result: LpOptimiserResult;
   try {
     result = await runLpOptimiser({
@@ -158,7 +163,8 @@ export async function runLpPlan(input: LpPlanInput): Promise<LpPlanResult> {
     return emptyResult(input.horizon, (err as Error).message);
   }
   if (!result.feasible) {
-    return emptyResult(input.horizon, 'LP infeasible — likely budget too tight for the constraint set.');
+    return emptyResult(input.horizon,
+      result.reason ?? 'LP infeasible — likely budget too tight for the constraint set.');
   }
 
   // 7. Map results back to UI types.
