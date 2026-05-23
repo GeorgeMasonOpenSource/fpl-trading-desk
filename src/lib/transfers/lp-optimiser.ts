@@ -42,9 +42,106 @@
  *     just the next GW.
  */
 
-// Import LP solver lazily to avoid breaking compile if the package isn't
-// installed yet. The user will `npm install javascript-lp-solver` once.
-// Until then we throw a clear error from runLpOptimiser.
+// Import LP solver lazily — three loading strategies tried in sequence
+// because Next.js's webpack pass mangles a normal CommonJS require:
+//   1. eval('require') — webpack ignores this; gives a native Node require
+//      that respects Module.createRequire semantics WITHOUT bundling the
+//      package. This is the path that works on Vercel server functions.
+//   2. createRequire(import.meta.url) — for plain-Node scripts (tsx) which
+//      have import.meta.url but no eval-require sandbox.
+//   3. await import(...) with binding rewrite — last resort. Wraps Solve
+//      in a closure so the library can mutate its `lastSolvedModel` slot
+//      on the closure object, not the frozen ESM namespace.
+// `serverComponentsExternalPackages: ['javascript-lp-solver']` keeps the
+// package out of the bundle, but we still need one of the loading paths
+// above to actually find it at runtime.
+
+let cachedSolver: { Solve: (m: any) => any } | null = null;
+let cachedLoadError: string | null = null;
+
+async function loadSolver(): Promise<{ Solve: (m: any) => any }> {
+  if (cachedSolver) return cachedSolver;
+  const errs: string[] = [];
+
+  // Strategy 1 — eval('require'). Works in Next.js Node-runtime server
+  // components on Vercel. The eval prevents webpack from rewriting the
+  // call, so we get the real Node global require at runtime.
+  try {
+    // (0, eval) keeps the indirect-eval form so bundlers don't try to be smart.
+    const r: any = (0, eval)('typeof require !== "undefined" ? require : null');
+    if (typeof r === 'function') {
+      const mod = r('javascript-lp-solver');
+      const inner = pickSolver(mod);
+      if (inner) {
+        cachedSolver = inner;
+        return inner;
+      }
+      errs.push('eval-require: loaded package but no Solve function found');
+    } else {
+      errs.push('eval-require: require is not available in this runtime');
+    }
+  } catch (err) {
+    errs.push(`eval-require: ${(err as Error).message}`);
+  }
+
+  // Strategy 2 — createRequire(import.meta.url). The tsx/Node-script path.
+  try {
+    const { createRequire } = await import('node:module');
+    if (typeof createRequire === 'function') {
+      const req = createRequire(import.meta.url);
+      const mod = req('javascript-lp-solver');
+      const inner = pickSolver(mod);
+      if (inner) {
+        cachedSolver = inner;
+        return inner;
+      }
+      errs.push('createRequire: loaded but no Solve function');
+    } else {
+      errs.push('createRequire: not available (node:module bundled to empty)');
+    }
+  } catch (err) {
+    errs.push(`createRequire: ${(err as Error).message}`);
+  }
+
+  // Strategy 3 — ESM dynamic import with namespace binding. ESM namespace
+  // objects are frozen, so we copy Solve into a plain object that the
+  // library can mutate.
+  try {
+    const mod: any = await import('javascript-lp-solver' as any);
+    const inner = pickSolver(mod);
+    if (inner && typeof inner.Solve === 'function') {
+      // Bind Solve so its internal `this.lastSolvedModel = …` writes land
+      // on a mutable object instead of the frozen namespace.
+      const container: any = { Solve: null };
+      container.Solve = inner.Solve.bind(container);
+      cachedSolver = container;
+      return container;
+    }
+    errs.push('esm-import: no Solve function');
+  } catch (err) {
+    errs.push(`esm-import: ${(err as Error).message}`);
+  }
+
+  cachedLoadError = errs.join(' | ');
+  throw new Error(
+    'LP optimiser needs javascript-lp-solver. ' +
+    'Install with: npm install javascript-lp-solver --save. ' +
+    `Underlying: ${cachedLoadError}`
+  );
+}
+
+function pickSolver(mod: any): { Solve: (m: any) => any } | null {
+  if (!mod) return null;
+  // CJS direct, CJS-via-ESM (.default), and bundler-wrapped shapes.
+  const candidates = [mod, mod.default, mod.Solver];
+  for (const c of candidates) {
+    if (c && typeof c.Solve === 'function') return c;
+  }
+  // Some versions export Solve as a top-level named function rather than
+  // hanging it off an object.
+  if (typeof mod.Solve === 'function') return mod;
+  return null;
+}
 
 interface SolverModel {
   optimize: string;
@@ -112,30 +209,11 @@ export interface LpOptimiserResult {
  * solver package so the rest of the app compiles without it.
  */
 export async function runLpOptimiser(input: LpOptimiserInput): Promise<LpOptimiserResult> {
-  // Dynamic require — the package is CommonJS and MUTATES its own module
-  // object during Solve() (sets `lastSolvedModel`). ESM dynamic import()
-  // returns a frozen Module Namespace Object so the assignment fails with
-  // "Cannot set property lastSolvedModel of [object Module] which has only
-  // a getter". Use Node's createRequire to load as CommonJS, giving us a
-  // mutable export object the library can write to.
-  let solver: { Solve: (m: SolverModel) => SolverResult };
-  try {
-    const { createRequire } = await import('node:module');
-    const req = createRequire(import.meta.url);
-    const mod = req('javascript-lp-solver') as any;
-    // Some bundlers wrap CJS in .default; handle both shapes.
-    const inner = mod && mod.Solve ? mod : (mod && mod.default ? mod.default : mod);
-    if (!inner || typeof inner.Solve !== 'function') {
-      throw new Error('javascript-lp-solver export shape unexpected — no Solve function found');
-    }
-    solver = inner;
-  } catch (err) {
-    throw new Error(
-      'LP optimiser needs javascript-lp-solver. ' +
-      'Install with: npm install javascript-lp-solver --save. ' +
-      `Underlying: ${(err as Error).message}`
-    );
-  }
+  // Lazy-load the solver via the multi-strategy loader (see loadSolver above).
+  // The library mutates its module object during Solve(), so loadSolver
+  // makes sure we hand it a mutable container regardless of how it was
+  // imported (CJS require vs. ESM namespace).
+  const solver = await loadSolver() as { Solve: (m: SolverModel) => SolverResult };
 
   const candidates = input.candidatePool.filter(p =>
     !(input.forceExclude?.has(p.playerId))
