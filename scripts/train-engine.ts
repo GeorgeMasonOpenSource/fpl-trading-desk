@@ -94,7 +94,12 @@ async function main() {
     const wmeanPred = pairs.reduce((s, r) => s + weighted(r.gameweek_id) * r.predicted, 0) / W;
     const wmeanAct  = pairs.reduce((s, r) => s + weighted(r.gameweek_id) * r.actual, 0) / W;
     const rawMult = wmeanPred > 0 ? wmeanAct / wmeanPred : 1.0;
-    const multiplier = Math.max(0.7, Math.min(1.6, rawMult));
+    // Clamp widened from [0.7, 1.6] to [0.5, 3.0] — the season-data showed
+    // the model has a 5–10× positional under-bias because the bench/sub mass
+    // drags wmean_pred toward zero. A 3× cap lets us correct most of the
+    // gap; the remaining elite-under-prediction needs structural fixes
+    // (team_xg_for undercount, hierarchical pooling) not a bigger multiplier.
+    const multiplier = Math.max(0.5, Math.min(3.0, rawMult));
     // High confidence: full season of weighted data.
     const confidence = Math.min(1, pairs.length / 1500);
     const rmse = Math.sqrt(pairs.reduce(

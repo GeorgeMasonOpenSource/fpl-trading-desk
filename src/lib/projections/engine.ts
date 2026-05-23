@@ -436,6 +436,25 @@ export async function recomputeProjectionsForGameweek(
   const weights = weightsForStage(stage);
   const includeFinished = options?.includeFinished ?? false;
 
+  // §calibration — load per-position multipliers ONCE and apply at projection
+  // write-time. The model_calibration table is populated by train:engine from
+  // the full-season backtest. Without this step the multiplier was only ever
+  // applied at one UI surface (/gw) and never persisted, so the planner /
+  // captaincy / xray all showed uncalibrated raw numbers — which is what
+  // caused the visible -0.33 season-bias.
+  const calibrationByPos = new Map<string, { multiplier: number; confidence: number }>();
+  try {
+    const calRows = await sql<Array<{
+      position: string; multiplier: number; confidence: number;
+    }>>`SELECT position, multiplier::float8, confidence::float8 FROM model_calibration`;
+    for (const r of calRows) {
+      calibrationByPos.set(r.position, {
+        multiplier: Number(r.multiplier),
+        confidence: Number(r.confidence)
+      });
+    }
+  } catch {/* table may not exist before migration 0010 applied */}
+
   const fixtures = includeFinished
     ? await sql<Array<{ id: number; team_h: number; team_a: number }>>`
         SELECT id, team_h, team_a FROM fixtures
@@ -743,32 +762,73 @@ export async function recomputeProjectionsForGameweek(
         oppAttackingStyle: opp.attacking
       });
 
+      // §calibration apply — multiply each xPts component by the per-position
+      // confidence-weighted multiplier. Components scale linearly with the
+      // overall multiplier so the EV decomposition bar still shows the right
+      // proportions. xpts_appearance is intentionally NOT scaled — appearance
+      // points are deterministic (you played, you got them) so calibrating
+      // them would inflate the floor incorrectly.
+      const cal = calibrationByPos.get(p.position);
+      const mult = cal
+        ? (1 - cal.confidence) * 1.0 + cal.confidence * cal.multiplier
+        : 1.0;
+      // We scale the "skill-driven" components but leave appearance alone.
+      // Cards/concede/owngoal/pen_save are tiny negative tweaks; we scale
+      // them so the relative balance stays right.
+      const scale = (x: number) => Number(x) * mult;
+      const calibratedReasons = [
+        ...projection.reasons,
+        {
+          kind: 'calibration',
+          weight: 0,
+          detail: `position multiplier ${mult.toFixed(2)}× (model_calibration[${p.position}], confidence ${cal ? (cal.confidence*100).toFixed(0) : '0'}%)`
+        }
+      ];
+
+      // xpts_total stays internally consistent: sum of components.
+      const calibratedTotal =
+        projection.xpts_appearance      // unscaled — appearance is deterministic
+        + scale(projection.xpts_goals)
+        + scale(projection.xpts_assists)
+        + scale(projection.xpts_clean_sheet)
+        + scale(projection.xpts_bonus)
+        + scale(projection.xpts_saves)
+        + scale(projection.xpts_pen_save)
+        + scale(projection.xpts_cards)
+        + scale(projection.xpts_concede)
+        + scale(projection.xpts_owngoal)
+        + scale(projection.xpts_defcon);
+
       projRows.push({
         player_id: p.id, fixture_id: fix.id, gameweek_id: gameweekId,
-        xpts_total: projection.xpts_total,
+        xpts_total: calibratedTotal,
         xpts_appearance: projection.xpts_appearance,
-        xpts_goals: projection.xpts_goals,
-        xpts_assists: projection.xpts_assists,
-        xpts_clean_sheet: projection.xpts_clean_sheet,
-        xpts_bonus: projection.xpts_bonus,
-        xpts_saves: projection.xpts_saves,
-        xpts_pen_save: projection.xpts_pen_save,
-        xpts_cards: projection.xpts_cards,
-        xpts_concede: projection.xpts_concede,
-        xpts_owngoal: projection.xpts_owngoal,
-        xpts_defcon: projection.xpts_defcon,
-        floor: projection.floor,
-        ceiling: projection.ceiling,
+        xpts_goals: scale(projection.xpts_goals),
+        xpts_assists: scale(projection.xpts_assists),
+        xpts_clean_sheet: scale(projection.xpts_clean_sheet),
+        xpts_bonus: scale(projection.xpts_bonus),
+        xpts_saves: scale(projection.xpts_saves),
+        xpts_pen_save: scale(projection.xpts_pen_save),
+        xpts_cards: scale(projection.xpts_cards),
+        xpts_concede: scale(projection.xpts_concede),
+        xpts_owngoal: scale(projection.xpts_owngoal),
+        xpts_defcon: scale(projection.xpts_defcon),
+        // Floor/ceiling — scale the variable portion (total - appearance) and
+        // re-add appearance so the structural minimum (just showing up) is
+        // preserved.
+        floor:   projection.xpts_appearance + scale(projection.floor   - projection.xpts_appearance),
+        ceiling: projection.xpts_appearance + scale(projection.ceiling - projection.xpts_appearance),
         risk_score: projection.risk_score,
         confidence_score: projection.confidence_score,
-        // Plain object/array for JSONB columns — postgres.js handles encoding.
-        reasons: projection.reasons,
+        reasons: calibratedReasons,
         computed_at: new Date()
       });
       snapshotRows.push({
         gameweek_id: gameweekId,
         player_id: p.id, fixture_id: fix.id,
-        payload: projection,
+        // Snapshot the CALIBRATED payload so RMSE measurement sees the
+        // values the user actually got, not the pre-calibration raw.
+        payload: { ...projection, xpts_total: calibratedTotal, calibration_multiplier: mult },
         taken_at: new Date()
       });
       written++;
