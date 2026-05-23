@@ -453,7 +453,17 @@ export async function recomputeProjectionsForGameweek(
         confidence: Number(r.confidence)
       });
     }
-  } catch {/* table may not exist before migration 0010 applied */}
+    // Diagnostic: log what we loaded so we can confirm calibration is firing.
+    // eslint-disable-next-line no-console
+    console.log(`[engine] loaded calibration multipliers: ${
+      Array.from(calibrationByPos.entries())
+        .map(([pos, c]) => `${pos}=${c.multiplier.toFixed(2)}×(conf ${(c.confidence*100).toFixed(0)}%)`)
+        .join(', ') || '(none)'
+    }`);
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn(`[engine] calibration load FAILED, falling back to 1.0×: ${(err as Error).message}`);
+  }
 
   const fixtures = includeFinished
     ? await sql<Array<{ id: number; team_h: number; team_a: number }>>`
