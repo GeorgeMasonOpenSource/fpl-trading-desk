@@ -1,4 +1,5 @@
 import type { PlayerInsight, EvComponents, PerGwDelta } from './insights';
+import type { MinutesContextRow } from './minutes-context';
 import type { Position } from '@/lib/db/types';
 
 /**
@@ -48,6 +49,9 @@ export interface TransferReasonsInput {
   /** True if the incoming player would be in the auto-picked XI after the swap. */
   startsImmediately: boolean;
   position: Position;
+  /** Minutes-engine forecast for the OUT/IN players this GW. Drives rotation-risk bullets. */
+  outMinutes?: MinutesContextRow;
+  inMinutes?: MinutesContextRow;
 }
 
 export function transferReasons(input: TransferReasonsInput): TransferReason[] {
@@ -101,6 +105,35 @@ export function transferReasons(input: TransferReasonsInput): TransferReason[] {
         detail: `${input.outName} only averaging ${outMinPerApp.toFixed(0)} mins/app last ${o.recent.apps} — that's below the 60-min appearance threshold.`
       });
     }
+  }
+
+  // 2b. ROTATION RISK — surface what the minutes engine actually forecasts
+  //     this GW. The single biggest driver of weird recommendations is the
+  //     model under/over-estimating someone's minutes. We surface both sides
+  //     explicitly with the EV swing if the forecast is wrong, so the user
+  //     can override with confidence rather than trust a hidden number.
+  const POINTS_PER_GAME_AT_FULL_MINUTES = 4.0;  // rough mean for a starter
+  if (input.inMinutes && input.inMinutes.expectedMinutes < 70) {
+    const em = input.inMinutes.expectedMinutes;
+    const sp = (input.inMinutes.startProb * 100).toFixed(0);
+    // EV swing: if he actually plays 85 mins not `em`, the appearance + scaled
+    // attacking points go up by (85 - em) / em × current_xpts. We use a
+    // conservative 0.6 × xpts as the "scaled with minutes" portion.
+    const swing = Math.max(0.3, ((85 - em) / Math.max(em, 40)) * 0.6 * 2.5).toFixed(1);
+    out.push({
+      tone: 'negative',
+      headline: 'Rotation risk on IN',
+      detail: `Model has ${input.inName} at only ${em.toFixed(0)} mins (start prob ${sp}%). If he plays 85+ instead, this swap gains ~${swing} more EV; if he plays <45, it loses ~${swing} EV. Check team news before pulling the trigger.`
+    });
+  }
+  if (input.outMinutes && input.outMinutes.expectedMinutes < 70) {
+    const em = input.outMinutes.expectedMinutes;
+    const sp = (input.outMinutes.startProb * 100).toFixed(0);
+    out.push({
+      tone: 'positive',
+      headline: 'Out is rotation risk',
+      detail: `Model forecasts only ${em.toFixed(0)} mins for ${input.outName} (${sp}% start). That's the biggest argument for the swap — but if he actually starts and plays 80+, the EV gap collapses.`
+    });
   }
 
   // 3. Underlying threat — xG + xA over the recent window. xG above goals

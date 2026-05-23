@@ -453,6 +453,8 @@ export async function recomputeProjectionsForGameweek(gameweekId: number) {
       xg_penalty_understat: number | null;
       xg_set_piece_understat: number | null;
       shots_open_play: number | null;
+      shots_penalty: number | null;
+      shots_set_piece: number | null;
       penalties_order: number | null;
       corners_order: number | null; freekicks_order: number | null;
       team_xg_total: number; team_xa_total: number;
@@ -497,6 +499,8 @@ export async function recomputeProjectionsForGameweek(gameweekId: number) {
         psa.xg_penalty::numeric                                                  AS xg_penalty_understat,
         psa.xg_set_piece::numeric                                                AS xg_set_piece_understat,
         psa.shots_open_play::int                                                 AS shots_open_play,
+        psa.shots_penalty::int                                                   AS shots_penalty,
+        psa.shots_set_piece::int                                                 AS shots_set_piece,
         COALESCE(recency.minutes, 0)::numeric AS recency_minutes,
         COALESCE(recency.xg, 0)::numeric      AS recency_xg,
         COALESCE(recency.xa, 0)::numeric      AS recency_xa,
@@ -606,18 +610,47 @@ export async function recomputeProjectionsForGameweek(gameweekId: number) {
       // Manual overrides take precedence — they're factual ("manager said X
       // takes pens this week"). If unset, derive from the FPL public order
       // fields: penalties_order == 1 means first taker.
+      //
+      // §sample-size threshold (Le Fée bug fix):
+      //   FPL's penalties_order field is a snapshot — a player listed as #2
+      //   may only have taken 1 actual penalty all season. Crediting them
+      //   with 30% pen share over-inflates their xG by ~0.25 EV.
+      //   We cross-check against Understat shots_penalty:
+      //     - #1 taker with ≥3 actual pen attempts → full 0.95 share
+      //     - #1 taker with <3 attempts → degrade to 0.50 (still primary, less certainty)
+      //     - #2 taker with ≥5 attempts → full 0.30 share
+      //     - #2 taker with <5 attempts → degrade to 0.10 (slight upside only)
+      //   This stops "designated #2 takers" from inflating projections off
+      //   tiny samples while preserving the signal for genuine pen takers.
       const manualPenShare = playerOv.find(o => o.kind === 'penalty_taker')?.value?.share;
-      const penaltyShare =
-        manualPenShare != null ? manualPenShare :
+      const actualPenShots = Number(p.shots_penalty) || 0;
+      const rawPenShare =
         p.penalties_order === 1 ? 0.95 :
         p.penalties_order === 2 ? 0.30 : 0;
+      const penShareAfterSample =
+        p.penalties_order === 1 && actualPenShots < 3 ? Math.min(rawPenShare, 0.50) :
+        p.penalties_order === 2 && actualPenShots < 5 ? Math.min(rawPenShare, 0.10) :
+        rawPenShare;
+      const penaltyShare =
+        manualPenShare != null ? manualPenShare : penShareAfterSample;
+
+      // §sample-size threshold for set pieces too — same rationale. Corner/FK
+      // takers need observed evidence. Understat's `shots_set_piece` covers
+      // direct FKs only (corner-takers don't shoot from corners, so it's a
+      // weaker proxy but still better than the bare order field).
+      const actualSetPieceShots = Number(p.shots_set_piece) || 0;
+      const rawCornerShare =
+        p.corners_order === 1 ? 0.9 : p.corners_order === 2 ? 0.4 : 0;
+      const rawFkShare =
+        p.freekicks_order === 1 ? 0.9 : p.freekicks_order === 2 ? 0.4 : 0;
+      const fkAfterSample =
+        p.freekicks_order === 1 && actualSetPieceShots < 2 ? Math.min(rawFkShare, 0.35) :
+        p.freekicks_order === 2 && actualSetPieceShots < 4 ? Math.min(rawFkShare, 0.15) :
+        rawFkShare;
       const manualSpShare = playerOv.find(o => o.kind === 'set_piece')?.value?.share;
       const setPieceShare =
         manualSpShare != null ? manualSpShare :
-        Math.max(
-          p.corners_order === 1 ? 0.9 : p.corners_order === 2 ? 0.4 : 0,
-          p.freekicks_order === 1 ? 0.9 : p.freekicks_order === 2 ? 0.4 : 0
-        );
+        Math.max(rawCornerShare, fkAfterSample);
 
       // goal- and assist-share — derived from data so a 35%-of-team-xG striker
       // isn't treated like a fringe forward. We clamp the share to 60% so the

@@ -12,6 +12,7 @@ import {
 import { TransferWhy } from '@/components/TransferWhy';
 import { TransferReasons } from '@/components/TransferReasons';
 import { transferReasons } from '@/lib/transfers/transfer-reasons';
+import { loadMinutesContext } from '@/lib/transfers/minutes-context';
 import { EvDecompositionBar } from '@/components/EvDecompositionBar';
 import { CompareToOverlay } from '@/components/CompareToOverlay';
 import { TransferPreview, type PreviewPlayer, type PreviewSwap } from '@/components/TransferPreview';
@@ -97,14 +98,19 @@ export default async function TransferPlanner() {
   const involvedIds = Array.from(new Set(
     topTransfers.flatMap(t => [t.out.playerId, t.in.playerId])
   ));
-  const [insights, evBreakdowns, defconStats, currentSquadForPreview] = await Promise.all([
+  const [insights, evBreakdowns, defconStats, currentSquadForPreview, minutesCtx] = await Promise.all([
     getTransferInsights(involvedIds, gw.id),
     getTransferEvBreakdown(involvedIds, gw.id, EV_BREAKDOWN_HORIZON_GWS),
     // Pull season DEFCON-per-90 + total DEFCON points for every player on
     // the top-10. Lets the row table flag "Le Fée scores 4 points because
     // he averages 9 def-actions/90 — borderline" vs "Anderson is 11/90, safe".
     loadDefconStats(involvedIds),
-    loadCurrentSquadForPreview(managerId, gw.id)
+    loadCurrentSquadForPreview(managerId, gw.id),
+    // §minutes uncertainty surface — pull expected_mins + start_prob for
+    // every involved player so the reasoner can flag <70-min forecasts
+    // explicitly. This is the single biggest "why does the model think
+    // this?" question users have, so we surface it loudly.
+    loadMinutesContext(involvedIds, gw.id)
   ]);
 
   // Build the swap list for the Transfer Preview: LP top pick first, then
@@ -243,6 +249,8 @@ export default async function TransferPlanner() {
               // WHY of every suggestion, not just the EV delta. We compute it
               // once per row and pass it to both the summary preview (top 2
               // headlines) and the expanded panel (full list).
+              const outMinutes = minutesCtx.get(t.out.playerId);
+              const inMinutes  = minutesCtx.get(t.in.playerId);
               const reasons = transferReasons({
                 outName: t.out.webName,
                 inName:  t.in.webName,
@@ -255,8 +263,14 @@ export default async function TransferPlanner() {
                 evGain3: t.evGain3,
                 changesCaptain: t.changesCaptain,
                 startsImmediately: t.startsImmediately,
-                position: t.in.position
+                position: t.in.position,
+                outMinutes, inMinutes
               });
+              // If EITHER side has expected_mins < 70 we paint an amber
+              // "rot risk" badge on the row so the user can spot fragile
+              // suggestions at a glance without expanding.
+              const inIsRotRisk  = inMinutes  && inMinutes.expectedMinutes  < 70;
+              const outIsRotRisk = outMinutes && outMinutes.expectedMinutes < 70;
               const topHeadlines = reasons
                 .filter(r => r.tone !== 'negative')
                 .slice(0, 2)
@@ -307,6 +321,16 @@ export default async function TransferPlanner() {
                     <div className="space-x-1">
                       {t.startsImmediately && <Badge tone="green">starts</Badge>}
                       {t.changesCaptain && <Badge tone="violet">new C</Badge>}
+                      {inIsRotRisk && (
+                        <Badge tone="amber" title={`Model has ${t.in.webName} at ${inMinutes!.expectedMinutes.toFixed(0)} expected mins (${(inMinutes!.startProb*100).toFixed(0)}% start)`}>
+                          rot {inMinutes!.expectedMinutes.toFixed(0)}′
+                        </Badge>
+                      )}
+                      {outIsRotRisk && !inIsRotRisk && (
+                        <Badge tone="amber" title={`Out player ${t.out.webName} only at ${outMinutes!.expectedMinutes.toFixed(0)} expected mins — biggest argument for the swap`}>
+                          out rot
+                        </Badge>
+                      )}
                     </div>
                   </div>
                   {topHeadlines && (

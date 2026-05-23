@@ -42,9 +42,16 @@ export interface CaptainOption {
 }
 
 export async function rankCaptains(managerId: number, gameweekId: number, leagueId?: number) {
+  // Wrap each query in try/catch so a single bad row / type-coercion problem
+  // in EO or blended-xpts doesn't take out the entire captaincy page. We log
+  // the failing step explicitly so production debugging is straightforward.
+  const errors: string[] = [];
+
   // Compute effective ownership across the user's mini league (if provided)
-  const eoRows = leagueId
-    ? await sql<Array<{ player_id: number; eo_pct: number }>>`
+  let eoRows: Array<{ player_id: number; eo_pct: number }> = [];
+  if (leagueId) {
+    try {
+      eoRows = await sql<Array<{ player_id: number; eo_pct: number }>>`
         WITH league_managers AS (
           SELECT DISTINCT entry AS manager_id
           FROM classic_league_standings
@@ -64,40 +71,72 @@ export async function rankCaptains(managerId: number, gameweekId: number, league
                ) / NULLIF((SELECT COUNT(*) FROM league_managers), 0))::numeric AS eo_pct
         FROM latest
         GROUP BY player_id
-      `
-    : [];
+      `;
+    } catch (err) {
+      const msg = `[rankCaptains] EO query failed: ${(err as Error).message}`;
+      console.error(msg);
+      errors.push(msg);
+    }
+  }
   const eoMap = new Map<number, number>(eoRows.map(r => [r.player_id, Number(r.eo_pct ?? 0)]));
 
-  // The user's current 11 + bench
-  const picks = await sql<Array<{
+  // The user's current 11 + bench. If THIS query fails the page can't render
+  // anything meaningful — let the error bubble up to the page, which renders
+  // a friendly error card via app/error.tsx. Cast every numeric column to
+  // float8 in SQL so we never receive an unparseable string back.
+  let picks: Array<{
     player_id: number; multiplier: number; position: number;
     web_name: string; team_short: string; pos: string;
     xpts: number; floor: number; ceiling: number; start_prob: number;
-  }>>`
-    SELECT mp.player_id, mp.multiplier, mp.position,
-           p.web_name, t.short_name AS team_short, p.position AS pos,
-           COALESCE(SUM(pr.xpts_total), 0) AS xpts,
-           COALESCE(SUM(pr.floor), 0)     AS floor,
-           COALESCE(SUM(pr.ceiling), 0)   AS ceiling,
-           COALESCE(MAX(mn.start_prob), 0) AS start_prob
-    FROM manager_picks mp
-    JOIN players p ON p.id = mp.player_id
-    JOIN teams t   ON t.id = p.team_id
-    LEFT JOIN projections pr        ON pr.player_id = p.id AND pr.gameweek_id = ${gameweekId}
-    LEFT JOIN minutes_projections mn ON mn.player_id = p.id
-      AND mn.fixture_id IN (SELECT id FROM fixtures WHERE gameweek_id = ${gameweekId})
-    WHERE mp.manager_id = ${managerId} AND mp.gameweek_id = ${gameweekId}
-      AND mp.position <= 11                  -- starting XI only
-    GROUP BY mp.player_id, mp.multiplier, mp.position, p.web_name, t.short_name, p.position
-    ORDER BY xpts DESC
-  `;
+  }> = [];
+  try {
+    picks = await sql<Array<{
+      player_id: number; multiplier: number; position: number;
+      web_name: string; team_short: string; pos: string;
+      xpts: number; floor: number; ceiling: number; start_prob: number;
+    }>>`
+      SELECT mp.player_id, mp.multiplier, mp.position,
+             p.web_name, t.short_name AS team_short, p.position AS pos,
+             COALESCE(SUM(pr.xpts_total)::float8, 0)  AS xpts,
+             COALESCE(SUM(pr.floor)::float8, 0)       AS floor,
+             COALESCE(SUM(pr.ceiling)::float8, 0)     AS ceiling,
+             COALESCE(MAX(mn.start_prob)::float8, 0)  AS start_prob
+      FROM manager_picks mp
+      JOIN players p ON p.id = mp.player_id
+      JOIN teams t   ON t.id = p.team_id
+      LEFT JOIN projections pr        ON pr.player_id = p.id AND pr.gameweek_id = ${gameweekId}
+      LEFT JOIN minutes_projections mn ON mn.player_id = p.id
+        AND mn.fixture_id IN (SELECT id FROM fixtures WHERE gameweek_id = ${gameweekId})
+      WHERE mp.manager_id = ${managerId} AND mp.gameweek_id = ${gameweekId}
+        AND mp.position <= 11                  -- starting XI only
+      GROUP BY mp.player_id, mp.multiplier, mp.position, p.web_name, t.short_name, p.position
+      ORDER BY xpts DESC
+    `;
+  } catch (err) {
+    const msg = `[rankCaptains] picks query failed: ${(err as Error).message}`;
+    console.error(msg);
+    errors.push(msg);
+    return {
+      ranked: [] as CaptainOption[],
+      recommended: undefined, safe: undefined,
+      aggressive: undefined, miniLeague: undefined,
+      tripleCaptainCandidate: undefined,
+      errors
+    };
+  }
 
   // Fetch ensemble (model + market) blended xpts in parallel for every pick.
-  // Falls back to model xpts when no market data exists.
+  // Falls back to model xpts when no market data exists. Failures here just
+  // mean we use model-only xpts for that player; they never crash the page.
   const blendedMap = new Map<number, number>();
   await Promise.all(picks.map(async r => {
-    const b = await getBlendedXpts(r.player_id, gameweekId);
-    if (b != null && Number.isFinite(b)) blendedMap.set(r.player_id, b);
+    try {
+      const b = await getBlendedXpts(r.player_id, gameweekId);
+      if (b != null && Number.isFinite(b)) blendedMap.set(r.player_id, b);
+    } catch (err) {
+      // Silent — model-only is the documented fallback.
+      console.warn(`[rankCaptains] getBlendedXpts pid=${r.player_id}: ${(err as Error).message}`);
+    }
   }));
 
   const ranked: CaptainOption[] = picks.map(r => {
@@ -191,5 +230,9 @@ export async function rankCaptains(managerId: number, gameweekId: number, league
   const ml          = top.slice().sort((a, b) => b.miniLeagueImpact - a.miniLeagueImpact)[0];
   const tripleCap   = ranked.slice().sort((a, b) => b.tripleCaptainScore - a.tripleCaptainScore)[0];
 
-  return { ranked, recommended, safe, aggressive, miniLeague: ml, tripleCaptainCandidate: tripleCap };
+  return {
+    ranked, recommended, safe, aggressive,
+    miniLeague: ml, tripleCaptainCandidate: tripleCap,
+    errors
+  };
 }
