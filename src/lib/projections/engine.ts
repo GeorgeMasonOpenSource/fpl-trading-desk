@@ -772,42 +772,67 @@ export async function recomputeProjectionsForGameweek(
         oppAttackingStyle: opp.attacking
       });
 
-      // §calibration apply — multiply each xPts component by the per-position
-      // confidence-weighted multiplier. Components scale linearly with the
-      // overall multiplier so the EV decomposition bar still shows the right
-      // proportions. xpts_appearance is intentionally NOT scaled — appearance
-      // points are deterministic (you played, you got them) so calibrating
-      // them would inflate the floor incorrectly.
+      // §calibration apply — multiply the ATTACKING components by the per-position
+      // multiplier. The position-level under-bias in the data comes from
+      // team_xg_for being under-counted (player_shot_history doesn't map all
+      // players to Understat). That undercount only affects GOALS, ASSISTS,
+      // and CLEAN SHEET (all derived from team xG). Other components are
+      // already well-calibrated:
+      //   • DEFCON is a discrete +2 award based on a per-90 threshold. It's
+      //     either hit or not — multiplying it inflates defensive mids who
+      //     are already at threshold (Anderson at 13.9/90 reliably hits +2,
+      //     a 3× multiplier would project +6 defcon which is impossible).
+      //   • BONUS is derived from BPS which is well-defined and doesn't
+      //     suffer from team_xg_for issues.
+      //   • SAVES / PEN_SAVE / CARDS / CONCEDE / OWNGOAL are tiny edge
+      //     contributions and aren't biased.
+      //   • APPEARANCE is deterministic (you played, you got the points).
+      //
+      // §raw-magnitude shrinkage on top — even within attacking components,
+      // we shrink the multiplier toward 1.0 as raw attacking projection
+      // rises. Bench-warmers with raw=0 attacking get full lift; elite
+      // strikers with raw=4 attacking get ~0 lift (their xG is already
+      // accurate via Understat data they actually have).
       const cal = calibrationByPos.get(p.position);
-      const mult = cal
+      const rawPosMult = cal
         ? (1 - cal.confidence) * 1.0 + cal.confidence * cal.multiplier
         : 1.0;
-      // We scale the "skill-driven" components but leave appearance alone.
-      // Cards/concede/owngoal/pen_save are tiny negative tweaks; we scale
-      // them so the relative balance stays right.
+      // "Raw attacking total" = the only components calibration touches.
+      const rawAttackTotal =
+        Number(projection.xpts_goals) +
+        Number(projection.xpts_assists) +
+        Number(projection.xpts_clean_sheet);
+      const SHRINKAGE_CEILING = 4.0;
+      const shrinkageWeight = Math.max(0, 1 - rawAttackTotal / SHRINKAGE_CEILING);
+      const mult = 1.0 + (rawPosMult - 1.0) * shrinkageWeight;
+      // We scale ONLY the attacking components (goals, assists, CS).
+      // DEFCON / bonus / saves / cards / concede / owngoal / pen_save are
+      // already well-calibrated and don't need a multiplier.
       const scale = (x: number) => Number(x) * mult;
       const calibratedReasons = [
         ...projection.reasons,
         {
           kind: 'calibration',
           weight: 0,
-          detail: `position multiplier ${mult.toFixed(2)}× (model_calibration[${p.position}], confidence ${cal ? (cal.confidence*100).toFixed(0) : '0'}%)`
+          detail: `attacking mult ${mult.toFixed(2)}× (pos ${rawPosMult.toFixed(2)} × shrinkage ${shrinkageWeight.toFixed(2)} on raw atk ${rawAttackTotal.toFixed(2)}) — applied to goals/assists/CS only`
         }
       ];
 
       // xpts_total stays internally consistent: sum of components.
+      // Only goals/assists/clean_sheet get the calibration multiplier;
+      // everything else passes through unchanged.
       const calibratedTotal =
-        projection.xpts_appearance      // unscaled — appearance is deterministic
-        + scale(projection.xpts_goals)
-        + scale(projection.xpts_assists)
-        + scale(projection.xpts_clean_sheet)
-        + scale(projection.xpts_bonus)
-        + scale(projection.xpts_saves)
-        + scale(projection.xpts_pen_save)
-        + scale(projection.xpts_cards)
-        + scale(projection.xpts_concede)
-        + scale(projection.xpts_owngoal)
-        + scale(projection.xpts_defcon);
+        projection.xpts_appearance         // unscaled — deterministic
+        + scale(projection.xpts_goals)     // SCALED — team_xg_for undercount
+        + scale(projection.xpts_assists)   // SCALED — same reason
+        + scale(projection.xpts_clean_sheet) // SCALED — team_xga undercount
+        + projection.xpts_bonus            // unscaled — well-calibrated BPS
+        + projection.xpts_saves            // unscaled
+        + projection.xpts_pen_save         // unscaled
+        + projection.xpts_cards            // unscaled
+        + projection.xpts_concede          // unscaled
+        + projection.xpts_owngoal          // unscaled
+        + projection.xpts_defcon;          // unscaled — discrete threshold award
 
       projRows.push({
         player_id: p.id, fixture_id: fix.id, gameweek_id: gameweekId,
@@ -816,18 +841,22 @@ export async function recomputeProjectionsForGameweek(
         xpts_goals: scale(projection.xpts_goals),
         xpts_assists: scale(projection.xpts_assists),
         xpts_clean_sheet: scale(projection.xpts_clean_sheet),
-        xpts_bonus: scale(projection.xpts_bonus),
-        xpts_saves: scale(projection.xpts_saves),
-        xpts_pen_save: scale(projection.xpts_pen_save),
-        xpts_cards: scale(projection.xpts_cards),
-        xpts_concede: scale(projection.xpts_concede),
-        xpts_owngoal: scale(projection.xpts_owngoal),
-        xpts_defcon: scale(projection.xpts_defcon),
-        // Floor/ceiling — scale the variable portion (total - appearance) and
-        // re-add appearance so the structural minimum (just showing up) is
-        // preserved.
-        floor:   projection.xpts_appearance + scale(projection.floor   - projection.xpts_appearance),
-        ceiling: projection.xpts_appearance + scale(projection.ceiling - projection.xpts_appearance),
+        xpts_bonus: projection.xpts_bonus,
+        xpts_saves: projection.xpts_saves,
+        xpts_pen_save: projection.xpts_pen_save,
+        xpts_cards: projection.xpts_cards,
+        xpts_concede: projection.xpts_concede,
+        xpts_owngoal: projection.xpts_owngoal,
+        xpts_defcon: projection.xpts_defcon,
+        // Floor — keep appearance + uncalibrated downside risks.
+        // Ceiling — recompute from the scaled attacking ceiling.
+        floor:   projection.floor,
+        ceiling: projection.xpts_appearance
+                 + scale(projection.ceiling - projection.xpts_appearance
+                                            - projection.xpts_bonus
+                                            - projection.xpts_defcon)
+                 + projection.xpts_bonus
+                 + projection.xpts_defcon,
         risk_score: projection.risk_score,
         confidence_score: projection.confidence_score,
         reasons: calibratedReasons,
