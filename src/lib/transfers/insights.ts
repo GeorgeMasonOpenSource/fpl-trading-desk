@@ -30,6 +30,7 @@ export interface RecentMatch {
 
 export interface PlayerInsight {
   playerId: number;
+  position: 'GKP'|'DEF'|'MID'|'FWD';
   matches: RecentMatch[];   // per-match rows, last 5 played, most-recent first
   recent: {
     apps: number;
@@ -58,10 +59,53 @@ export interface PlayerInsight {
     starts: number;
     goals: number;
     assists: number;
-    xg: number;
+    xg: number;          // raw season_xg (includes pens — kept for back-compat)
     xa: number;
     bonus: number;
+    defcon: number;
+    defconPer90: number;
   };
+  /** Shot-situation aggregates from Understat. null if the player isn't in player_shot_aggregates. */
+  shots: {
+    openPlayShots: number;
+    openPlayXg: number;
+    setPieceShots: number;
+    setPieceXg: number;
+    penaltyShots: number;
+    penaltyXg: number;
+    directFkShots: number;
+    directFkXg: number;
+    goalsOpenPlay: number;
+    goalsSetPiece: number;
+    goalsPenalty: number;
+    goalsDirectFk: number;
+    /** Per-shot xG (open-play only) — proxy for shot quality. */
+    xgPerOpenPlayShot: number;
+    /** Non-penalty xG — npxG. The "how dangerous in normal play" number. */
+    npxg: number;
+    /** Non-penalty goals. */
+    npGoals: number;
+    /** npGoals - npxG. Positive = over-finishing, negative = unlucky. */
+    npFinishingDelta: number;
+  } | null;
+  /** Per-player Bayesian priors (output of recomputePlayerPriors). null if no entry. */
+  priors: {
+    goalMult: number;
+    assistMult: number;
+    bonusMult: number;
+    sample90s: number;
+    confidence: number;
+  } | null;
+  /** Per-position defence stats for THIS PLAYER'S NEXT OPPONENT. */
+  oppDefence: {
+    oppShort: string;
+    home: boolean;
+    /** xG conceded to attackers of this player's position per match. */
+    xgConcededPerMatch: number;
+    /** Multiplier vs league average. >1.0 = leaky, <1.0 = strong. */
+    defenceMultiplier: number;
+    matches: number;
+  } | null;
 }
 
 /**
@@ -132,24 +176,82 @@ export async function getTransferInsights(
 
   // Roles + season totals from players.
   const meta = await sql<Array<{
-    id: number; team_id: number;
+    id: number; team_id: number; position: 'GKP'|'DEF'|'MID'|'FWD';
     penalties_order: number | null;
     corners_and_indirect_freekicks_order: number | null;
     direct_freekicks_order: number | null;
     season_minutes: number; season_starts: number;
     season_goals: number; season_assists: number;
     season_xg: number; season_xa: number; season_bonus: number;
+    season_defcon: number; season_defcon_per_90: number;
   }>>`
-    SELECT id, team_id,
+    SELECT id, team_id, position,
            penalties_order,
            corners_and_indirect_freekicks_order,
            direct_freekicks_order,
            season_minutes, season_starts,
            season_goals, season_assists,
-           season_xg, season_xa, season_bonus
+           season_xg, season_xa, season_bonus,
+           COALESCE(season_defcon, 0)        AS season_defcon,
+           COALESCE(season_defcon_per_90, 0) AS season_defcon_per_90
     FROM players WHERE id IN ${sql(playerIds as any)}
   `;
   const metaById = new Map(meta.map(m => [m.id, m]));
+
+  // Shot aggregates (Understat) — situation-decomposed xG. Players without
+  // an entry (no Understat data) get null shots.
+  const shotRows = await sql<Array<{
+    player_id: number;
+    shots_open_play: number; shots_set_piece: number; shots_penalty: number; shots_direct_fk: number;
+    xg_open_play: number; xg_set_piece: number; xg_penalty: number; xg_direct_fk: number;
+    goals_open_play: number; goals_set_piece: number; goals_penalty: number; goals_direct_fk: number;
+  }>>`
+    SELECT player_id,
+           shots_open_play, shots_set_piece, shots_penalty, shots_direct_fk,
+           xg_open_play, xg_set_piece, xg_penalty, xg_direct_fk,
+           goals_open_play, goals_set_piece, goals_penalty, goals_direct_fk
+      FROM player_shot_aggregates
+     WHERE player_id IN ${sql(playerIds as any)}
+  `;
+  const shotsById = new Map(shotRows.map(s => [s.player_id, s]));
+
+  // Player priors (Bayesian conversion / assist / bonus multipliers).
+  const priorRows = await sql<Array<{
+    player_id: number;
+    goal_conversion_mult: number;
+    assist_conversion_mult: number;
+    bonus_per_90_mult: number;
+    sample_90s: number;
+    confidence: number;
+  }>>`
+    SELECT player_id, goal_conversion_mult, assist_conversion_mult,
+           bonus_per_90_mult, sample_90s, confidence
+      FROM player_priors
+     WHERE player_id IN ${sql(playerIds as any)}
+  `;
+  const priorsById = new Map(priorRows.map(r => [r.player_id, r]));
+
+  // Opponent defence vs this player's position, for THIS player's next fixture.
+  // Indexed by (team_id, attacker_position) — we resolve the next-opponent's
+  // team_id below and look up the matching row.
+  const tdbpRows = await sql<Array<{
+    team_id: number;
+    attacker_position: 'GKP'|'DEF'|'MID'|'FWD';
+    xg_per_match: number;
+    multiplier: number;
+    matches: number;
+  }>>`
+    SELECT team_id, attacker_position, xg_per_match, multiplier, matches
+      FROM team_defence_by_position
+  `;
+  const tdbpByKey = new Map<string, { xg_per_match: number; multiplier: number; matches: number }>();
+  for (const r of tdbpRows) {
+    tdbpByKey.set(`${r.team_id}|${r.attacker_position}`, {
+      xg_per_match: Number(r.xg_per_match),
+      multiplier:   Number(r.multiplier),
+      matches:      Number(r.matches)
+    });
+  }
 
   // Assemble per-player insight.
   const recentByPlayer = new Map<number, typeof recentRows>();
@@ -175,8 +277,69 @@ export async function getTransferInsights(
         };
       });
 
+    const sh = shotsById.get(p.id);
+    const shots = sh ? {
+      openPlayShots:   Number(sh.shots_open_play)   || 0,
+      openPlayXg:      Number(sh.xg_open_play)      || 0,
+      setPieceShots:   Number(sh.shots_set_piece)   || 0,
+      setPieceXg:      Number(sh.xg_set_piece)      || 0,
+      penaltyShots:    Number(sh.shots_penalty)     || 0,
+      penaltyXg:       Number(sh.xg_penalty)        || 0,
+      directFkShots:   Number(sh.shots_direct_fk)   || 0,
+      directFkXg:      Number(sh.xg_direct_fk)      || 0,
+      goalsOpenPlay:   Number(sh.goals_open_play)   || 0,
+      goalsSetPiece:   Number(sh.goals_set_piece)   || 0,
+      goalsPenalty:    Number(sh.goals_penalty)     || 0,
+      goalsDirectFk:   Number(sh.goals_direct_fk)   || 0,
+      xgPerOpenPlayShot: 0, npxg: 0, npGoals: 0, npFinishingDelta: 0
+    } : null;
+    if (shots) {
+      shots.xgPerOpenPlayShot = shots.openPlayShots > 0
+        ? shots.openPlayXg / shots.openPlayShots
+        : 0;
+      shots.npxg     = shots.openPlayXg + shots.setPieceXg + shots.directFkXg;
+      shots.npGoals  = shots.goalsOpenPlay + shots.goalsSetPiece + shots.goalsDirectFk;
+      shots.npFinishingDelta = shots.npGoals - shots.npxg;
+    }
+
+    const pr = priorsById.get(p.id);
+    const priors = pr ? {
+      goalMult:   Number(pr.goal_conversion_mult)   || 1,
+      assistMult: Number(pr.assist_conversion_mult) || 1,
+      bonusMult:  Number(pr.bonus_per_90_mult)      || 1,
+      sample90s:  Number(pr.sample_90s)             || 0,
+      confidence: Number(pr.confidence)             || 0
+    } : null;
+
+    // Next-opponent defence vs this player's position.
+    const firstFx = teamFx[0];
+    const position = (m?.position ?? 'MID') as 'GKP'|'DEF'|'MID'|'FWD';
+    let oppDefence: PlayerInsight['oppDefence'] = null;
+    if (firstFx) {
+      // We need the opponent's team_id. teamFx already has opp short — find the
+      // fixture row to recover team ids. (Cheap: just walk teamFixtures.)
+      const fxRow = teamFixtures.find(f =>
+        f.gameweek_id === firstFx.gw &&
+        (f.team_h === p.team_id || f.team_a === p.team_id)
+      );
+      if (fxRow) {
+        const oppTeamId = fxRow.team_h === p.team_id ? fxRow.team_a : fxRow.team_h;
+        const tdbp = tdbpByKey.get(`${oppTeamId}|${position}`);
+        if (tdbp) {
+          oppDefence = {
+            oppShort: firstFx.opp,
+            home: firstFx.home,
+            xgConcededPerMatch: tdbp.xg_per_match,
+            defenceMultiplier:  tdbp.multiplier,
+            matches:            tdbp.matches
+          };
+        }
+      }
+    }
+
     out.set(p.id, {
       playerId: p.id,
+      position,
       matches: recent.map(r => ({
         gw: r.gameweek_id,
         opp: (r as any).opp_short ?? '???',
@@ -214,8 +377,13 @@ export async function getTransferInsights(
         assists: Number(m?.season_assists) || 0,
         xg: Number(m?.season_xg) || 0,
         xa: Number(m?.season_xa) || 0,
-        bonus: Number(m?.season_bonus) || 0
-      }
+        bonus: Number(m?.season_bonus) || 0,
+        defcon: Number(m?.season_defcon) || 0,
+        defconPer90: Number(m?.season_defcon_per_90) || 0
+      },
+      shots,
+      priors,
+      oppDefence
     });
   }
   return out;

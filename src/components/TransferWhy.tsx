@@ -102,6 +102,9 @@ function PlayerPanel({ label, name, ins, tone }: {
               {' '}{ins.season.goals}G {ins.season.assists}A ·
               {' '}xG {fmt(ins.season.xg, 1)} · xA {fmt(ins.season.xa, 1)} ·
               {' '}{ins.season.bonus} bonus
+              {ins.season.defconPer90 > 0 && (
+                <> · {fmt(ins.season.defconPer90, 1)} defcon/90</>
+              )}
             </span>
             {/* Open-play xG split. If the player is a pen taker, the
                 headline xG above includes their penalty xG. We strip an
@@ -118,6 +121,118 @@ function PlayerPanel({ label, name, ins, tone }: {
               </span>
             )}
           </Section>
+
+          {/* Shot profile — Understat per-situation xG. The single best
+              "shot picture" we have: open-play shot volume, shot quality
+              (xG/shot), and the finishing delta (npGoals - npxG). For a
+              forward this is the most important diagnostic. */}
+          {ins.shots && (ins.shots.openPlayShots + ins.shots.setPieceShots + ins.shots.directFkShots) > 0 && (
+            <Section title="Shot profile (Understat)">
+              <table className="w-full text-[11px] font-mono">
+                <thead className="text-ink-dim">
+                  <tr>
+                    <th className="text-left"></th>
+                    <th className="text-right">shots</th>
+                    <th className="text-right">xG</th>
+                    <th className="text-right">goals</th>
+                    <th className="text-right">xG/shot</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {ins.shots.openPlayShots > 0 && (
+                    <tr>
+                      <td className="text-left text-ink-dim">open play</td>
+                      <td className="text-right">{ins.shots.openPlayShots}</td>
+                      <td className="text-right">{fmt(ins.shots.openPlayXg, 2)}</td>
+                      <td className="text-right">{ins.shots.goalsOpenPlay}</td>
+                      <td className={`text-right ${ins.shots.xgPerOpenPlayShot >= 0.14 ? 'text-accent-green' : ins.shots.xgPerOpenPlayShot >= 0.08 ? 'text-ink' : 'text-ink-dim'}`}>
+                        {fmt(ins.shots.xgPerOpenPlayShot, 3)}
+                      </td>
+                    </tr>
+                  )}
+                  {ins.shots.setPieceShots > 0 && (
+                    <tr>
+                      <td className="text-left text-ink-dim">set piece</td>
+                      <td className="text-right">{ins.shots.setPieceShots}</td>
+                      <td className="text-right">{fmt(ins.shots.setPieceXg, 2)}</td>
+                      <td className="text-right">{ins.shots.goalsSetPiece}</td>
+                      <td className="text-right text-ink-dim">—</td>
+                    </tr>
+                  )}
+                  {ins.shots.directFkShots > 0 && (
+                    <tr>
+                      <td className="text-left text-ink-dim">direct FK</td>
+                      <td className="text-right">{ins.shots.directFkShots}</td>
+                      <td className="text-right">{fmt(ins.shots.directFkXg, 2)}</td>
+                      <td className="text-right">{ins.shots.goalsDirectFk}</td>
+                      <td className="text-right text-ink-dim">—</td>
+                    </tr>
+                  )}
+                  {ins.shots.penaltyShots > 0 && (
+                    <tr>
+                      <td className="text-left text-ink-dim">penalty</td>
+                      <td className="text-right">{ins.shots.penaltyShots}</td>
+                      <td className="text-right">{fmt(ins.shots.penaltyXg, 2)}</td>
+                      <td className="text-right">{ins.shots.goalsPenalty}</td>
+                      <td className="text-right text-ink-dim">—</td>
+                    </tr>
+                  )}
+                  <tr className="border-t border-line">
+                    <td className="text-left text-ink-dim">npxG</td>
+                    <td colSpan={2} className="text-right">{fmt(ins.shots.npxg, 2)}</td>
+                    <td className="text-right">{ins.shots.npGoals} np-goals</td>
+                    <td className={`text-right ${ins.shots.npFinishingDelta >= 0 ? 'text-accent-green' : 'text-accent-amber'}`}>
+                      {ins.shots.npFinishingDelta >= 0 ? '+' : ''}{fmt(ins.shots.npFinishingDelta, 1)}
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+              <div className="text-[10px] text-ink-dim mt-1">
+                npxG = non-penalty expected goals · finishing Δ = np-goals − npxG.{' '}
+                {ins.shots.npFinishingDelta >= 2
+                  ? 'Over-finishing — regression risk down.'
+                  : ins.shots.npFinishingDelta <= -2
+                  ? 'Under-finishing — regression upside.'
+                  : 'In line with expected.'}
+              </div>
+            </Section>
+          )}
+
+          {/* Bayesian player priors. Tells the user this isn't just hot
+              form — the model has fitted a season-long multiplier from
+              actuals vs expected. */}
+          {ins.priors && (ins.priors.goalMult !== 1 || ins.priors.bonusMult !== 1 || ins.priors.assistMult !== 1) && (
+            <Section title="Player priors (Bayesian)">
+              <span className="font-mono">
+                goals {fmt(ins.priors.goalMult, 2)}× · assists {fmt(ins.priors.assistMult, 2)}× · bonus {fmt(ins.priors.bonusMult, 2)}×
+              </span>
+              <div className="text-[10px] text-ink-dim mt-0.5">
+                Shrunk over {fmt(ins.priors.sample90s, 0)} 90s · confidence {fmt(ins.priors.confidence * 100, 0)}%.
+                {ins.priors.goalMult >= 1.15 && ' Model treats him as an elite finisher.'}
+                {ins.priors.goalMult <= 0.85 && ' Model is fading the finishing — wasteful in the box.'}
+                {ins.priors.bonusMult >= 1.15 && ' Bonus magnet — over-performs BPS-from-xG.'}
+              </div>
+            </Section>
+          )}
+
+          {/* Opponent defence vs this player's position — the position-
+              specific FDR, more useful than the generic 1-5 number. */}
+          {ins.oppDefence && (
+            <Section title={`Next opp defence vs ${ins.position}`}>
+              <span className="font-mono">
+                {ins.oppDefence.oppShort} concede {fmt(ins.oppDefence.xgConcededPerMatch, 2)} xG/match to {ins.position}s ·
+                {' '}{fmt(ins.oppDefence.defenceMultiplier, 2)}× league avg
+              </span>
+              <div className={`text-[10px] mt-0.5 ${ins.oppDefence.defenceMultiplier >= 1.15 ? 'text-accent-green' : ins.oppDefence.defenceMultiplier <= 0.85 ? 'text-accent-red' : 'text-ink-dim'}`}>
+                {ins.oppDefence.defenceMultiplier >= 1.15
+                  ? `${((ins.oppDefence.defenceMultiplier - 1) * 100).toFixed(0)}% leakier than average — favourable matchup.`
+                  : ins.oppDefence.defenceMultiplier <= 0.85
+                  ? `${((1 - ins.oppDefence.defenceMultiplier) * 100).toFixed(0)}% tighter than average — tough matchup.`
+                  : `Roughly league-average defence vs ${ins.position}s.`}
+                {' '}({ins.oppDefence.matches} matches sampled.)
+              </div>
+            </Section>
+          )}
 
           <Section title="Next 3 fixtures">
             {ins.upcoming.length === 0 ? (

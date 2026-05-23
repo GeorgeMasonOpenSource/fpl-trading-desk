@@ -4,6 +4,13 @@ import { n, fmt, pct } from '@/lib/util/fmt';
 
 interface Reason { kind: string; weight: number; detail?: string }
 
+/** A "why this player is starting" bullet, produced by xi-narrative.ts. */
+export interface XiNarrativeBullet {
+  tone: 'positive' | 'neutral' | 'negative';
+  headline: string;
+  detail: string;
+}
+
 export interface PlayerCardData {
   player_id: number;
   web_name: string;
@@ -26,6 +33,14 @@ export interface PlayerCardData {
   ceiling: number;
   risk_score: number;
   reasons: Reason[] | null;
+  /** Optional XI-narrative bullets explaining why this player is starting vs the bench. */
+  xiNarrative?: {
+    isCaptain: boolean;
+    isVice: boolean;
+    nearestBenchAlt?: { web_name: string; xpts: number } | null;
+    xpGap: number;
+    bullets: XiNarrativeBullet[];
+  } | null;
   last_refresh?: string;
 }
 
@@ -79,6 +94,35 @@ export function PlayerCard({ p }: { p: PlayerCardData }) {
         <Stat label="ceiling" value={fmt(p.ceiling, 1)} />
       </div>
 
+      {p.xiNarrative && p.xiNarrative.bullets.length > 0 && (
+        <details className="text-[11px] text-ink-muted" open={p.xiNarrative.isCaptain}>
+          <summary className="cursor-pointer text-ink-dim hover:text-ink flex items-center gap-1.5">
+            <span className="font-medium text-ink">
+              {p.xiNarrative.isCaptain ? '★ Why captain' : p.xiNarrative.isVice ? '⌧ Why vice' : 'Why starting'}
+            </span>
+            {p.xiNarrative.nearestBenchAlt && (
+              <span className="text-ink-dim">
+                · {p.xiNarrative.xpGap >= 0 ? '+' : ''}{fmt(p.xiNarrative.xpGap, 2)} xP vs {p.xiNarrative.nearestBenchAlt.web_name}
+              </span>
+            )}
+          </summary>
+          <ul className="mt-1.5 space-y-1.5">
+            {p.xiNarrative.bullets.map((b, i) => (
+              <li key={i} className="flex gap-1.5 items-start">
+                <span className={
+                  b.tone === 'positive' ? 'text-accent-green mt-1' :
+                  b.tone === 'negative' ? 'text-accent-red mt-1' :
+                  'text-ink-dim mt-1'
+                }>•</span>
+                <span>
+                  <span className="font-medium text-ink">{b.headline}</span>
+                  <span className="text-ink-muted"> — {b.detail}</span>
+                </span>
+              </li>
+            ))}
+          </ul>
+        </details>
+      )}
       {Array.isArray(p.reasons) && p.reasons.length > 0 && (
         <details className="text-[11px] text-ink-muted">
           <summary className="cursor-pointer text-ink-dim hover:text-ink">Reason breakdown</summary>

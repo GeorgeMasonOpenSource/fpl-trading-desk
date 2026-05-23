@@ -150,6 +150,109 @@ export function transferReasons(input: TransferReasonsInput): TransferReason[] {
     }
   }
 
+  // 3a. Shot quality — xG per open-play shot. A player with 6 shots/90 at
+  //     0.10 xG/shot (long-range pots) is far less reliable than one with
+  //     3 shots/90 at 0.22 xG/shot (box chances). Captures shot LOCATION
+  //     quality, which raw xG totals hide.
+  if (i?.shots && o?.shots && i.season.minutes > 0 && o.season.minutes > 0) {
+    const inOpsP90    = (i.shots.openPlayShots * 90) / i.season.minutes;
+    const outOpsP90   = (o.shots.openPlayShots * 90) / o.season.minutes;
+    const inQuality   = i.shots.xgPerOpenPlayShot;
+    const outQuality  = o.shots.xgPerOpenPlayShot;
+    if (inOpsP90 - outOpsP90 >= 0.7 && inQuality >= 0.10) {
+      out.push({
+        tone: 'positive',
+        headline: 'More box shots',
+        detail: `${inOpsP90.toFixed(1)} open-play shots/90 (avg ${inQuality.toFixed(2)} xG/shot — ${qualityLabel(inQuality)}). ${input.outName}: ${outOpsP90.toFixed(1)}/90 at ${outQuality.toFixed(2)}.`
+      });
+    } else if (inQuality - outQuality >= 0.04 && i.shots.openPlayShots >= 15) {
+      out.push({
+        tone: 'positive',
+        headline: 'Higher shot quality',
+        detail: `${inQuality.toFixed(2)} xG/shot vs ${outQuality.toFixed(2)} for ${input.outName}. ${input.inName} gets cleaner chances — ${qualityLabel(inQuality)} territory.`
+      });
+    }
+  }
+
+  // 3b. Finishing — npGoals vs npxG. Negative delta means under-performing
+  //     finishing (regression UP coming); positive means over-finishing
+  //     (regression DOWN risk). Either is worth surfacing.
+  if (i?.shots && i.shots.openPlayShots >= 15) {
+    const d = i.shots.npFinishingDelta;
+    if (d <= -2.0) {
+      out.push({
+        tone: 'positive',
+        headline: 'Due to regress UP',
+        detail: `${input.inName} has ${i.shots.npGoals} non-pen goals on ${i.shots.npxg.toFixed(1)} npxG — ${Math.abs(d).toFixed(1)} below expectation. Finishing should normalise — model treats him as undervalued.`
+      });
+    } else if (d >= 3.0) {
+      out.push({
+        tone: 'neutral',
+        headline: 'Over-finishing risk',
+        detail: `${i.shots.npGoals} non-pen goals on only ${i.shots.npxg.toFixed(1)} npxG — +${d.toFixed(1)} over expected. Elite finisher OR positive variance. Player-prior is shrinking this in the projection.`
+      });
+    }
+  }
+
+  // 3c. Player-prior boost — surface the Bayesian goal/bonus multipliers
+  //     when they're materially above 1.0. Tells the user "this is an
+  //     elite over the season, not just a hot streak".
+  if (i?.priors) {
+    const gm = i.priors.goalMult;
+    const bm = i.priors.bonusMult;
+    if (gm >= 1.15 && i.priors.sample90s >= 15) {
+      out.push({
+        tone: 'positive',
+        headline: 'Elite finisher (prior)',
+        detail: `Season prior: ${gm.toFixed(2)}× goal conversion vs his position median (over ${i.priors.sample90s.toFixed(0)} 90s). Model adds ~${((gm - 1) * 100).toFixed(0)}% to his raw goal xPts.`
+      });
+    }
+    if (bm >= 1.15 && i.priors.sample90s >= 15) {
+      out.push({
+        tone: 'positive',
+        headline: 'Bonus magnet',
+        detail: `Earns ${bm.toFixed(2)}× the bonus his BPS-from-xG would suggest. Key passes, dribbles, fouls drawn — stuff that doesn't show in xG but adds bonus.`
+      });
+    }
+  }
+
+  // 3d. DEFCON proximity — for the +2 defcon threshold, what matters is
+  //     P(actions ≥ 12). Surface the per-90 rate so the user knows whether
+  //     the swap is a defcon play.
+  if (i && o && i.season.minutes >= 900) {
+    const inDc  = i.season.defconPer90;
+    const outDc = o.season.defconPer90;
+    if (inDc - outDc >= 1.5 && inDc >= 9) {
+      out.push({
+        tone: 'positive',
+        headline: 'DEFCON threat',
+        detail: `${inDc.toFixed(1)} defcon actions/90 (CBI+T+R) vs ${outDc.toFixed(1)} for ${input.outName}. Closer to the 12-action +2 pt threshold every match.`
+      });
+    }
+  }
+
+  // 3e. Opponent defence vs position — frames the upcoming fixture in
+  //     position-specific terms, not generic FDR. A team can be top-5
+  //     defensively overall but leaky vs MIDs (Spurs 24-25 was).
+  if (i?.oppDefence && o?.oppDefence) {
+    const inOd = i.oppDefence;
+    const outOd = o.oppDefence;
+    if (inOd.defenceMultiplier - outOd.defenceMultiplier >= 0.2 && inOd.matches >= 5) {
+      out.push({
+        tone: 'positive',
+        headline: `Soft opp vs ${i.position}`,
+        detail: `${inOd.oppShort} concedes ${inOd.xgConcededPerMatch.toFixed(2)} xG/match to ${i.position}s (${(inOd.defenceMultiplier * 100 - 100).toFixed(0)}% above league average). ${input.outName} faces ${outOd.oppShort} who's tighter.`
+      });
+    } else if (inOd.defenceMultiplier <= 0.85 && inOd.matches >= 5) {
+      // Inbound has a hard opp — call it out so the user isn't surprised.
+      out.push({
+        tone: 'negative',
+        headline: `Tough opp vs ${i.position}`,
+        detail: `${inOd.oppShort} is ${((1 - inOd.defenceMultiplier) * 100).toFixed(0)}% tighter than average vs ${i.position}s — only ${inOd.xgConcededPerMatch.toFixed(2)} xG/match conceded. Form alone has to carry this swap.`
+      });
+    }
+  }
+
   // 4. Fixture swing. FDR is FPL's 1–5 difficulty rating; <2.5 is a green
   //    run, >3.5 is a hard run. A 1.0 swing across 3 GWs is significant.
   if (i && o && i.upcoming.length > 0 && o.upcoming.length > 0) {
@@ -274,9 +377,23 @@ export function transferReasons(input: TransferReasonsInput): TransferReason[] {
   }
 
   // Order: positives first (lead with the strongest argument), then neutrals,
-  // then negatives (so trade-offs land last). Cap at 6.
+  // then negatives (so trade-offs land last). Cap at 8 — we now have richer
+  // underlying-data bullets so a few more are worth showing.
   const positives = out.filter(r => r.tone === 'positive');
   const neutrals  = out.filter(r => r.tone === 'neutral');
   const negatives = out.filter(r => r.tone === 'negative');
-  return [...positives, ...neutrals, ...negatives].slice(0, 6);
+  return [...positives, ...neutrals, ...negatives].slice(0, 8);
+}
+
+/**
+ * Label an open-play xG-per-shot value so the user knows what they're
+ * looking at. Anchors come from Understat's Premier League distribution
+ * 2024-25: median open-play xG/shot ≈ 0.08, 75th pct ≈ 0.12, 90th ≈ 0.18.
+ */
+function qualityLabel(xgPerShot: number): string {
+  if (xgPerShot >= 0.20) return 'elite — penalty-box specialist';
+  if (xgPerShot >= 0.14) return 'high quality — central forward range';
+  if (xgPerShot >= 0.10) return 'above average';
+  if (xgPerShot >= 0.07) return 'league average';
+  return 'low quality — mostly long-range';
 }
