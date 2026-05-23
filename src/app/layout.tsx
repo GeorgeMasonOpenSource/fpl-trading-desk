@@ -1,6 +1,6 @@
 import './globals.css';
-import Link from 'next/link';
 import { ConnectionBar } from '@/components/ConnectionBar';
+import { Nav } from '@/components/Nav';
 import { getManagerId, getLeagueId } from '@/lib/session';
 import { sql } from '@/lib/db/client';
 
@@ -8,33 +8,6 @@ export const metadata = {
   title: 'FPL Trading Desk',
   description: 'A deterministic, transparent Fantasy Premier League quant terminal.'
 };
-
-const NAV = [
-  { href: '/gw',                 label: '★ This Gameweek' },
-  { href: '/',                   label: 'Dashboard (full)' },
-  { href: '/gw-checklist',       label: 'GW Checklist' },
-  { href: '/pitch',              label: 'Pitch view' },
-  { href: '/predicted-lineups',  label: 'Predicted Lineups' },
-  { href: '/my-team',            label: 'My Team' },
-  { href: '/transfer-planner',   label: 'Transfer Planner' },
-  { href: '/captaincy',          label: 'Captaincy' },
-  { href: '/chip-planner',       label: 'Chip Planner' },
-  { href: '/mini-league',        label: 'Mini League War Room' },
-  { href: '/creator-signals',    label: 'Creator Board' },
-  { href: '/decision-matrix',    label: 'Decision Matrix' },
-  { href: '/creator-lineups',    label: 'Creator Lineups' },
-  { href: '/creator-accuracy',   label: 'Creator Accuracy' },
-  { href: '/player-explorer',    label: 'Player Explorer' },
-  { href: '/minutes-lab',        label: 'Minutes Lab' },
-  { href: '/role-matrix',        label: 'Role Matrix' },
-  { href: '/rotation-radar',     label: 'Rotation Radar' },
-  { href: '/fixture-congestion', label: 'Fixture Congestion' },
-  { href: '/model-lab',          label: 'Model Lab' },
-  { href: '/model-audit',        label: 'Model Audit' },
-  { href: '/backtesting',        label: 'Backtesting' },
-  { href: '/settings',           label: 'Settings' },
-  { href: '/manual-overrides',   label: 'Manual Overrides' }
-];
 
 async function loadConnectionContext() {
   const managerId = getManagerId();
@@ -72,24 +45,16 @@ export default async function RootLayout({ children }: { children: React.ReactNo
   return (
     <html lang="en" className="dark">
       <body className="min-h-screen bg-bg text-ink font-sans">
-        <div className="grid grid-cols-[220px_1fr] min-h-screen">
-          <aside className="bg-bg-raised border-r border-line">
+        <div className="grid grid-cols-[200px_1fr] min-h-screen">
+          <aside className="bg-bg-raised border-r border-line sticky top-0 h-screen overflow-y-auto flex flex-col">
             <div className="px-4 py-5 border-b border-line">
               <div className="text-xs uppercase tracking-widest text-ink-dim">Trading Desk</div>
               <div className="font-mono font-semibold text-lg">FPL · TD</div>
             </div>
-            <nav className="py-2">
-              {NAV.map(item => (
-                <Link
-                  key={item.href}
-                  href={item.href}
-                  className="block px-4 py-2 text-sm text-ink-muted hover:text-ink hover:bg-bg-card border-l-2 border-transparent hover:border-accent-blue"
-                >
-                  {item.label}
-                </Link>
-              ))}
-            </nav>
-            <div className="px-4 py-4 mt-2 border-t border-line text-[11px] text-ink-dim font-mono">
+            <div className="flex-1">
+              <Nav />
+            </div>
+            <div className="px-4 py-3 border-t border-line text-[11px] text-ink-dim font-mono">
               v0.1 · deterministic
             </div>
           </aside>
