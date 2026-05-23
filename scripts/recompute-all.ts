@@ -33,6 +33,7 @@ import { recomputePerPositionDefence } from '../src/lib/projections/per-position
 import { recomputeMinutesCalibration } from '../src/lib/minutes/per-position-calibration';
 import { recomputeSetPieceRoles } from '../src/lib/projections/set-piece-roles';
 import { recomputeMinutesForGameweek } from '../src/lib/minutes/engine';
+import { recomputePlayerPriors } from '../src/lib/projections/player-priors';
 
 async function main() {
   const args = process.argv.slice(2);
@@ -78,6 +79,24 @@ async function main() {
     console.log(`[recompute-all] step 1d done in ${Date.now() - t0d}ms`);
   } catch (err) {
     console.warn(`[recompute-all] step 1d SKIPPED (${(err as Error).message})`);
+  }
+
+  // 1e. Per-player Bayesian priors — individual finishing/creation/bonus
+  // multipliers, shrunk toward 1.0 based on sample size. Captures the
+  // Haaland-tier elites that no position-level calibration could see.
+  const t0e = Date.now();
+  console.log('[recompute-all] step 1e — per-player priors');
+  try {
+    const priors = await recomputePlayerPriors();
+    console.log(`[recompute-all] step 1e done in ${Date.now() - t0e}ms (${priors.computed} players)`);
+    if (priors.highMultipliers.length > 0) {
+      console.log(`  Top movers:`);
+      for (const m of priors.highMultipliers.slice(0, 5)) {
+        console.log(`    ${m.web_name.padEnd(20)} goal ${m.goal_mult.toFixed(2)}× · bonus ${m.bonus_mult.toFixed(2)}× (${m.sample90s.toFixed(1)} 90s)`);
+      }
+    }
+  } catch (err) {
+    console.warn(`[recompute-all] step 1e SKIPPED (${(err as Error).message}) — apply migration 0014 to enable`);
   }
 
   // 2. Hierarchical estimates -------------------------------------------

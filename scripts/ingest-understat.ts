@@ -21,6 +21,7 @@ import {
   fetchAllMatchIds,
   fetchMatchShots,
   fetchLeaguePlayers,
+  fetchLeagueTeams,
   type UnderstatShot
 } from '../src/lib/understat/scraper';
 
@@ -196,6 +197,47 @@ async function main() {
     WHERE opponent_team_id IS NOT NULL
     GROUP BY opponent_team_id
   `;
+  // 7. §team-level xG_for ingest — Understat's per-team history doesn't
+  //    require player mapping, so it gives us the TRUE team xG even for
+  //    players we couldn't resolve to FPL IDs (Cherki, Haaland on some
+  //    seasons, foreign-character name mismatches, etc).
+  //
+  //    Read once from the league endpoint, sum across home + away matches
+  //    per team, and UPDATE team_shot_aggregates with the unbiased totals.
+  //    The team-rating Bayesian Kalman reads from xg_for/xg_against here.
+  const teamData = await fetchLeagueTeams(year);
+  let teamRowsUpdated = 0;
+  for (const understatTeamId of Object.keys(teamData)) {
+    const t = teamData[understatTeamId]!;
+    const fplTeamId = teamByName.get(t.title.toLowerCase());
+    if (!fplTeamId) {
+      console.log(`  team mismatch: "${t.title}" not in FPL teams (skipping)`);
+      continue;
+    }
+    let xgFor = 0, xgAgainst = 0, npxgFor = 0, npxgAgainst = 0, played = 0;
+    for (const h of t.history) {
+      xgFor       += Number(h.xG)    || 0;
+      xgAgainst   += Number(h.xGA)   || 0;
+      npxgFor     += Number(h.npxG)  || 0;
+      npxgAgainst += Number(h.npxGA) || 0;
+      played++;
+    }
+    await sql`
+      INSERT INTO team_shot_aggregates
+        (team_id, xg_for, xg_against, npxg_for, npxg_against, matches_team_xg, matches, updated_at)
+      VALUES (${fplTeamId}, ${xgFor}, ${xgAgainst}, ${npxgFor}, ${npxgAgainst}, ${played}, ${played}, now())
+      ON CONFLICT (team_id) DO UPDATE
+        SET xg_for          = EXCLUDED.xg_for,
+            xg_against      = EXCLUDED.xg_against,
+            npxg_for        = EXCLUDED.npxg_for,
+            npxg_against    = EXCLUDED.npxg_against,
+            matches_team_xg = EXCLUDED.matches_team_xg,
+            updated_at      = now()
+    `;
+    teamRowsUpdated++;
+  }
+  console.log(`→ updated team-level xG for ${teamRowsUpdated} teams (from Understat team API, no player mapping needed)`);
+
   console.log(`done. ${inserted} new shot rows.`);
   await sql.end();
 }

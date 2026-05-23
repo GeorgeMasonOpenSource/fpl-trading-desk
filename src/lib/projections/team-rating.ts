@@ -109,14 +109,20 @@ export async function recomputeTeamRatings(cutoffGameweek?: number): Promise<voi
         team_id: number; matches: number; xg_for: number; xg_against: number;
       }>>`
         SELECT t.id AS team_id,
-               COALESCE(tsa.matches, 0)::int AS matches,
-               COALESCE((
-                 SELECT SUM(xg)
-                   FROM player_shot_history psh
-                   JOIN players p ON p.id = psh.player_id
-                  WHERE p.team_id = t.id
-               ), 0)::numeric AS xg_for,
-               COALESCE(tsa.xg_against, 0)::numeric AS xg_against
+               COALESCE(tsa.matches_team_xg, tsa.matches, 0)::int AS matches,
+               -- §unbiased team xG — prefer Understat's team-level totals
+               -- (no player-mapping dependency, so includes shots from
+               -- every player). Fall back to the leaky per-player sum
+               -- only if the team-level ingest hasn't populated tsa.xg_for.
+               COALESCE(
+                 tsa.xg_for::numeric,
+                 (SELECT SUM(xg)
+                    FROM player_shot_history psh
+                    JOIN players p ON p.id = psh.player_id
+                   WHERE p.team_id = t.id),
+                 0
+               ) AS xg_for,
+               COALESCE(tsa.xg_against::numeric, 0) AS xg_against
           FROM teams t
           LEFT JOIN team_shot_aggregates tsa ON tsa.team_id = t.id
       `;

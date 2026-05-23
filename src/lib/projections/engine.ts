@@ -465,6 +465,41 @@ export async function recomputeProjectionsForGameweek(
     console.warn(`[engine] calibration load FAILED, falling back to 1.0×: ${(err as Error).message}`);
   }
 
+  // §per-player priors — individual finishing/creation/bonus multipliers,
+  // already Bayesian-shrunk in player-priors.ts. We apply these on top of
+  // the position calibration. Captures the Haaland-tier elites that the
+  // position multiplier alone can't distinguish from average finishers.
+  const priorsByPlayer = new Map<number, {
+    goalMult: number; assistMult: number; bonusMult: number; confidence: number;
+  }>();
+  try {
+    const priorRows = await sql<Array<{
+      player_id: number;
+      goal_conversion_mult: number;
+      assist_conversion_mult: number;
+      bonus_per_90_mult: number;
+      confidence: number;
+    }>>`SELECT player_id,
+              goal_conversion_mult::float8,
+              assist_conversion_mult::float8,
+              bonus_per_90_mult::float8,
+              confidence::float8
+         FROM player_priors`;
+    for (const r of priorRows) {
+      priorsByPlayer.set(r.player_id, {
+        goalMult:   Number(r.goal_conversion_mult),
+        assistMult: Number(r.assist_conversion_mult),
+        bonusMult:  Number(r.bonus_per_90_mult),
+        confidence: Number(r.confidence)
+      });
+    }
+    // eslint-disable-next-line no-console
+    console.log(`[engine] loaded per-player priors for ${priorsByPlayer.size} players`);
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn(`[engine] player priors load FAILED, falling back to 1.0×: ${(err as Error).message}`);
+  }
+
   const fixtures = includeFinished
     ? await sql<Array<{ id: number; team_h: number; team_a: number }>>`
         SELECT id, team_h, team_a FROM fixtures
@@ -807,26 +842,45 @@ export async function recomputeProjectionsForGameweek(
       const mult = 1.0 + (rawPosMult - 1.0) * shrinkageWeight;
       // We scale ONLY the attacking components (goals, assists, CS).
       // DEFCON / bonus / saves / cards / concede / owngoal / pen_save are
-      // already well-calibrated and don't need a multiplier.
-      const scale = (x: number) => Number(x) * mult;
+      // already well-calibrated and don't need a position multiplier.
+      //
+      // §per-player priors — on top of the position multiplier, multiply
+      // each component by the player's individual prior. Haaland's goal
+      // multiplier of 1.10 makes his goals component 10% higher than a
+      // generic FWD with the same xG. Bonus multiplier captures the
+      // BPS-magnets (Bowen, Saka). All three are clamped to [0.7, 1.4]
+      // and Bayesian-shrunk in player-priors.ts, so unproven players
+      // stay at 1.0.
+      const prior = priorsByPlayer.get(p.id);
+      const playerGoalMult   = prior?.goalMult   ?? 1.0;
+      const playerAssistMult = prior?.assistMult ?? 1.0;
+      const playerBonusMult  = prior?.bonusMult  ?? 1.0;
+
+      const scaleGoals   = (x: number) => Number(x) * mult * playerGoalMult;
+      const scaleAssists = (x: number) => Number(x) * mult * playerAssistMult;
+      const scaleCs      = (x: number) => Number(x) * mult;  // CS isn't player-specific
+      const scaleBonus   = (x: number) => Number(x) * playerBonusMult;
+
       const calibratedReasons = [
         ...projection.reasons,
         {
           kind: 'calibration',
           weight: 0,
-          detail: `attacking mult ${mult.toFixed(2)}× (pos ${rawPosMult.toFixed(2)} × shrinkage ${shrinkageWeight.toFixed(2)} on raw atk ${rawAttackTotal.toFixed(2)}) — applied to goals/assists/CS only`
+          detail: `pos mult ${mult.toFixed(2)}× (atk only) · player priors goal ${playerGoalMult.toFixed(2)}×, assist ${playerAssistMult.toFixed(2)}×, bonus ${playerBonusMult.toFixed(2)}×`
         }
       ];
 
       // xpts_total stays internally consistent: sum of components.
-      // Only goals/assists/clean_sheet get the calibration multiplier;
-      // everything else passes through unchanged.
+      // Goals/assists get position-mult × player-goal-mult,
+      // CS gets position-mult only (team-level, not player-specific),
+      // Bonus gets player-bonus-mult only,
+      // Everything else passes through unchanged.
       const calibratedTotal =
         projection.xpts_appearance         // unscaled — deterministic
-        + scale(projection.xpts_goals)     // SCALED — team_xg_for undercount
-        + scale(projection.xpts_assists)   // SCALED — same reason
-        + scale(projection.xpts_clean_sheet) // SCALED — team_xga undercount
-        + projection.xpts_bonus            // unscaled — well-calibrated BPS
+        + scaleGoals(projection.xpts_goals)       // SCALED × player goal mult
+        + scaleAssists(projection.xpts_assists)   // SCALED × player assist mult
+        + scaleCs(projection.xpts_clean_sheet)    // SCALED (team-level)
+        + scaleBonus(projection.xpts_bonus)       // player bonus mult only
         + projection.xpts_saves            // unscaled
         + projection.xpts_pen_save         // unscaled
         + projection.xpts_cards            // unscaled
@@ -838,10 +892,10 @@ export async function recomputeProjectionsForGameweek(
         player_id: p.id, fixture_id: fix.id, gameweek_id: gameweekId,
         xpts_total: calibratedTotal,
         xpts_appearance: projection.xpts_appearance,
-        xpts_goals: scale(projection.xpts_goals),
-        xpts_assists: scale(projection.xpts_assists),
-        xpts_clean_sheet: scale(projection.xpts_clean_sheet),
-        xpts_bonus: projection.xpts_bonus,
+        xpts_goals: scaleGoals(projection.xpts_goals),
+        xpts_assists: scaleAssists(projection.xpts_assists),
+        xpts_clean_sheet: scaleCs(projection.xpts_clean_sheet),
+        xpts_bonus: scaleBonus(projection.xpts_bonus),
         xpts_saves: projection.xpts_saves,
         xpts_pen_save: projection.xpts_pen_save,
         xpts_cards: projection.xpts_cards,
@@ -852,10 +906,10 @@ export async function recomputeProjectionsForGameweek(
         // Ceiling — recompute from the scaled attacking ceiling.
         floor:   projection.floor,
         ceiling: projection.xpts_appearance
-                 + scale(projection.ceiling - projection.xpts_appearance
-                                            - projection.xpts_bonus
-                                            - projection.xpts_defcon)
-                 + projection.xpts_bonus
+                 + scaleGoals(projection.ceiling - projection.xpts_appearance
+                                                 - projection.xpts_bonus
+                                                 - projection.xpts_defcon)
+                 + scaleBonus(projection.xpts_bonus)
                  + projection.xpts_defcon,
         risk_score: projection.risk_score,
         confidence_score: projection.confidence_score,
