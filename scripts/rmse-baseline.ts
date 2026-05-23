@@ -47,17 +47,26 @@ async function main() {
   const toGw   = toArg ? Number(toArg.split('=')[1]) : 38;
   console.log(`RMSE baseline · GW${fromGw}–${toGw}\n`);
 
+  // Critical: only score against gameweeks that have actually been played.
+  // An unfinished GW has actuals = 0 which crushes bias/MAE/RMSE numbers
+  // because we'd be comparing predictions to "the game hasn't happened yet".
+  // Filter to gameweeks where the corresponding fixtures.finished = TRUE
+  // (i.e. the GW is fully concluded).
   const rows = await sql<Array<{
     player_id: number; gameweek_id: number;
     position: 'GKP'|'DEF'|'MID'|'FWD';
     predicted: number; actual: number;
   }>>`
-    WITH snap AS (
+    WITH finished_gws AS (
+      SELECT id AS gameweek_id FROM gameweeks
+       WHERE finished = TRUE AND id BETWEEN ${fromGw} AND ${toGw}
+    ),
+    snap AS (
       SELECT DISTINCT ON (player_id, fixture_id, gameweek_id)
              player_id, fixture_id, gameweek_id,
              ((payload->>'xpts_total')::float8) AS predicted
         FROM projection_snapshots
-       WHERE gameweek_id BETWEEN ${fromGw} AND ${toGw}
+       WHERE gameweek_id IN (SELECT gameweek_id FROM finished_gws)
          AND payload ? 'xpts_total'
        ORDER BY player_id, fixture_id, gameweek_id, taken_at DESC
     ),
@@ -65,7 +74,7 @@ async function main() {
       SELECT player_id, gameweek_id, fixture_id,
              total_points::float8 AS actual
         FROM player_gameweek_history
-       WHERE gameweek_id BETWEEN ${fromGw} AND ${toGw}
+       WHERE gameweek_id IN (SELECT gameweek_id FROM finished_gws)
          AND minutes IS NOT NULL
     )
     SELECT s.player_id, s.gameweek_id, p.position,
@@ -82,7 +91,17 @@ async function main() {
 
   if (rows.length === 0) {
     console.log('No paired snapshot/actual rows in that range — nothing to score.');
+    console.log('Note: snapshots are only captured for the current GW. We do not have');
+    console.log('historical projection_snapshots for past gameweeks, so the season-wide');
+    console.log('backtest is limited until the cutoff-aware engine refactor lands');
+    console.log('(see WALK-FORWARD-PLAN.md).');
     process.exit(0);
+  }
+  const distinctGws = new Set(rows.map(r => r.gameweek_id));
+  if (distinctGws.size < 3) {
+    console.log(`⚠  Only ${distinctGws.size} finished gameweek(s) of snapshot data available.`);
+    console.log(`   This is a tiny sample — RMSE estimates are noisy. The cutoff-aware`);
+    console.log(`   walk-forward (WALK-FORWARD-PLAN.md) will give us full-season scoring.\n`);
   }
 
   // Headline metrics
@@ -134,8 +153,11 @@ async function main() {
     SELECT id, web_name, position FROM players WHERE id IN ${sql(Array.from(byPlayer.keys()) as any)}
   `;
   const metaMap = new Map(playerMeta.map(p => [p.id, p]));
+  // Need a few GWs to draw signal. When we only have 1-2 GWs of snapshot data
+  // we relax to n>=1 so the user still sees who we were most wrong about.
+  const minSample = distinctGws.size >= 4 ? 3 : 1;
   const ranked = Array.from(byPlayer.entries())
-    .filter(([_, v]) => v.n >= 10)  // need ≥10 GWs to draw signal
+    .filter(([_, v]) => v.n >= minSample)
     .map(([id, v]) => ({
       id, n: v.n,
       meanDelta: v.sumDelta / v.n,

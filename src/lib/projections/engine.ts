@@ -417,15 +417,34 @@ export function projectPlayer(ctx: PlayerProjectionContext): ProjectionResult {
  * Recompute projections for every upcoming fixture in the gameweek.
  * Pulls minutes distribution + baselines + team strengths from the DB and
  * writes results into `projections` (UPSERT) + an append-only snapshot.
+ *
+ * §walk-forward options:
+ *   - `includeFinished` — also predict finished fixtures (default false in
+ *     live mode, true for backtest harnesses that need historic snapshots).
+ *   - `cutoffGameweek` — when set, the historic-data layers (team ratings,
+ *     player aggregates) will be re-derived using only data from GWs
+ *     strictly before this cutoff. Required for fair walk-forward; without
+ *     it, predictions leak future information. NOTE: full cutoff threading
+ *     is in progress (see WALK-FORWARD-PLAN.md). Today, only team-rating
+ *     accepts the cutoff.
  */
-export async function recomputeProjectionsForGameweek(gameweekId: number) {
+export async function recomputeProjectionsForGameweek(
+  gameweekId: number,
+  options?: { includeFinished?: boolean; cutoffGameweek?: number }
+) {
   const stage = classifyStage(gameweekId);
   const weights = weightsForStage(stage);
+  const includeFinished = options?.includeFinished ?? false;
 
-  const fixtures = await sql<Array<{ id: number; team_h: number; team_a: number }>>`
-    SELECT id, team_h, team_a FROM fixtures
-    WHERE gameweek_id = ${gameweekId} AND finished = FALSE
-  `;
+  const fixtures = includeFinished
+    ? await sql<Array<{ id: number; team_h: number; team_a: number }>>`
+        SELECT id, team_h, team_a FROM fixtures
+        WHERE gameweek_id = ${gameweekId}
+      `
+    : await sql<Array<{ id: number; team_h: number; team_a: number }>>`
+        SELECT id, team_h, team_a FROM fixtures
+        WHERE gameweek_id = ${gameweekId} AND finished = FALSE
+      `;
 
   let written = 0;
   for (const fix of fixtures) {

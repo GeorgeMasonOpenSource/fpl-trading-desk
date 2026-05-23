@@ -50,28 +50,76 @@ const LEAGUE_XG_PER_MATCH_DEFAULT = 1.4;
  * Called after each Understat ingest. Output is persisted on
  * teams.attacking_style + teams.defensive_solidity (which the engine
  * already reads), keeping the data flow clean.
+ *
+ * §walk-forward: pass `cutoffGameweek` to fit using only data from
+ * fixtures BEFORE that GW. Used by the season backtest harness to
+ * measure RMSE per GW without data leakage. When null (default), uses
+ * the full season — matches the live production behaviour.
  */
-export async function recomputeTeamRatings(): Promise<void> {
-  const rows = await sql<Array<{
-    team_id: number;
-    matches: number;
-    xg_for: number;
-    xg_against: number;
-  }>>`
-    -- xg_for = SUM of xg this team scored across all our shot rows
-    -- xg_against from team_shot_aggregates which tracks shots faced
-    SELECT t.id AS team_id,
-           COALESCE(tsa.matches, 0)::int AS matches,
-           COALESCE((
-             SELECT SUM(xg)
-               FROM player_shot_history psh
-               JOIN players p ON p.id = psh.player_id
-              WHERE p.team_id = t.id
-           ), 0)::numeric AS xg_for,
-           COALESCE(tsa.xg_against, 0)::numeric AS xg_against
-      FROM teams t
-      LEFT JOIN team_shot_aggregates tsa ON tsa.team_id = t.id
-  `;
+export async function recomputeTeamRatings(cutoffGameweek?: number): Promise<void> {
+  // For walk-forward we re-derive team xg_for + xg_against from
+  // `player_shot_history` filtered by match date < the deadline for
+  // `cutoffGameweek`. The flat `team_shot_aggregates` table is a
+  // current-state snapshot and can't be GW-filtered, so we bypass it
+  // when a cutoff is set.
+  let cutoffDate: string | null = null;
+  if (cutoffGameweek != null) {
+    const dl = await sql<Array<{ deadline_time: Date | null }>>`
+      SELECT deadline_time FROM gameweeks WHERE id = ${cutoffGameweek}
+    `;
+    cutoffDate = dl[0]?.deadline_time
+      ? (dl[0].deadline_time as any).toISOString()
+      : null;
+  }
+
+  const rows = cutoffDate
+    // Cutoff-aware: derive xg_for + xg_against entirely from shot history
+    // filtered by match_date < cutoff. No reliance on the flat aggregate
+    // table (which reflects the END of the season, not the cutoff).
+    ? await sql<Array<{
+        team_id: number; matches: number; xg_for: number; xg_against: number;
+      }>>`
+        WITH shots AS (
+          SELECT p.team_id, psh.fixture_id, psh.match_date, psh.xg::float8 AS xg
+            FROM player_shot_history psh
+            JOIN players p ON p.id = psh.player_id
+           WHERE psh.match_date < ${cutoffDate}
+        ),
+        fx AS (
+          SELECT DISTINCT team_id, fixture_id, match_date FROM shots
+        )
+        SELECT t.id AS team_id,
+               COALESCE((
+                 SELECT COUNT(DISTINCT fixture_id)::int
+                   FROM fx WHERE fx.team_id = t.id
+               ), 0) AS matches,
+               COALESCE((
+                 SELECT SUM(xg)::numeric FROM shots WHERE shots.team_id = t.id
+               ), 0) AS xg_for,
+               COALESCE((
+                 SELECT SUM(xg)::numeric FROM shots
+                  WHERE shots.fixture_id IN (
+                    SELECT fixture_id FROM fx WHERE fx.team_id = t.id
+                  )
+                    AND shots.team_id != t.id
+               ), 0) AS xg_against
+          FROM teams t
+      `
+    : await sql<Array<{
+        team_id: number; matches: number; xg_for: number; xg_against: number;
+      }>>`
+        SELECT t.id AS team_id,
+               COALESCE(tsa.matches, 0)::int AS matches,
+               COALESCE((
+                 SELECT SUM(xg)
+                   FROM player_shot_history psh
+                   JOIN players p ON p.id = psh.player_id
+                  WHERE p.team_id = t.id
+               ), 0)::numeric AS xg_for,
+               COALESCE(tsa.xg_against, 0)::numeric AS xg_against
+          FROM teams t
+          LEFT JOIN team_shot_aggregates tsa ON tsa.team_id = t.id
+      `;
 
   // League average xG per match — used as the unit baseline.
   const totalMatches = rows.reduce((s, r) => s + Number(r.matches), 0);
