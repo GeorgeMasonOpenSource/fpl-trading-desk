@@ -42,6 +42,33 @@ async function main() {
     teamByName.set(t.name.toLowerCase(), t.id);
     teamByName.set(t.short_name.toLowerCase(), t.id);
   }
+
+  // Understat uses the long, "official" team names. FPL uses short ones —
+  // "Spurs" not "Tottenham", "Man City" not "Manchester City", etc. Without
+  // these aliases, six PL teams silently fail to match and their xg_for never
+  // gets the Understat unbiased totals (the entire point of the team-level
+  // ingest below). Map each Understat name to any FPL key we expect to find.
+  const UNDERSTAT_TEAM_ALIASES: Record<string, string[]> = {
+    'tottenham':              ['spurs', 'tot'],
+    'newcastle united':       ['newcastle', 'new'],
+    'manchester city':        ['man city', 'mci'],
+    'manchester united':      ['man utd', 'man united', 'mun'],
+    'wolverhampton wanderers': ['wolves', 'wol'],
+    'nottingham forest':      ["nott'm forest", 'nottm forest', 'forest', 'nfo'],
+    // Defensive — in case FPL flips naming mid-season
+    'brighton':               ['brighton', 'bha'],
+    'west ham':               ['west ham', 'whu'],
+  };
+  for (const [understatName, fplKeys] of Object.entries(UNDERSTAT_TEAM_ALIASES)) {
+    if (teamByName.has(understatName)) continue;  // already resolved
+    for (const k of fplKeys) {
+      const id = teamByName.get(k);
+      if (id !== undefined) {
+        teamByName.set(understatName, id);
+        break;
+      }
+    }
+  }
   const fplPlayers = await sql<Array<{
     id: number; web_name: string; first_name: string; second_name: string; team_id: number;
   }>>`
@@ -236,7 +263,12 @@ async function main() {
     `;
     teamRowsUpdated++;
   }
-  console.log(`→ updated team-level xG for ${teamRowsUpdated} teams (from Understat team API, no player mapping needed)`);
+  const expectedTeams = Object.keys(teamData).length;
+  const banner = teamRowsUpdated === expectedTeams ? '→' : '⚠';
+  console.log(`${banner} updated team-level xG for ${teamRowsUpdated}/${expectedTeams} teams (from Understat team API, no player mapping needed)`);
+  if (teamRowsUpdated < expectedTeams) {
+    console.log(`  ${expectedTeams - teamRowsUpdated} team(s) failed to match — add aliases in UNDERSTAT_TEAM_ALIASES.`);
+  }
 
   console.log(`done. ${inserted} new shot rows.`);
   await sql.end();

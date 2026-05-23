@@ -35,6 +35,20 @@ const PRIOR_WEIGHT_90S = 8;
 const MULT_CLAMP_LO = 0.7;
 const MULT_CLAMP_HI = 1.4;
 const MIN_MINUTES_FOR_PRIOR = 540;  // 6 full matches — below this we leave mult = 1.0
+// xG is noisy in small samples. A DEF with 2 goals on 0.6 xG looks like a
+// 3× finisher but the truth is variance. Require enough expected goals
+// before fitting goal_mult. Higher bar for DEF/GKP because their xG is
+// usually corner-tap-in lottery; MID/FWD see real shot volume.
+const MIN_XG_FOR_GOAL_PRIOR: Record<'GKP'|'DEF'|'MID'|'FWD', number> = {
+  GKP: 99,    // GKPs don't take shots — never fit a goal mult
+  DEF: 2.0,
+  MID: 1.5,
+  FWD: 2.0,
+};
+const MIN_XA_FOR_ASSIST_PRIOR = 1.5;
+// Bonus mult is the most data-hungry: bonus is granular (1/2/3 points per
+// match) and noisy. Require a season's worth of action.
+const MIN_BONUS_FOR_BONUS_PRIOR = 5;
 
 export async function recomputePlayerPriors(): Promise<{
   computed: number;
@@ -83,28 +97,46 @@ export async function recomputePlayerPriors(): Promise<{
     LEFT JOIN player_shot_aggregates psa ON psa.player_id = p.id
   `;
 
-  // Compute log-space residual per player vs the position median.
-  // Using the median (not mean) makes the prior robust to outliers.
-  const byPos: Record<string, Array<{ player_id: number; conv: number; bonus90: number; assistConv: number; mins: number }>> = {
-    GKP: [], DEF: [], MID: [], FWD: []
+  // Per-player accumulator. We store raw seasons-totals and decide
+  // PER-COMPONENT (goal / assist / bonus) whether the sample is large
+  // enough to fit a multiplier — if not, that component stays at 1.0.
+  // This stops a DEF with 2 goals on 0.6 xG from getting goal_mult=1.4.
+  type PlayerFit = {
+    player_id: number;
+    pos: 'GKP'|'DEF'|'MID'|'FWD';
+    mins: number;
+    expGoals: number;
+    expAssists: number;
+    actualGoals: number;
+    actualAssists: number;
+    seasonBonus: number;
+    conv: number;        // (goals+0.5)/(xg+0.5)
+    assistConv: number;
+    bonus90: number;
   };
+  const byPos: Record<'GKP'|'DEF'|'MID'|'FWD', PlayerFit[]> = { GKP: [], DEF: [], MID: [], FWD: [] };
+
   for (const r of rows) {
     if (r.season_minutes < MIN_MINUTES_FOR_PRIOR) continue;
-    const expectedGoals = r.understat_xg ?? r.season_xg;
-    const expectedAssists = r.season_xa;
-    if (expectedGoals < 0.5) continue;  // can't fit a multiplier without expected
-    const conv = (r.season_goals + 0.5) / (expectedGoals + 0.5);
-    const assistConv = expectedAssists > 0.5
-      ? (r.season_assists + 0.5) / (expectedAssists + 0.5)
+    const expGoals = r.understat_xg ?? r.season_xg;
+    const expAssists = r.season_xa;
+    const conv = (r.season_goals + 0.5) / (expGoals + 0.5);
+    const assistConv = expAssists > 0.5
+      ? (r.season_assists + 0.5) / (expAssists + 0.5)
       : 1.0;
     const bonus90 = (r.season_bonus * 90) / r.season_minutes;
     byPos[r.position].push({
-      player_id: r.player_id, conv, bonus90, assistConv, mins: r.season_minutes
+      player_id: r.player_id, pos: r.position, mins: r.season_minutes,
+      expGoals, expAssists, actualGoals: r.season_goals, actualAssists: r.season_assists,
+      seasonBonus: r.season_bonus, conv, assistConv, bonus90
     });
   }
 
-  // Position medians.
+  // Position medians — but ONLY from players who actually have enough sample
+  // to enter that component's fit. Otherwise the DEF "conv" median is
+  // dominated by 0.5/1.0 = 0.5 ratios and skews everything upward.
   const medianBy = (arr: number[]) => {
+    if (arr.length === 0) return 1;
     const sorted = arr.slice().sort((a, b) => a - b);
     return sorted[Math.floor(sorted.length / 2)] ?? 1;
   };
@@ -112,13 +144,14 @@ export async function recomputePlayerPriors(): Promise<{
   for (const pos of ['GKP', 'DEF', 'MID', 'FWD'] as const) {
     const players = byPos[pos];
     medians[pos] = {
-      conv:       medianBy(players.map(p => p.conv)),
-      bonus90:    medianBy(players.map(p => p.bonus90)),
-      assistConv: medianBy(players.map(p => p.assistConv))
+      conv:       medianBy(players.filter(p => p.expGoals    >= MIN_XG_FOR_GOAL_PRIOR[pos]).map(p => p.conv)),
+      assistConv: medianBy(players.filter(p => p.expAssists  >= MIN_XA_FOR_ASSIST_PRIOR).map(p => p.assistConv)),
+      bonus90:    medianBy(players.filter(p => p.seasonBonus >= MIN_BONUS_FOR_BONUS_PRIOR).map(p => p.bonus90))
     };
   }
 
-  // Fit + persist.
+  // Fit + persist. Each component independently checks its threshold;
+  // sub-threshold components stay at 1.0 (no signal, no nudge).
   const updates: Array<{ player_id: number; web_name: string; goal_mult: number; assist_mult: number; bonus_mult: number; sample90s: number; conf: number }> = [];
   const meta = new Map(rows.map(r => [r.player_id, r]));
 
@@ -127,17 +160,30 @@ export async function recomputePlayerPriors(): Promise<{
     for (const p of byPos[pos]) {
       const sample90s = p.mins / 90;
       const w = sample90s / (sample90s + PRIOR_WEIGHT_90S);
-      // log-space residual vs the position median
-      const goalLogResid   = Math.log(p.conv)        - Math.log(med.conv);
-      const assistLogResid = Math.log(p.assistConv)  - Math.log(med.assistConv);
-      const bonusLogResid  = med.bonus90 > 0
-        ? Math.log(Math.max(0.05, p.bonus90)) - Math.log(med.bonus90)
-        : 0;
-      const goalMult   = clamp(Math.exp(goalLogResid   * w), MULT_CLAMP_LO, MULT_CLAMP_HI);
-      const assistMult = clamp(Math.exp(assistLogResid * w), MULT_CLAMP_LO, MULT_CLAMP_HI);
-      const bonusMult  = clamp(Math.exp(bonusLogResid  * w), MULT_CLAMP_LO, MULT_CLAMP_HI);
-      const conf = Math.min(1, sample90s / 30);
 
+      // Goal mult — only if the player has enough expected goals to fit.
+      let goalMult = 1.0;
+      if (p.expGoals >= MIN_XG_FOR_GOAL_PRIOR[pos] && med.conv > 0) {
+        const goalLogResid = Math.log(p.conv) - Math.log(med.conv);
+        goalMult = clamp(Math.exp(goalLogResid * w), MULT_CLAMP_LO, MULT_CLAMP_HI);
+      }
+      // Assist mult — only if the player has enough expected assists.
+      let assistMult = 1.0;
+      if (p.expAssists >= MIN_XA_FOR_ASSIST_PRIOR && med.assistConv > 0) {
+        const assistLogResid = Math.log(p.assistConv) - Math.log(med.assistConv);
+        assistMult = clamp(Math.exp(assistLogResid * w), MULT_CLAMP_LO, MULT_CLAMP_HI);
+      }
+      // Bonus mult — needs a season's worth of bonus history.
+      let bonusMult = 1.0;
+      if (p.seasonBonus >= MIN_BONUS_FOR_BONUS_PRIOR && med.bonus90 > 0) {
+        const bonusLogResid = Math.log(Math.max(0.05, p.bonus90)) - Math.log(med.bonus90);
+        bonusMult = clamp(Math.exp(bonusLogResid * w), MULT_CLAMP_LO, MULT_CLAMP_HI);
+      }
+
+      // Skip persistence entirely if we have nothing meaningful to say.
+      if (goalMult === 1.0 && assistMult === 1.0 && bonusMult === 1.0) continue;
+
+      const conf = Math.min(1, sample90s / 30);
       updates.push({
         player_id: p.player_id,
         web_name:  meta.get(p.player_id)?.web_name ?? '',
