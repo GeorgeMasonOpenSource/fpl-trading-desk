@@ -143,6 +143,27 @@ export function CompareToOverlay({ reference }: CompareToOverlayProps) {
             </div>
           </div>
           <EvDecompositionBar delta={result.delta} perGw={result.perGw} />
+          {result.outComponents && result.inComponents && (
+            <XptsBreakdownTable
+              outName={result.outResolved.webName}
+              inName={result.inResolved.webName}
+              outComponents={result.outComponents}
+              inComponents={result.inComponents}
+              outInsight={result.outInsight}
+              inInsight={result.inInsight}
+              outExpectedMinutes={result.outExpectedMinutes}
+              inExpectedMinutes={result.inExpectedMinutes}
+              horizonGws={result.horizonGws ?? 3}
+            />
+          )}
+          {(result.outInsight || result.inInsight) && (
+            <TransferWhy
+              outName={result.outResolved.webName}
+              inName={result.inResolved.webName}
+              outInsight={result.outInsight}
+              inInsight={result.inInsight}
+            />
+          )}
         </div>
       )}
     </div>
