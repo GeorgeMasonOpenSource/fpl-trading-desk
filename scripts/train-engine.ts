@@ -94,13 +94,13 @@ async function main() {
     const wmeanPred = pairs.reduce((s, r) => s + weighted(r.gameweek_id) * r.predicted, 0) / W;
     const wmeanAct  = pairs.reduce((s, r) => s + weighted(r.gameweek_id) * r.actual, 0) / W;
     const rawMult = wmeanPred > 0 ? wmeanAct / wmeanPred : 1.0;
-    // Clamp [0.5, 2.5]. Bumped from 2.0 alongside the shrinkage softening
-    // in engine.ts (floor 0.70, ceiling 8). RMSE backtests showed even
-    // with player priors capped at 1.4, elites were under-predicted by
-    // ~6 xPts/GW. The new shrinkage now lets ~70% of the position multiplier
-    // through for top attackers, so the train fitter needs more headroom.
-    // Worst-case stack: 2.5 × 0.70 (shrunk) × 1.4 (player prior) = 2.45×.
-    const multiplier = Math.max(0.5, Math.min(2.5, rawMult));
+    // Clamp [0.5, 2.0]. The strict shrinkage in engine.ts (ceiling=4,
+    // floor=0) means elites barely receive any of the position multiplier
+    // anyway; bumping the cap further just over-amplifies the mid-tier
+    // attackers who DO benefit from the lift. Worst-case stack:
+    //   2.0 × 1.0 (no shrinkage at raw=0) × 1.4 (player prior) = 2.8×
+    //   2.0 × 0.0 (full shrinkage at raw=4) × 1.4 = 1.0×
+    const multiplier = Math.max(0.5, Math.min(2.0, rawMult));
     // High confidence: full season of weighted data.
     const confidence = Math.min(1, pairs.length / 1500);
     const rmse = Math.sqrt(pairs.reduce(

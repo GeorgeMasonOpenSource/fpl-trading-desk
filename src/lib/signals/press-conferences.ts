@@ -1,95 +1,111 @@
 /**
- * Press-conference / team-news engine — GW-FOCUSED.
+ * Press-conference / Team-news engine.
  *
- * Produces per-team blocks similar in shape to Fantasy Football Scout's
- * team-news page, but built deterministically from our own data sources:
+ * Goal: surface ONLY content that a manager actually addressed in their
+ * pre-match press conference (or that's verifiable from FPL bootstrap).
+ * Specifically excludes off-season transfers and rest-of-season loans —
+ * those clutter the page with players who are gone for the summer, not
+ * what the manager talked about on Friday.
  *
- *   • FPL bootstrap        — status, news, chance_of_playing_next_round
- *   • Minutes engine       — expected_minutes, start_prob, ninety_prob
- *   • teams.motivation     — derived in team-context.ts (table position +
- *                            stakes remaining)
- *   • transcript_signals   — verbatim quotes from FPL creator YouTube
- *                            videos in the last 48 hours, classified as
- *                            start / bench / injury per (player, video).
- *   • Yellow-card history  — cumulative YC counts to detect 5/10/15 bans
- *                            FPL hasn't yet flipped to status='s'.
+ * Sources, in priority order:
  *
- * Per team we expose:
+ *   1. FPL `players.news` filtered to PRESS-CONF-RELEVANT patterns:
+ *      • injury / knock / lack of match fitness / muscle / hamstring /
+ *        ankle / knee / illness
+ *      • "Suspended for the match against …" / "Suspended until …"
+ *      • "% chance of playing"
+ *      • "Expected back …" (for confirming injury timelines)
+ *      Explicit excludes:
+ *      • "has joined X permanently"  (off-season transfer)
+ *      • "has joined X on loan"      (off-season loan)
+ *      • "has departed the club"     (off-season exit)
+ *      • "On loan to …"              (off-season loan)
+ *      • "Signed by …"               (off-season exit)
  *
- *   • Fixture, motivation context
- *   • Predicted XI (11 players, legal formation)
- *   • Out:    status ∈ {i, s, u, n} OR hard-out news OR yc-ban
- *   • Doubts: status='d' OR chance_of_playing < 100 (with %)
- *   • Banned: ycSuspended OR status='s' (subset of "Out" but flagged
- *             separately because the user usually wants to see them)
- *   • Latest News paragraph: 2-4 sentences stitched from the freshest
- *     creator quotes + FPL flags + motivation + suspension counts.
- *     Quotes are paraphrased into our own phrasing then linked back to
- *     the source video at the timestamp.
+ *   2. Minutes engine — expected_minutes, start_prob, ninety_prob for
+ *      THIS GW. Drives the predicted-XI picker and rotation flagging.
  *
- * Plus a top-level Rotation Watchlist that ranks players globally by
- * how much their expected minutes for THIS GW are below their season
- * average — same lens as FPLReview's heavy-rotation flags.
+ *   3. Yellow-card history — cumulative count to detect 5/10/15 bans.
  *
- * Everything is GW-scoped (current/next finished=false) and quote-windowed
- * to the last 48 hours by default.
+ *   4. Creator transcript signals from the last 48h. The FPL ecosystem
+ *      doesn't give us direct manager-presser transcripts, but most
+ *      FPL pundit channels record post-presser previews that quote the
+ *      manager. We extract those by:
+ *      • Filtering raw_quote for the team's manager surname
+ *        (Pep / Arteta / Carrick / Slot / Iraola / Howe / …)
+ *      • Surfacing those quotes as "Manager said (via {channel})"
+ *      Everything else (generic captain debates, team-shuffle ideas) is
+ *      DEMOTED to a separate "Pundit chatter" section so the user can
+ *      tell signal from speculation.
+ *
+ *   5. teams.motivation_score — derived from PL position + stakes (in
+ *      team-context.ts). Drives the "Dead rubber / Top-4 race / etc."
+ *      label.
+ *
+ * Output: one TeamPressSummary per PL team, with predicted XI, Out /
+ * Doubts / Banned columns, a narrative built from the manager quotes
+ * (when we have them) + active flags, and the verbatim source quotes
+ * linked to source videos so the user can verify.
  */
 
 import { sql } from '@/lib/db/client';
 
 // ─── public types ─────────────────────────────────────────────────────────────
 
-export type Position        = 'GKP' | 'DEF' | 'MID' | 'FWD';
-export type Status          = 'a' | 'd' | 'i' | 'n' | 's' | 'u';
-export type StarterTier     = 'nailed' | 'likely' | 'rotation' | 'doubt' | 'out';
+export type Position = 'GKP' | 'DEF' | 'MID' | 'FWD';
+export type Status   = 'a' | 'd' | 'i' | 'n' | 's' | 'u';
+export type StarterTier = 'nailed' | 'likely' | 'rotation' | 'doubt' | 'out';
 export type RotationSeverity = 'severe' | 'moderate' | 'mild' | 'none';
 
 export interface PressQuote {
   channelName: string;
-  videoTitle:  string;
-  rawQuote:    string;
+  videoTitle: string;
+  rawQuote: string;
   timestampSec: number;
-  videoUrl:    string;
+  videoUrl: string;
   publishedAt: string;
-  signalKind:  'start' | 'bench' | 'injury';
-  confidence:  number;
+  signalKind: 'start' | 'bench' | 'injury';
+  confidence: number;
+  /** Set when the quote text contains the team's manager surname. */
+  mentionsManager: boolean;
 }
 
 export interface PressPlayerLine {
-  playerId:  number;
-  webName:   string;
-  position:  Position;
-  cost:      number;                     // tenths
-  status:    Status;
+  playerId: number;
+  webName: string;
+  position: Position;
+  cost: number;
+  status: Status;
   chanceOfPlayingNext: number | null;
-  news:      string | null;
-  tier:      StarterTier;
-  expectedMinutes:      number | null;
-  startProb:            number | null;
-  seasonAvgMinsPerApp:  number;
-  minsDeltaVsSeason:    number;
-  ycSuspended:          boolean;
-  reasons:    string[];
+  news: string | null;       // ONLY if press-conf relevant
+  rawNews: string | null;    // full FPL news (we keep it for debugging)
+  tier: StarterTier;
+  expectedMinutes: number | null;
+  startProb: number | null;
+  seasonAvgMinsPerApp: number;
+  minsDeltaVsSeason: number;
+  ycSuspended: boolean;
+  reasons: string[];
   freshQuotes: PressQuote[];
 }
 
 export interface RotationCandidate {
   playerId: number;
-  webName:  string;
+  webName: string;
   position: Position;
-  cost:     number;
+  cost: number;
   teamShort: string;
-  teamName:  string;
+  teamName: string;
   expectedMinutes: number;
-  startProb:        number;
-  ninetyProb:       number;
+  startProb: number;
+  ninetyProb: number;
   seasonAvgMinsPerApp: number;
-  seasonStartRate:     number;
-  minsDeltaVsSeason:   number;
-  severity:  RotationSeverity;
-  status:    Status;
+  seasonStartRate: number;
+  minsDeltaVsSeason: number;
+  severity: RotationSeverity;
+  status: Status;
   chanceOfPlayingNext: number | null;
-  news:      string | null;
+  news: string | null;
   ycSuspended: boolean;
   reasons: string[];
   freshQuotes: PressQuote[];
@@ -98,41 +114,158 @@ export interface RotationCandidate {
 
 export interface PredictedXI {
   formation: { def: number; mid: number; fwd: number };
-  starters:  PressPlayerLine[];     // 11 players, GKP first
-  bench:     PressPlayerLine[];     // up to 5 (we don't know the FPL squad)
+  starters: PressPlayerLine[];
+  bench:    PressPlayerLine[];
 }
 
 export interface TeamPressSummary {
-  teamId:    number;
+  teamId: number;
   teamShort: string;
-  teamName:  string;
+  teamName: string;
+  managerName: string | null;
   // Stakes & fixture context
   tablePosition:   number | null;
-  motivation:      number | null;    // 0..1
-  motivationLabel: string;           // human label
-  fixtureSummary:  string;           // "vs Burnley (H)" / "at City (A)"
+  motivation:      number | null;
+  motivationLabel: string;
+  fixtureSummary:  string;
   isHome:          boolean;
   // Predicted XI
   predictedXI: PredictedXI;
-  // Status buckets
-  out:     PressPlayerLine[];        // any status i/s/u/n OR hard-out news OR yc-ban
-  doubts:  PressPlayerLine[];        // status='d' OR chance < 100
-  banned:  PressPlayerLine[];        // suspensions specifically
-  // The narrative
-  latestNews:   string;              // synthesised paragraph (2-4 sentences)
-  newsUpdatedAt: string | null;      // newest published_at across quotes used
-  teamLevelQuotes: PressQuote[];     // full quote list for the verify-it panel
-  // 1-line scan-friendly takeaway
-  headline: string;
+  // Status buckets (active-squad only)
+  out:    PressPlayerLine[];
+  doubts: PressPlayerLine[];
+  banned: PressPlayerLine[];
+  // Quotes split by whether they mention the manager
+  managerQuotes: PressQuote[];    // quotes that explicitly cite the manager
+  punditQuotes:  PressQuote[];    // everything else (creator analysis / debate)
+  // Synthesised paragraph (2-5 sentences)
+  latestNews:    string;
+  newsUpdatedAt: string | null;
+  headline:      string;
+}
+
+// ─── managers ─────────────────────────────────────────────────────────────────
+
+/**
+ * Surnames / common short references for each PL team's manager as of
+ * GW38 25/26. Used to detect when a creator quote is reporting what
+ * the manager actually said (vs the creator's own opinion). Manually
+ * curated; update as managers change.
+ *
+ * Add Pep + first names where short-form is heavily used in transcripts.
+ */
+const MANAGERS_BY_TEAM: Record<string, { manager: string; aliases: string[] }> = {
+  ARS: { manager: 'Mikel Arteta',     aliases: ['Arteta'] },
+  AVL: { manager: 'Unai Emery',       aliases: ['Emery'] },
+  BOU: { manager: 'Andoni Iraola',    aliases: ['Iraola'] },
+  BRE: { manager: 'Keith Andrews',    aliases: ['Andrews'] },
+  BHA: { manager: 'Fabian Hürzeler',  aliases: ['Hurzeler', 'Hürzeler'] },
+  BUR: { manager: 'Mike Jackson',     aliases: ['Jackson'] },
+  CHE: { manager: 'Enzo Maresca',     aliases: ['Maresca', 'McFarlane'] },
+  CRY: { manager: 'Oliver Glasner',   aliases: ['Glasner'] },
+  EVE: { manager: 'David Moyes',      aliases: ['Moyes'] },
+  FUL: { manager: 'Marco Silva',      aliases: ['Silva'] },
+  LEE: { manager: 'Daniel Farke',     aliases: ['Farke'] },
+  LIV: { manager: 'Arne Slot',        aliases: ['Slot'] },
+  MCI: { manager: 'Pep Guardiola',    aliases: ['Guardiola', 'Pep'] },
+  MUN: { manager: 'Michael Carrick',  aliases: ['Carrick'] },
+  NEW: { manager: 'Eddie Howe',       aliases: ['Howe'] },
+  NFO: { manager: 'Vítor Pereira',    aliases: ['Pereira'] },
+  SUN: { manager: 'Régis Le Bris',    aliases: ['Le Bris'] },
+  TOT: { manager: 'Roberto De Zerbi', aliases: ['De Zerbi'] },
+  WHU: { manager: 'Nuno Espírito Santo', aliases: ['Nuno', 'Espirito Santo', 'Espírito Santo'] },
+  WOL: { manager: 'Rob Edwards',      aliases: ['Edwards'] },
+};
+
+function managerMatchesQuote(quote: string, teamShort: string): boolean {
+  const m = MANAGERS_BY_TEAM[teamShort];
+  if (!m) return false;
+  const lc = quote.toLowerCase();
+  return m.aliases.some(a => lc.includes(a.toLowerCase()));
+}
+
+// ─── news filtering ───────────────────────────────────────────────────────────
+
+/**
+ * Is this `news` field text relevant to THIS week's press conference?
+ * Off-season transfers and rest-of-season loans are EXCLUDED — they
+ * tell us nothing about whether a player will feature on Sunday.
+ */
+function isPressConfRelevantNews(news: string | null): boolean {
+  if (!news) return false;
+  const s = news.toLowerCase();
+  // Explicit excludes — off-season housekeeping.
+  if (
+    /has joined .* permanently/.test(s) ||
+    /\bhas joined .* on loan\b/.test(s) ||
+    /has departed the club/.test(s) ||
+    /\bon loan to\b/.test(s) ||
+    /signed by /.test(s) ||
+    /season-long loan/.test(s)
+  ) return false;
+  // Includes — current-week press-conf signal.
+  return (
+    /\binjury\b|\bknock\b|\billness\b|\bfatigue\b|match fitness/.test(s) ||
+    /\bhamstring|knee|ankle|foot|calf|muscle|shoulder|back|hip|achilles\b/.test(s) ||
+    /chance of playing/.test(s) ||
+    /\bsuspended\b/.test(s) ||
+    /expected back/.test(s) ||
+    /not available for the match/.test(s) ||
+    /made unavailable for selection/.test(s)
+  );
+}
+
+/**
+ * Sub-class for "hard out THIS WEEK" — drives the engine's news-gate
+ * and the page's Out column. Only fires on definitively-out news, not
+ * on "knock 75% chance" or "expected back early next month".
+ */
+export function isHardOutByNews(news: string | null): boolean {
+  if (!news) return false;
+  const s = news.toLowerCase();
+  // Same exclusions as above — never count "joined permanently" as
+  // hard-out for THIS GW because the player has already left.
+  if (
+    /has joined .* permanently/.test(s) ||
+    /\bhas joined .* on loan\b/.test(s) ||
+    /has departed the club/.test(s) ||
+    /\bon loan to\b/.test(s) ||
+    /signed by /.test(s)
+  ) return false;
+  return (
+    /\bsuspended\b/.test(s) ||
+    /not available for the match/.test(s) ||
+    /made unavailable for selection/.test(s)
+  );
+}
+
+/**
+ * Should this player be SHOWN on the press-conf page at all? Drops
+ * players who already left the club for the summer (status='u' with
+ * an off-season news string), regardless of season minutes. Keeps
+ * everyone who could plausibly feature on Sunday.
+ */
+function isActiveSquadMember(p: ProjectionRow): boolean {
+  // Already left the club — no point showing on a GW preview.
+  const news = (p.news ?? '').toLowerCase();
+  if (
+    /has joined .* permanently/.test(news) ||
+    /\bhas joined .* on loan\b/.test(news) ||
+    /has departed the club/.test(news) ||
+    /\bon loan to\b/.test(news) ||
+    /signed by /.test(news) ||
+    /season-long loan/.test(news)
+  ) return false;
+  // Status 'u' WITHOUT a "joined elsewhere" news string can still be
+  // relevant (e.g. legally unavailable but on the roster). Rare; we
+  // keep them and let the news string speak.
+  // Drop fringe players who haven't played all season AND aren't flagged.
+  if (p.season_minutes === 0 && p.status === 'a') return false;
+  return true;
 }
 
 // ─── public API ───────────────────────────────────────────────────────────────
 
-/**
- * Rotation Watchlist for the upcoming GW. Ranks players globally by
- * impact (severity × cost), filters out anyone whose expected minutes
- * are within 5 of their season average and who has no other flag.
- */
 export async function buildRotationWatchlist(
   gameweekId: number,
   opts: { withinHours?: number; limit?: number } = {}
@@ -140,69 +273,59 @@ export async function buildRotationWatchlist(
   const withinHours = opts.withinHours ?? 48;
   const limit       = opts.limit       ?? 25;
 
-  const players = await loadPlayerProjections(gameweekId);
+  const players = (await loadPlayerProjections(gameweekId)).filter(isActiveSquadMember);
   if (players.length === 0) return [];
-  const ycSet = await loadYcSuspended(players.map(p => p.id));
+  const ycSet          = await loadYcSuspended(players.map(p => p.id));
   const quotesByPlayer = await loadFreshQuotes(players.map(p => p.id), withinHours);
 
-  const candidates: RotationCandidate[] = [];
+  const out: RotationCandidate[] = [];
   for (const p of players) {
-    if (p.appearances < 8) continue;            // need a season anchor
+    if (p.appearances < 8) continue;
     const seasonAvg = p.season_avg_mins_per_app;
-    const expected  = p.expected_minutes;
-    const delta     = expected - seasonAvg;
-    const yc = ycSet.has(p.id);
+    const delta = p.expected_minutes - seasonAvg;
     const cop = p.chance_of_playing_next_round;
-    if (
-      delta >= -5 &&
-      p.status === 'a' &&
-      (cop ?? 100) >= 100 &&
-      !yc
-    ) continue;
+    const yc = ycSet.has(p.id);
+    if (delta >= -5 && p.status === 'a' && (cop ?? 100) >= 100 && !yc) continue;
     const severity = classifySeverity(delta, p.status, cop, p.news, yc);
     if (severity === 'none') continue;
     const reasons = buildReasonsForPlayer(p, yc);
-    const freshQuotes = quotesByPlayer.get(p.id) ?? [];
-    for (const q of freshQuotes.slice(0, 2)) {
+    const fresh = quotesByPlayer.get(p.id) ?? [];
+    // Tag manager-mentioning quotes — feed back into reasons.
+    const quotes = fresh.map(q => ({
+      ...q,
+      mentionsManager: managerMatchesQuote(q.rawQuote, p.team_short),
+    }));
+    for (const q of quotes.slice(0, 2)) {
       const tag =
         q.signalKind === 'start' ? '✓ start' :
-        q.signalKind === 'bench' ? '✗ bench risk' :
-                                    '⚕ injury concern';
-      reasons.push(`${q.channelName} (${tag}): "${truncate(q.rawQuote, 110)}"`);
+        q.signalKind === 'bench' ? '✗ bench' :
+                                    '⚕ injury';
+      const prefix = q.mentionsManager ? `${q.channelName} (manager quote)` : q.channelName;
+      reasons.push(`${prefix} ${tag}: "${truncate(q.rawQuote, 110)}"`);
     }
     const sevWeight = severity === 'severe' ? 4 : severity === 'moderate' ? 2 : 1;
     const impactScore = sevWeight * Math.max(1, p.now_cost / 10);
-    candidates.push({
-      playerId: p.id,
-      webName: p.web_name,
-      position: p.position,
-      cost: p.now_cost,
-      teamShort: p.team_short,
-      teamName: p.team_name,
-      expectedMinutes: expected,
-      startProb: p.start_prob,
-      ninetyProb: p.ninety_prob,
+    out.push({
+      playerId: p.id, webName: p.web_name, position: p.position, cost: p.now_cost,
+      teamShort: p.team_short, teamName: p.team_name,
+      expectedMinutes: p.expected_minutes, startProb: p.start_prob, ninetyProb: p.ninety_prob,
       seasonAvgMinsPerApp: seasonAvg,
-      seasonStartRate: p.season_starts > 0 && p.team_games > 0
-        ? p.season_starts / p.team_games : 0,
+      seasonStartRate: p.season_starts > 0 && p.team_games > 0 ? p.season_starts / p.team_games : 0,
       minsDeltaVsSeason: delta,
       severity,
       status: p.status,
       chanceOfPlayingNext: cop,
-      news: p.news,
+      news: isPressConfRelevantNews(p.news) ? p.news : null,
       ycSuspended: yc,
       reasons,
-      freshQuotes,
+      freshQuotes: quotes,
       impactScore,
     });
   }
-  candidates.sort((a, b) => b.impactScore - a.impactScore);
-  return candidates.slice(0, limit);
+  out.sort((a, b) => b.impactScore - a.impactScore);
+  return out.slice(0, limit);
 }
 
-/**
- * Per-team team-news cards. Quotes constrained to last 48h by default.
- */
 export async function buildPressConferenceSummary(
   gameweekId: number,
   opts: { withinHours?: number } = {}
@@ -222,8 +345,7 @@ export async function buildPressConferenceSummary(
 
   type FixtureRow = {
     team_h: number; team_a: number;
-    h_short: string; a_short: string;
-    h_name:  string; a_name:  string;
+    h_short: string; a_short: string; h_name: string; a_name: string;
   };
   const fixtures = await sql<FixtureRow[]>`
     SELECT f.team_h, f.team_a,
@@ -241,88 +363,103 @@ export async function buildPressConferenceSummary(
     fixtureByTeam.set(f.team_a, { opp: f.h_short, oppName: f.h_name, isHome: false });
   }
 
-  const projRows = await loadPlayerProjections(gameweekId);
-  const ycSet    = await loadYcSuspended(projRows.map(p => p.id));
-  const projByTeam = new Map<number, ProjectionRow[]>();
+  const allProjRows = await loadPlayerProjections(gameweekId);
+  const projRows    = allProjRows.filter(isActiveSquadMember);
+  const ycSet       = await loadYcSuspended(projRows.map(p => p.id));
+  const projByTeam  = new Map<number, ProjectionRow[]>();
   for (const p of projRows) {
     if (!projByTeam.has(p.team_id)) projByTeam.set(p.team_id, []);
     projByTeam.get(p.team_id)!.push(p);
   }
-  const quotesByPlayer = await loadFreshQuotes(projRows.map(p => p.id), withinHours);
+  const rawQuotesByPlayer = await loadFreshQuotes(projRows.map(p => p.id), withinHours);
 
   const out: TeamPressSummary[] = [];
   for (const t of teams) {
-    const fx = fixtureByTeam.get(t.id);
-    const ps = (projByTeam.get(t.id) ?? [])
-      // Drop deep-fringe players — too noisy.
-      .filter(p =>
-        p.season_minutes > 200 ||
-        p.status !== 'a' ||
-        p.chance_of_playing_next_round !== null
-      );
+    const ps = projByTeam.get(t.id) ?? [];
+    const managerInfo = MANAGERS_BY_TEAM[t.short_name] ?? null;
+    const managerName = managerInfo?.manager ?? null;
+
+    // Quotes tagged with mentionsManager + carried per player.
+    const tagQuote = (q: PressQuote): PressQuote => ({
+      ...q,
+      mentionsManager: managerMatchesQuote(q.rawQuote, t.short_name),
+    });
 
     const lines: PressPlayerLine[] = ps.map(p => {
       const yc = ycSet.has(p.id);
-      return buildPlayerLine(p, quotesByPlayer.get(p.id) ?? [], yc);
+      const quotes = (rawQuotesByPlayer.get(p.id) ?? []).map(tagQuote);
+      return buildPlayerLine(p, quotes, yc);
     });
 
-    // Predicted XI from the engine (legal 4-4-2-ish formation).
+    // Predicted XI from the engine.
     const predictedXI = pickPredictedXI(lines);
 
-    // Status buckets.
-    const banned = lines.filter(l => l.ycSuspended || l.status === 's');
-    const out_   = lines.filter(l =>
+    // Active flags. Banned = explicit suspension. Out = hard-out by news OR
+    // status i/u/n. Doubts = status='d' or chance<100, not already out/banned.
+    const banned = lines.filter(l => l.ycSuspended ||
+      l.status === 's' ||
+      (l.news && /\bsuspended\b/.test(l.news.toLowerCase()))
+    );
+    const out_ = lines.filter(l =>
       l.tier === 'out' && !banned.some(b => b.playerId === l.playerId)
     );
     const doubts = lines.filter(l =>
       (l.status === 'd' ||
-        (l.chanceOfPlayingNext !== null && l.chanceOfPlayingNext < 100)
+       (l.chanceOfPlayingNext !== null && l.chanceOfPlayingNext < 100)
       ) &&
       l.tier !== 'out' &&
       !banned.some(b => b.playerId === l.playerId)
     );
 
-    // Team-level quote pool — flatten + dedupe by video_id + signal_kind.
+    // Aggregate team-level quote list, deduped, sorted by freshness.
     const allQuotes = lines.flatMap(l => l.freshQuotes);
     const seen = new Set<string>();
-    const teamLevelQuotes: PressQuote[] = [];
+    const dedupedAll: PressQuote[] = [];
     for (const q of allQuotes.sort((a, b) => b.publishedAt.localeCompare(a.publishedAt))) {
-      const key = `${q.videoUrl.split('?')[0]}::${q.signalKind}`;
+      const key = `${q.videoUrl.split('?')[0]}::${q.signalKind}::${q.rawQuote.slice(0, 40)}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      teamLevelQuotes.push(q);
+      dedupedAll.push(q);
     }
+    // Split: quotes that mention the manager vs everything else.
+    const managerQuotes = dedupedAll.filter(q => q.mentionsManager).slice(0, 6);
+    const punditQuotes  = dedupedAll.filter(q => !q.mentionsManager).slice(0, 6);
 
-    // Narrative — stitched from creator quotes + flags + motivation.
     const motivation = t.motivation_score == null ? null : Number(t.motivation_score);
     const motivationLabel = describeMotivation(motivation, t.table_position);
+    const fixtureSummary = fixtureByTeam.get(t.id)
+      ? (fixtureByTeam.get(t.id)!.isHome
+          ? `vs ${fixtureByTeam.get(t.id)!.opp} (H)`
+          : `at ${fixtureByTeam.get(t.id)!.opp} (A)`)
+      : 'No fixture';
+
     const narrative = synthesiseLatestNews({
       teamShort: t.short_name,
-      fixture: fx,
+      managerName,
+      fixture: fixtureByTeam.get(t.id),
       motivation,
       motivationLabel,
-      out: out_,
+      out:    out_,
       doubts,
       banned,
       predictedXI,
-      teamQuotes: teamLevelQuotes.slice(0, 6),
+      managerQuotes,
+      punditQuotes,
     });
 
-    const fixtureSummary = fx
-      ? (fx.isHome ? `vs ${fx.opp} (H)` : `at ${fx.opp} (A)`)
-      : 'No fixture';
+    const newsUpdatedAt = dedupedAll[0]?.publishedAt ?? null;
 
-    const newsUpdatedAt = teamLevelQuotes[0]?.publishedAt ?? null;
-
+    // Headline: most actionable single line.
     let headline = '';
     if (banned.length > 0 && out_.length > 0) {
-      headline = `Banned: ${banned.map(b => b.webName).join(', ')} · Out: ${out_.map(b => b.webName).slice(0,3).join(', ')}`;
+      headline = `Banned: ${listNamesFlat(banned)} · Out: ${listNamesFlat(out_, 3)}`;
     } else if (banned.length > 0) {
-      headline = `Banned: ${banned.map(b => b.webName).join(', ')}`;
+      headline = `Banned: ${listNamesFlat(banned)}`;
     } else if (out_.length > 0) {
-      headline = `Out: ${out_.slice(0,3).map(b => b.webName).join(', ')}`;
+      headline = `Out: ${listNamesFlat(out_, 3)}`;
     } else if (doubts.length > 0) {
-      headline = `Doubts: ${doubts.slice(0,3).map(b => `${b.webName} ${b.chanceOfPlayingNext ?? '?'}%`).join(', ')}`;
+      headline = `Doubts: ${doubts.slice(0,3).map(d =>
+        `${d.webName} ${d.chanceOfPlayingNext ?? '?'}%`).join(', ')}`;
     } else if (motivation !== null && motivation < 0.4) {
       headline = `${motivationLabel} — rotation possible`;
     } else {
@@ -330,28 +467,21 @@ export async function buildPressConferenceSummary(
     }
 
     out.push({
-      teamId: t.id,
-      teamShort: t.short_name,
-      teamName: t.name,
+      teamId: t.id, teamShort: t.short_name, teamName: t.name, managerName,
       tablePosition: t.table_position,
-      motivation,
-      motivationLabel,
-      fixtureSummary,
-      isHome: fx?.isHome ?? false,
+      motivation, motivationLabel,
+      fixtureSummary, isHome: fixtureByTeam.get(t.id)?.isHome ?? false,
       predictedXI,
-      out: out_,
-      doubts,
-      banned,
-      latestNews: narrative,
-      newsUpdatedAt,
-      teamLevelQuotes,
+      out: out_, doubts, banned,
+      managerQuotes, punditQuotes,
+      latestNews: narrative, newsUpdatedAt,
       headline,
     });
   }
   return out;
 }
 
-// ─── internals: SQL ───────────────────────────────────────────────────────────
+// ─── data loaders ─────────────────────────────────────────────────────────────
 
 type ProjectionRow = {
   id: number; team_id: number; team_short: string; team_name: string;
@@ -387,16 +517,16 @@ async function loadPlayerProjections(gameweekId: number): Promise<ProjectionRow[
            t.short_name AS team_short, t.name AS team_name,
            p.web_name, p.position, p.now_cost, p.status,
            p.chance_of_playing_next_round, p.news,
-           COALESCE(mp.expected_minutes, 0)::float        AS expected_minutes,
-           COALESCE(mp.start_prob,        0)::float        AS start_prob,
-           COALESCE(mp.ninety_prob,       0)::float        AS ninety_prob,
+           COALESCE(mp.expected_minutes, 0)::float AS expected_minutes,
+           COALESCE(mp.start_prob,        0)::float AS start_prob,
+           COALESCE(mp.ninety_prob,       0)::float AS ninety_prob,
            p.season_minutes, p.season_starts,
            CASE WHEN COALESCE(a.appearances, 0) > 0
                 THEN COALESCE(a.total_mins, p.season_minutes) / a.appearances
                 ELSE COALESCE(p.season_minutes::float / NULLIF(p.season_starts, 0), 0)
-           END::float                                       AS season_avg_mins_per_app,
-           COALESCE(a.appearances, 0)                       AS appearances,
-           COALESCE(tg.games, 1)                            AS team_games
+           END::float AS season_avg_mins_per_app,
+           COALESCE(a.appearances, 0) AS appearances,
+           COALESCE(tg.games, 1) AS team_games
     FROM players p
     JOIN teams t ON t.id = p.team_id
     LEFT JOIN apps a ON a.player_id = p.id
@@ -412,11 +542,6 @@ async function loadPlayerProjections(gameweekId: number): Promise<ProjectionRow[
   `;
 }
 
-/**
- * Yellow-card-suspended set — anyone whose cumulative YC count crossed
- * a 5/10/15 threshold in the LAST FINISHED GW. Mirrors the detector
- * inside src/lib/minutes/engine.ts.
- */
 async function loadYcSuspended(playerIds: number[]): Promise<Set<number>> {
   if (playerIds.length === 0) return new Set();
   const rows = await sql<Array<{ player_id: number; cum: number; before_last: number }>>`
@@ -436,8 +561,7 @@ async function loadYcSuspended(playerIds: number[]): Promise<Set<number>> {
   `;
   const out = new Set<number>();
   for (const r of rows) {
-    const before = r.before_last;
-    const total  = r.cum;
+    const before = r.before_last; const total = r.cum;
     if ((before < 5 && total >= 5) ||
         (before < 10 && total >= 10) ||
         (before < 15 && total >= 15)) {
@@ -477,14 +601,11 @@ async function loadFreshQuotes(
   for (const r of rows) {
     const url = r.video_url + (r.video_url.includes('?') ? '&' : '?') + `t=${r.timestamp_sec}`;
     const q: PressQuote = {
-      channelName: r.channel_name,
-      videoTitle:  r.video_title,
-      rawQuote:    r.raw_quote,
-      timestampSec: r.timestamp_sec,
-      videoUrl:    url,
-      publishedAt: r.published_at,
-      signalKind:  r.signal_kind,
-      confidence:  r.confidence,
+      channelName: r.channel_name, videoTitle: r.video_title,
+      rawQuote: r.raw_quote, timestampSec: r.timestamp_sec,
+      videoUrl: url, publishedAt: r.published_at,
+      signalKind: r.signal_kind, confidence: r.confidence,
+      mentionsManager: false,    // set later when we know the team
     };
     if (!m.has(r.player_id)) m.set(r.player_id, []);
     m.get(r.player_id)!.push(q);
@@ -492,7 +613,7 @@ async function loadFreshQuotes(
   return m;
 }
 
-// ─── internals: classification ────────────────────────────────────────────────
+// ─── classification ───────────────────────────────────────────────────────────
 
 function buildPlayerLine(p: ProjectionRow, quotes: PressQuote[], yc: boolean): PressPlayerLine {
   const seasonAvg = p.season_avg_mins_per_app;
@@ -505,7 +626,8 @@ function buildPlayerLine(p: ProjectionRow, quotes: PressQuote[], yc: boolean): P
     cost: p.now_cost,
     status: p.status,
     chanceOfPlayingNext: p.chance_of_playing_next_round,
-    news: p.news,
+    news: isPressConfRelevantNews(p.news) ? p.news : null,
+    rawNews: p.news,
     tier,
     expectedMinutes: p.expected_minutes,
     startProb: p.start_prob,
@@ -520,7 +642,12 @@ function buildPlayerLine(p: ProjectionRow, quotes: PressQuote[], yc: boolean): P
 function classifyTier(p: ProjectionRow, delta: number, yc: boolean): StarterTier {
   if (yc) return 'out';
   if (isHardOutByNews(p.news)) return 'out';
-  if (p.status === 'i' || p.status === 's' || p.status === 'u' || p.status === 'n') return 'out';
+  if (p.status === 'i' || p.status === 's') return 'out';
+  // status='u' alone shouldn't mean out unless the player is clearly gone
+  // (handled by isActiveSquadMember). Treat 'u' here as out anyway since
+  // they aren't expected to feature.
+  if (p.status === 'u') return 'out';
+  if (p.status === 'n') return 'out';
   const cop = p.chance_of_playing_next_round;
   if (p.status === 'd' && (cop ?? 50) <= 50) return 'out';
   if (cop !== null && cop < 75) return 'doubt';
@@ -549,22 +676,21 @@ function buildReasonsForPlayer(p: ProjectionRow, yc: boolean): string[] {
   const reasons: string[] = [];
   const seasonAvg = p.season_avg_mins_per_app;
   const delta = p.expected_minutes - seasonAvg;
+  const pressRelevantNews = isPressConfRelevantNews(p.news) ? p.news : null;
 
   if (yc) reasons.push('Yellow-card threshold reached last GW — 1-match ban');
   if (isHardOutByNews(p.news)) {
     reasons.push(`Ruled out: ${truncate(p.news ?? '', 90)}`);
   } else if (p.status === 'i') {
-    reasons.push(`FPL injured${p.news ? ` — ${truncate(p.news, 80)}` : ''}`);
+    reasons.push(`FPL injured${pressRelevantNews ? ` — ${truncate(pressRelevantNews, 80)}` : ''}`);
   } else if (p.status === 's') {
-    reasons.push(`FPL suspended${p.news ? ` — ${truncate(p.news, 80)}` : ''}`);
-  } else if (p.status === 'u') {
-    reasons.push(`Unavailable / no longer at club`);
+    reasons.push(`FPL suspended${pressRelevantNews ? ` — ${truncate(pressRelevantNews, 80)}` : ''}`);
   } else if (p.status === 'n') {
-    reasons.push(`Not available for this match${p.news ? ` — ${truncate(p.news, 80)}` : ''}`);
+    reasons.push(`Not available for this match${pressRelevantNews ? ` — ${truncate(pressRelevantNews, 80)}` : ''}`);
   } else if (p.status === 'd' && p.chance_of_playing_next_round != null) {
-    reasons.push(`FPL doubt — ${p.chance_of_playing_next_round}% chance${p.news ? ` (${truncate(p.news, 60)})` : ''}`);
+    reasons.push(`FPL doubt — ${p.chance_of_playing_next_round}% chance${pressRelevantNews ? ` (${truncate(pressRelevantNews, 60)})` : ''}`);
   } else if (p.chance_of_playing_next_round != null && p.chance_of_playing_next_round < 100) {
-    reasons.push(`FPL chance ${p.chance_of_playing_next_round}% (yellow flag despite status='a')`);
+    reasons.push(`FPL chance ${p.chance_of_playing_next_round}% (yellow flag)`);
   }
 
   if (delta <= -10 && seasonAvg > 60) {
@@ -572,7 +698,6 @@ function buildReasonsForPlayer(p: ProjectionRow, yc: boolean): string[] {
   } else if (p.expected_minutes < 30 && seasonAvg > 50) {
     reasons.push(`Bench/cameo likely (${Math.round(p.expected_minutes)} mins expected)`);
   }
-
   return reasons;
 }
 
@@ -586,11 +711,9 @@ function describeMotivation(motivation: number | null, position: number | null):
   return 'Dead rubber — expect rotation';
 }
 
-// ─── internals: predicted XI ──────────────────────────────────────────────────
+// ─── predicted XI ─────────────────────────────────────────────────────────────
 
 function pickPredictedXI(lines: PressPlayerLine[]): PredictedXI {
-  // Available players sorted by start probability (with confirmed-lineup
-  // lock priority via start_prob >= 0.99) then expected minutes.
   const available = lines
     .filter(l => l.tier !== 'out')
     .slice()
@@ -604,140 +727,128 @@ function pickPredictedXI(lines: PressPlayerLine[]): PredictedXI {
       return (b.startProb ?? 0) - (a.startProb ?? 0);
     });
 
-  const gk  = available.find(p => p.position === 'GKP');
-  const out: PressPlayerLine[] = [];
-  if (gk) out.push(gk);
+  const gk = available.find(p => p.position === 'GKP');
+  const starters: PressPlayerLine[] = [];
+  if (gk) starters.push(gk);
 
-  // Greedy fill of 10 outfielders respecting min/max constraints.
   const counts = { DEF: 0, MID: 0, FWD: 0 };
-  const min = { DEF: 3, MID: 2, FWD: 1 };
   const max = { DEF: 5, MID: 5, FWD: 3 };
   const minimaQueue: Position[] = ['DEF','DEF','DEF','MID','MID','FWD'];
 
-  // Pass 1: fill minima.
   for (const need of minimaQueue) {
     const pick = available.find(p =>
-      p.position === need &&
-      !out.includes(p) &&
+      p.position === need && !starters.includes(p) &&
       counts[need as 'DEF'|'MID'|'FWD'] < max[need as 'DEF'|'MID'|'FWD']
     );
-    if (pick) {
-      out.push(pick);
-      counts[need as 'DEF'|'MID'|'FWD'] += 1;
-    }
+    if (pick) { starters.push(pick); counts[need as 'DEF'|'MID'|'FWD'] += 1; }
   }
-  // Pass 2: fill remaining slots by expected minutes, honouring max.
   for (const p of available) {
-    if (out.length >= 11) break;
+    if (starters.length >= 11) break;
     if (p.position === 'GKP') continue;
-    if (out.includes(p)) continue;
+    if (starters.includes(p)) continue;
     const pos = p.position as 'DEF'|'MID'|'FWD';
     if (counts[pos] < max[pos]) {
-      out.push(p);
-      counts[pos] += 1;
+      starters.push(p); counts[pos] += 1;
     }
   }
-  const starters = out.slice(0, 11);
-  const bench    = available.filter(p => !starters.includes(p)).slice(0, 5);
+  const final = starters.slice(0, 11);
+  const bench = available.filter(p => !final.includes(p)).slice(0, 5);
   return {
     formation: {
-      def: starters.filter(p => p.position === 'DEF').length,
-      mid: starters.filter(p => p.position === 'MID').length,
-      fwd: starters.filter(p => p.position === 'FWD').length,
+      def: final.filter(p => p.position === 'DEF').length,
+      mid: final.filter(p => p.position === 'MID').length,
+      fwd: final.filter(p => p.position === 'FWD').length,
     },
-    starters, bench,
+    starters: final, bench,
   };
 }
 
-// ─── internals: narrative synthesis ───────────────────────────────────────────
+// ─── narrative synthesis ──────────────────────────────────────────────────────
 
 interface NarrativeInputs {
   teamShort: string;
+  managerName: string | null;
   fixture: { opp: string; oppName: string; isHome: boolean } | undefined;
   motivation: number | null;
   motivationLabel: string;
-  out:    PressPlayerLine[];
+  out: PressPlayerLine[];
   doubts: PressPlayerLine[];
   banned: PressPlayerLine[];
   predictedXI: PredictedXI;
-  teamQuotes: PressQuote[];
+  managerQuotes: PressQuote[];
+  punditQuotes: PressQuote[];
 }
 
 /**
- * Build a 2-4 sentence Latest News paragraph. Deterministic — sentence
- * templates chosen by which signals are present. Quotes are paraphrased
- * into our own phrasing (we never copy verbatim into the narrative —
- * the verbatim text lives in the quote-link panel below).
- *
- * Avoids "manager Y said …" copy that would mirror Fantasy Football Scout;
- * we phrase it as "creators report …" since our source is FPL pundit
- * transcripts not direct manager wires.
+ * Synthesise the team-news paragraph. When we have manager-quotes
+ * (creator quotes that explicitly mention the manager), they LEAD
+ * the paragraph because that's the closest we get to a real
+ * press-conference summary. When we don't, we fall back to
+ * fixture + motivation + flags.
  */
 function synthesiseLatestNews(n: NarrativeInputs): string {
   const sentences: string[] = [];
 
-  // 1. Fixture + motivation lead.
+  // 1. Fixture + motivation.
   if (n.fixture) {
-    const fxStr = n.fixture.isHome ? `host ${n.fixture.oppName}` : `travel to ${n.fixture.oppName}`;
-    sentences.push(`${n.teamShort} ${fxStr}. ${n.motivationLabel}.`);
+    const fx = n.fixture.isHome ? `host ${n.fixture.oppName}` : `travel to ${n.fixture.oppName}`;
+    sentences.push(`${n.teamShort} ${fx}. ${n.motivationLabel}.`);
   } else {
     sentences.push(`${n.teamShort}: ${n.motivationLabel}.`);
   }
 
-  // 2. Banned + Out + Doubts roll-up.
+  // 2. Manager-attributed quotes (highest signal). Phrase as "via {channel}"
+  //    so it's clear the quote is a creator's report of what the manager said,
+  //    not a primary transcript.
+  if (n.managerQuotes.length > 0 && n.managerName) {
+    // Cluster by signal_kind so we say "X reported the manager hinted at Y".
+    const startMentions = n.managerQuotes.filter(q => q.signalKind === 'start').length;
+    const benchMentions = n.managerQuotes.filter(q => q.signalKind === 'bench').length;
+    const injuryMentions = n.managerQuotes.filter(q => q.signalKind === 'injury').length;
+    const bits: string[] = [];
+    if (startMentions > 0) bits.push(`a confirmed starter`);
+    if (benchMentions > 0) bits.push(`possible rotation`);
+    if (injuryMentions > 0) bits.push(`an injury concern`);
+    sentences.push(
+      `Creators reporting on ${n.managerName}'s presser surface ${bits.join(', ')}` +
+      ` — see the manager-quote panel below for the verbatim sources.`
+    );
+  } else if (n.managerName) {
+    sentences.push(`No press-conf coverage of ${n.managerName} in the last 48h — relying on FPL flags only.`);
+  }
+
+  // 3. Absences roll-up.
   const absentParts: string[] = [];
-  if (n.banned.length > 0) {
-    absentParts.push(`${listNames(n.banned)} banned`);
-  }
-  if (n.out.length > 0) {
-    absentParts.push(`${listNames(n.out, 4)} out`);
-  }
+  if (n.banned.length > 0) absentParts.push(`${listNamesFlat(n.banned)} banned`);
+  if (n.out.length > 0)    absentParts.push(`${listNamesFlat(n.out, 4)} out`);
   if (n.doubts.length > 0) {
-    const docFmt = n.doubts.slice(0, 4).map(l => {
+    const dfmt = n.doubts.slice(0, 4).map(l => {
       const c = l.chanceOfPlayingNext;
       return c != null ? `${l.webName} (${c}%)` : l.webName;
     }).join(', ');
-    absentParts.push(`doubts on ${docFmt}`);
+    absentParts.push(`doubts on ${dfmt}`);
   }
   if (absentParts.length > 0) {
     sentences.push(capitalise(absentParts.join('; ')) + '.');
+  } else {
+    sentences.push('No fitness flags from FPL bootstrap.');
   }
 
-  // 3. Creator quote roll-up — pick the freshest distinct (kind, player).
-  if (n.teamQuotes.length > 0) {
-    const seenKinds = new Map<string, PressQuote>();
-    for (const q of n.teamQuotes) {
-      const key = `${q.signalKind}`;
-      if (!seenKinds.has(key)) seenKinds.set(key, q);
-    }
-    const startQ  = seenKinds.get('start');
-    const benchQ  = seenKinds.get('bench');
-    const injuryQ = seenKinds.get('injury');
-    const bits: string[] = [];
-    if (startQ)  bits.push(`a starting nod for the player in question`);
-    if (benchQ)  bits.push(`rotation concerns flagged`);
-    if (injuryQ) bits.push(`an injury concern raised`);
-    if (bits.length > 0) {
-      sentences.push(`Creator quotes in the last 48h surface ${bits.join(', ')} — see the source clips below to verify.`);
-    }
-  }
-
-  // 4. Engine takeaway about XI rotation.
+  // 4. Engine takeaway — rotation likely?
   const subThresholdStarters = n.predictedXI.starters.filter(s =>
     (s.expectedMinutes ?? 0) < 70 && s.seasonAvgMinsPerApp > 75
   );
   if (subThresholdStarters.length >= 3) {
-    sentences.push(`Engine flags ${subThresholdStarters.length} of the predicted XI for sub-70-minute outings (${listNames(subThresholdStarters, 3)}) — managed minutes likely.`);
+    sentences.push(`Engine projects ${subThresholdStarters.length} of the predicted XI under 70 mins (${listNamesFlat(subThresholdStarters, 3)}) — managed minutes likely.`);
   } else if (subThresholdStarters.length >= 1) {
-    sentences.push(`Engine expects reduced minutes for ${listNames(subThresholdStarters, 3)}.`);
+    sentences.push(`Engine expects reduced minutes for ${listNamesFlat(subThresholdStarters, 3)}.`);
   } else if (n.motivation !== null && n.motivation < 0.4 && n.out.length === 0 && n.doubts.length === 0) {
     sentences.push('No specific lineup leaks — but dead-rubber stakes mean wholesale changes from the bench are possible.');
   }
-
   return sentences.join(' ');
 }
 
-function listNames(ps: PressPlayerLine[], cap = 3): string {
+function listNamesFlat(ps: PressPlayerLine[], cap = 3): string {
   if (ps.length === 0) return '';
   const names = ps.slice(0, cap).map(p => p.webName);
   if (ps.length <= cap) {
@@ -752,24 +863,4 @@ function capitalise(s: string): string {
 
 function truncate(s: string, n: number): string {
   return s.length <= n ? s : s.slice(0, n) + '…';
-}
-
-// ─── helpers ──────────────────────────────────────────────────────────────────
-
-/**
- * Same regex set used by the minutes engine's news-gate, kept in sync.
- * Exported so the page card can flag a player as "hard-out by news"
- * without re-importing the engine.
- */
-export function isHardOutByNews(news: string | null): boolean {
-  if (!news) return false;
-  const s = news.toLowerCase();
-  return (
-    /\bsuspended\b/.test(s) ||
-    /not available for the match/.test(s) ||
-    /made unavailable for selection/.test(s) ||
-    /joined .* permanently/.test(s) ||
-    /transferred to/.test(s) ||
-    /has left the club/.test(s)
-  );
 }

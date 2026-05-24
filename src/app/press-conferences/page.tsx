@@ -1,21 +1,20 @@
 /**
- * Press Conferences — Team News brief.
+ * Press Conferences — Team News, GW-focused.
  *
- * For the upcoming GW, every PL team gets a card with:
+ * Per team:
+ *   • Header  — team, manager, table position, fixture, motivation tag
+ *   • Predicted XI — 11 players, legal formation, expected minutes
+ *   • Out / Doubts (%) / Banned — three structured columns, active
+ *     squad only (transfers-out filtered)
+ *   • Latest News — synthesised paragraph leading with manager-attributed
+ *     creator quotes (when present) then engine takeaways
+ *   • Manager said — verbatim creator quotes that explicitly mention
+ *     the team's manager surname (Pep / Arteta / Carrick / Slot / etc.)
+ *     with timestamped video links
+ *   • Pundit chatter — every other creator quote (separated so the user
+ *     sees what's actual presser reporting vs creator opinion)
  *
- *   1. Fixture (opponent + H/A) and motivation context
- *   2. Predicted XI — 11 players in legal-formation order, with expected
- *      minutes per player
- *   3. Out / Doubts (% chance) / Banned — three structured columns
- *   4. Latest News — a 2-4 sentence narrative paragraph synthesised
- *      from the last-48h creator transcripts + FPL flags + engine
- *      projections + motivation context
- *   5. Source quotes — expandable list of the verbatim transcript snippets
- *      from FPL pundit videos that informed the narrative, each linked
- *      to the source video at the right timestamp
- *
- * Plus a global Rotation Watchlist at the top — top-N players where
- * expected minutes are below their season average, ranked by impact.
+ * Plus a global Rotation Watchlist at the top.
  */
 import { sql } from '@/lib/db/client';
 import { Card } from '@/components/ui/Card';
@@ -55,18 +54,24 @@ export default async function PressConferencesPage() {
     buildPressConferenceSummary(gw.id, { withinHours: 48 }),
   ]);
 
-  // Sort: most actionable first (bans > outs > doubts > rotation > settled).
+  // Sort: most actionable first.
   teamSummaries.sort((a, b) => {
-    const aRisk = a.banned.length * 20 + a.out.length * 8 + a.doubts.length * 3;
-    const bRisk = b.banned.length * 20 + b.out.length * 8 + b.doubts.length * 3;
+    const aRisk = a.banned.length * 20 + a.out.length * 6 + a.doubts.length * 2
+                + (a.managerQuotes.length > 0 ? 1 : 0);
+    const bRisk = b.banned.length * 20 + b.out.length * 6 + b.doubts.length * 2
+                + (b.managerQuotes.length > 0 ? 1 : 0);
     if (bRisk !== aRisk) return bRisk - aRisk;
     return a.teamShort.localeCompare(b.teamShort);
   });
 
-  const totalQuotes = teamSummaries.reduce((s, t) => s + t.teamLevelQuotes.length, 0);
-  const dataFreshness = totalQuotes > 0
-    ? `${totalQuotes} creator signals (last 48h)`
-    : 'No creator signals in last 48h — engine projections only';
+  const totalManagerQuotes = teamSummaries.reduce((s, t) => s + t.managerQuotes.length, 0);
+  const totalPunditQuotes  = teamSummaries.reduce((s, t) => s + t.punditQuotes.length, 0);
+  const dataFreshness =
+    totalManagerQuotes > 0
+      ? `${totalManagerQuotes} manager-attributed quotes · ${totalPunditQuotes} pundit comments (last 48h)`
+      : totalPunditQuotes > 0
+        ? `${totalPunditQuotes} pundit comments (last 48h) · no quotes citing managers directly`
+        : 'No creator signals in last 48h — engine projections + FPL flags only';
   const deadline = gw.deadline_time ? formatRelative(gw.deadline_time) : '';
 
   return (
@@ -75,14 +80,17 @@ export default async function PressConferencesPage() {
         <div>
           <h1 className="text-2xl font-semibold">{gw.name} · Team News</h1>
           <p className="text-ink-muted text-sm mt-1">
-            Predicted XI, injury/suspension lists, and a synthesised press-conf
-            summary for every PL team. Pulls from FPL bootstrap, our minutes
-            engine, and creator-transcript signals from the last 48h.
+            Predicted XI, injury / suspension / doubt status, and a synthesised press-conference
+            summary for every PL team. We surface creator quotes that explicitly cite the manager
+            (Pep, Arteta, Carrick, etc.) in a separate panel so you can see what was actually said
+            vs creator opinion. Off-season transfers and rest-of-season loans are filtered out.
           </p>
         </div>
         <div className="flex flex-col items-end gap-1">
           {deadline && <Badge tone="blue">Deadline {deadline}</Badge>}
-          <Badge tone={totalQuotes > 0 ? 'steel' : 'amber'}>{dataFreshness}</Badge>
+          <Badge tone={totalManagerQuotes > 0 ? 'green' : totalPunditQuotes > 0 ? 'amber' : 'steel'}>
+            {dataFreshness}
+          </Badge>
         </div>
       </header>
 
@@ -109,8 +117,7 @@ function RotationWatchlist({ list }: { list: RotationCandidate[] }) {
       <Card>
         <h2 className="text-lg font-semibold">Rotation watchlist</h2>
         <p className="text-sm text-ink-muted mt-2">
-          No meaningful rotation signals for this GW — engine projections
-          align with every player&apos;s season average.
+          No meaningful rotation signals for this GW.
         </p>
       </Card>
     );
@@ -123,7 +130,7 @@ function RotationWatchlist({ list }: { list: RotationCandidate[] }) {
       <div className="flex items-baseline justify-between mb-3">
         <h2 className="text-lg font-semibold">Rotation watchlist</h2>
         <span className="text-xs text-ink-dim">
-          {severe.length} severe · {moderate.length} moderate · {mild.length} mild · sorted by impact
+          {severe.length} severe · {moderate.length} moderate · {mild.length} mild
         </span>
       </div>
       <ul className="divide-y divide-line">
@@ -136,12 +143,10 @@ function RotationWatchlist({ list }: { list: RotationCandidate[] }) {
 function WatchlistRow({ c }: { c: RotationCandidate }) {
   const sevColour =
     c.severity === 'severe' ? 'text-accent-red' :
-    c.severity === 'moderate' ? 'text-accent-amber' :
-                                 'text-ink-muted';
+    c.severity === 'moderate' ? 'text-accent-amber' : 'text-ink-muted';
   const sevDot =
     c.severity === 'severe' ? 'bg-accent-red' :
-    c.severity === 'moderate' ? 'bg-accent-amber' :
-                                 'bg-ink-dim';
+    c.severity === 'moderate' ? 'bg-accent-amber' : 'bg-ink-dim';
   const deltaSign = c.minsDeltaVsSeason >= 0 ? '+' : '';
   return (
     <li className="py-3 first:pt-0 last:pb-0">
@@ -165,29 +170,17 @@ function WatchlistRow({ c }: { c: RotationCandidate }) {
           ))}
         </ul>
       )}
-      {c.freshQuotes.length > 0 && (
-        <ul className="mt-1.5 space-y-0.5">
-          {c.freshQuotes.map((q, i) => (
-            <li key={i} className="text-[11px] text-ink-muted">
-              <span className="text-ink-dim">{q.channelName} · {ageOfQuote(q.publishedAt)} · </span>
-              <a href={q.videoUrl} target="_blank" rel="noopener noreferrer"
-                 className="text-accent-blue hover:underline">video↗</a>
-            </li>
-          ))}
-        </ul>
-      )}
     </li>
   );
 }
 
-// ─── Team card (FFS-style) ────────────────────────────────────────────────────
+// ─── Team card ────────────────────────────────────────────────────────────────
 
 function TeamCard({ team }: { team: TeamPressSummary }) {
   const motivationTone =
     team.motivation == null   ? 'steel' :
     team.motivation >= 0.7    ? 'green' :
-    team.motivation >= 0.4    ? 'amber' :
-                                'red';
+    team.motivation >= 0.4    ? 'amber' : 'red';
   const f = team.predictedXI.formation;
   return (
     <Card>
@@ -202,6 +195,9 @@ function TeamCard({ team }: { team: TeamPressSummary }) {
                 </span>
               )}
             </h3>
+            {team.managerName && (
+              <p className="text-[11px] text-ink-dim mt-0.5">Manager: {team.managerName}</p>
+            )}
             <p className="text-xs text-ink-muted mt-0.5">
               <span className="font-medium">Next match:</span> {team.fixtureSummary}
             </p>
@@ -216,14 +212,12 @@ function TeamCard({ team }: { team: TeamPressSummary }) {
           </div>
         </header>
 
-        {/* Predicted XI grid */}
         <Section title="Predicted XI">
           <ul className="grid grid-cols-2 md:grid-cols-3 gap-x-3 gap-y-1.5 mt-1">
             {team.predictedXI.starters.map(p => <XIRow key={p.playerId} p={p} />)}
           </ul>
         </Section>
 
-        {/* Out / Doubts / Banned columns */}
         <div className="grid grid-cols-3 gap-3">
           <BucketCol title="Out" tone="red" players={team.out} emptyText="—" />
           <BucketCol title="Doubts" tone="amber" players={team.doubts} emptyText="—"
@@ -231,27 +225,39 @@ function TeamCard({ team }: { team: TeamPressSummary }) {
           <BucketCol title="Banned" tone="red" players={team.banned} emptyText="—" />
         </div>
 
-        {/* Latest News narrative */}
         <Section title="Latest news">
           <p className="text-xs text-ink leading-relaxed">{team.latestNews}</p>
           {team.newsUpdatedAt && (
             <p className="text-[10px] text-ink-dim mt-1">
-              Newest quote {ageOfQuote(team.newsUpdatedAt)} · {team.teamLevelQuotes.length} sources in window
+              Newest quote {ageOfQuote(team.newsUpdatedAt)} ·{' '}
+              {team.managerQuotes.length} manager-attributed ·{' '}
+              {team.punditQuotes.length} other
             </p>
           )}
         </Section>
 
-        {/* Source quotes (verifiable) */}
-        {team.teamLevelQuotes.length > 0 && (
-          <Section title="Source quotes (last 48h)">
+        {team.managerQuotes.length > 0 && (
+          <Section title={team.managerName ? `What ${team.managerName} said (via creators)` : 'Manager-attributed quotes'}>
             <ul className="space-y-1.5 mt-1">
-              {team.teamLevelQuotes.slice(0, 6).map((q, i) => (
-                <li key={i}>
-                  <QuoteLine q={q} />
-                </li>
+              {team.managerQuotes.map((q, i) => (
+                <li key={i}><QuoteLine q={q} /></li>
               ))}
             </ul>
           </Section>
+        )}
+
+        {team.punditQuotes.length > 0 && (
+          <details className="text-xs">
+            <summary className="cursor-pointer text-ink-muted hover:text-ink select-none">
+              Pundit chatter ({team.punditQuotes.length})
+              <span className="text-ink-dim ml-2">— creator analysis not citing the manager</span>
+            </summary>
+            <ul className="space-y-1.5 mt-2 pl-2 border-l border-line">
+              {team.punditQuotes.map((q, i) => (
+                <li key={i}><QuoteLine q={q} /></li>
+              ))}
+            </ul>
+          </details>
         )}
       </div>
     </Card>
@@ -334,11 +340,14 @@ function QuoteLine({ q }: { q: PressQuote }) {
     q.signalKind === 'start' ? 'start' :
     q.signalKind === 'bench' ? 'bench' :
                                 'injury';
-  const quote = q.rawQuote.length > 180 ? q.rawQuote.slice(0, 180) + '…' : q.rawQuote;
+  const quote = q.rawQuote.length > 200 ? q.rawQuote.slice(0, 200) + '…' : q.rawQuote;
   return (
     <p className="text-[11px] text-ink-muted italic leading-snug">
       <span className={`not-italic font-mono ${tagDot}`}>[{tagLabel}]</span>{' '}
-      <span className="text-ink-dim">{q.channelName} · {ageOfQuote(q.publishedAt)}</span>{' '}
+      <span className="text-ink-dim not-italic">
+        {q.channelName} · {ageOfQuote(q.publishedAt)}
+        {q.mentionsManager && <span className="text-accent-green"> · cites mgr</span>}
+      </span>{' '}
       “{quote}”{' '}
       <a href={q.videoUrl} target="_blank" rel="noopener noreferrer"
          className="text-accent-blue hover:underline not-italic">video↗</a>

@@ -826,31 +826,29 @@ export async function recomputeProjectionsForGameweek(
       // §raw-magnitude shrinkage on top — even within attacking components,
       // we shrink the multiplier toward 1.0 as raw attacking projection
       // rises. Bench-warmers with raw=0 attacking get full lift; elite
-      // strikers retain MOST of the lift because the RMSE backtest shows
-      // they're systematically under-predicted by ~6 xPts/GW (Haaland,
-      // Gabriel, B.Fernandes, Rice). Shrinking their lift to zero made
-      // the elite-bias worse.
+      // strikers with raw=4 attacking get near-zero lift (their xG is
+      // already accurate via Understat data and amplifying them produces
+      // unphysical projections like Haaland 11 xPts/GW vs his actual
+      // ~7 xPts/GW season average).
       //
-      // §elite-bias-fix (post-audit): replaced the aggressive shrinkage
-      // (ceiling=4, floor=0) with a gentler curve. Floor at 0.70 means
-      // even the highest raw-attack FWDs still get 70% of the position
-      // lift, instead of effectively zero. Ceiling raised to 8 so the
-      // taper is slower.
+      // The previous "elite-bias-fix" relaxed shrinkage to floor=0.70 /
+      // ceiling=8 to lift elites toward the RMSE-implied truth, but that
+      // over-corrected: the under-prediction we observed in backtest was
+      // mostly minutes-engine error (now fixed via news-gate + motivation
+      // downweighting), not a magnitude problem. So we revert to the
+      // strict shrinkage: floor=0, ceiling=4. Elites get small lift; the
+      // dead-rubber motivation multiplier handles per-GW rotation
+      // adjustments separately.
       const cal = calibrationByPos.get(p.position);
       const rawPosMult = cal
         ? (1 - cal.confidence) * 1.0 + cal.confidence * cal.multiplier
         : 1.0;
-      // "Raw attacking total" = the only components calibration touches.
       const rawAttackTotal =
         Number(projection.xpts_goals) +
         Number(projection.xpts_assists) +
         Number(projection.xpts_clean_sheet);
-      const SHRINKAGE_CEILING = 8.0;
-      const SHRINKAGE_FLOOR   = 0.70;
-      const shrinkageWeight = Math.max(
-        SHRINKAGE_FLOOR,
-        1 - rawAttackTotal / SHRINKAGE_CEILING
-      );
+      const SHRINKAGE_CEILING = 4.0;
+      const shrinkageWeight = Math.max(0, 1 - rawAttackTotal / SHRINKAGE_CEILING);
       const mult = 1.0 + (rawPosMult - 1.0) * shrinkageWeight;
       // We scale ONLY the attacking components (goals, assists, CS).
       // DEFCON / bonus / saves / cards / concede / owngoal / pen_save are

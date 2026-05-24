@@ -253,9 +253,15 @@ export async function runLpOptimiser(input: LpOptimiserInput): Promise<LpOptimis
 
   const xiFirst = input.xiFirst ?? false;
   const benchWeight = input.benchWeight ?? 0.05;
-  // Captain bonus on by default — closes the LP's blind spot to premium
-  // upgrades. tcMode triples the captain (bonus coefficient = 2 instead of 1).
-  const captainBonus = input.captainBonus ?? true;
+  // Captain bonus OFF by default — adds ~600 binaries and ~600 coupling
+  // constraints that choke the JS branch-and-bound solver, returning
+  // partial squads (size 8 etc.) that fail post-LP validation. Same root
+  // cause as the xiFirst regression. autoPick handles captain post-LP,
+  // so disabling this here only loses one specific edge: the LP can't
+  // see "premium upgrade is worth more because they'd be captained".
+  // To re-enable for callers that have a small candidate pool, pass
+  // captainBonus: true explicitly.
+  const captainBonus = input.captainBonus ?? false;
   const captainCoef  = input.tcMode ? 2 : 1;
 
   // Declare constraints early — the player loop adds per-player coupling

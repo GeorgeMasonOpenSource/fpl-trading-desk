@@ -163,6 +163,8 @@ export async function runLpPlan(input: LpPlanInput): Promise<LpPlanResult> {
       maxHits:   input.maxHits   ?? 1,
       xiFirst,
       tcMode: input.tcMode ?? false,
+      // captainBonus stays default (false) — captain handled via iterative
+      // probe below instead of LP variables, which broke the solver.
     });
   } catch (err) {
     // The LP package is dynamic-imported and might not be installed.
@@ -172,6 +174,77 @@ export async function runLpPlan(input: LpPlanInput): Promise<LpPlanResult> {
     return emptyResult(input.horizon,
       result.reason ?? 'LP infeasible — likely budget too tight for the constraint set.');
   }
+
+  // §iterative-captain-probe — the LP doesn't know that one player in the
+  // squad will be captained for 2× points, so it can under-value premium
+  // upgrades (e.g. swapping a £4 def for Haaland is +5 raw EV but +12 EV
+  // once captaincy is applied). To fix without re-introducing 600 binary
+  // variables that break the solver, we probe: for each of the top-3
+  // non-GKP candidates in the pool by xpts, re-run the LP with that
+  // player's xpts doubled (and force-included). If a probe produces a
+  // higher total EV than the base solve, use that result. Bounded to 3
+  // extra solves so total cost stays at ~4s.
+  const captainMult = (input.tcMode ? 3 : 2);
+  const captainBonus = captainMult - 1;  // extra coefficient added to the candidate's xpts
+  const topCaptains = [...pool]
+    .filter(p => p.position !== 'GKP')
+    .sort((a, b) => b.xptsHorizon - a.xptsHorizon)
+    .slice(0, 3);
+  let bestResult = result;
+  let bestCaptain: LpPlayer | null = null;
+  // Default: identify captain from the base squad if no probe wins.
+  bestCaptain = [...bestResult.squad15]
+    .filter(p => p.position !== 'GKP')
+    .sort((a, b) => b.xptsHorizon - a.xptsHorizon)[0] ?? null;
+  // Score baseline as totalXpts + captain bonus.
+  const baseScore = bestResult.totalXpts + (bestCaptain?.xptsHorizon ?? 0) * captainBonus;
+  let bestScore = baseScore;
+
+  for (const cap of topCaptains) {
+    const boostedPool = pool.map(p =>
+      p.playerId === cap.playerId
+        ? { ...p, xptsHorizon: p.xptsHorizon * captainMult }
+        : p
+    );
+    const force = new Set<number>([cap.playerId]);
+    try {
+      const probed = await runLpOptimiser({
+        candidatePool: boostedPool,
+        bank,
+        freeTransfers: input.freeTransfers,
+        allowHits: input.allowHits ?? false,
+        maxHits:   input.maxHits   ?? 1,
+        xiFirst,
+        tcMode: input.tcMode ?? false,
+        forceInclude: force,
+      });
+      if (!probed.feasible) continue;
+      // probed.totalXpts already includes the captain's doubled value because
+      // we baked the multiplier into the pool. So it IS the "captain-aware" score.
+      if (probed.totalXpts > bestScore) {
+        bestScore = probed.totalXpts;
+        // Recover the original (unboosted) xpts when returning to the UI by
+        // rebuilding the squad against the original pool.
+        const origById = new Map(pool.map(p => [p.playerId, p]));
+        bestResult = {
+          ...probed,
+          squad15:      probed.squad15.map(p => origById.get(p.playerId) ?? p),
+          transfersIn:  probed.transfersIn.map(p => origById.get(p.playerId) ?? p),
+          transfersOut: probed.transfersOut.map(p => origById.get(p.playerId) ?? p),
+          // Compute totalXpts in the original-pool space, then add captain bonus.
+          totalXpts:    probed.squad15.reduce(
+            (s, p) => s + (origById.get(p.playerId)?.xptsHorizon ?? p.xptsHorizon), 0
+          ) + cap.xptsHorizon * captainBonus,
+        };
+        bestCaptain = origById.get(cap.playerId) ?? cap;
+      }
+    } catch {
+      // Probe failure — skip this candidate; baseline is still valid.
+    }
+  }
+  result = bestResult;
+  // Attach the chosen captain so the UI can highlight it.
+  result.captain = bestCaptain ?? null;
 
   // 7. Map results back to UI types.
   const toUi = (p: LpPlayer): LpUiPlayer => {
