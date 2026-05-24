@@ -57,7 +57,7 @@ export default async function TransferPlanner() {
       evThreshold:  Number(process.env.EV_TRANSFER_THRESHOLD ?? 0.6),
       hitThreshold: Number(process.env.EV_HIT_THRESHOLD ?? 1.5)
     }),
-    rankTopTransfers(managerId, gw.id, 10),
+    rankTopTransfers(managerId, gw.id, 20),
     // LP optimiser, 1-GW horizon: the globally-optimal single move for THIS
     // gameweek given the budget + 3-per-club + position-shape constraints.
     // Matches FPLReview's "Linear Optimiser" output.
@@ -218,7 +218,7 @@ export default async function TransferPlanner() {
         </Table>
       </Card>
       <Card
-        title={`Top 10 transfers for ${gw.name}`}
+        title={`Top 20 transfers for ${gw.name}`}
         subtitle="XI-only — only includes swaps where the incoming player would start in your auto-picked XI. Bench-only depth moves are filtered out. Ranked by next-GW Starting-XI EV gain, captain doubling included."
       >
         {topTransfers.length === 0 ? (
