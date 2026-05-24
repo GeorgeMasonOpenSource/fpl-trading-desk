@@ -57,6 +57,11 @@ export interface MinutesInputs {
   // and forces injuryAbsenceProb to 1.0 when found, closing the gap
   // where status='a' but news already says out.
   fplNews?: string | null;
+  // §yc-suspension — true when the player crossed a 5/10/15 cumulative
+  // yellow-card threshold in the last finished GW. Equivalent to a 1-match
+  // FPL suspension, but we detect it ourselves rather than waiting for FPL
+  // to flip status='s'.
+  ycSuspendedNext?: boolean;
   // Context for this specific fixture:
   isPostEuropeanFixture: boolean;
   isPreEuropeanFixture: boolean;
@@ -112,6 +117,12 @@ export function projectMinutes(input: MinutesInputs): MinutesDistribution {
   if (input.manualExpectedAbsence) {
     injuryAbsenceProb = 0.99;
     reasons.push({ kind: 'manual_absence_override', weight: 0.99, detail: 'manual override: expected absence' });
+  } else if (input.ycSuspendedNext) {
+    // YC threshold crossed in the most recent finished GW → banned next GW.
+    // Treated as deterministically out. FPL frequently lags on this flag —
+    // we detect it from cumulative YC counts directly.
+    injuryAbsenceProb = 0.99;
+    reasons.push({ kind: 'yc_suspension', weight: 0.99, detail: 'yellow-card threshold reached last GW — suspended next match' });
   } else {
     // §news-gate — late-breaking unavailability that FPL hasn't yet
     // reflected in `status`. Patterns observed in bootstrap:
@@ -467,6 +478,48 @@ export async function recomputeMinutesForGameweek(gw: number) {
   `;
   const aggByPlayer = new Map(aggs.map(a => [a.player_id, a]));
 
+  // §yc-suspension — Premier League yellow-card thresholds:
+  //   5 yellows in first 19 PL matches → 1-match ban
+  //   10 yellows in first 32 PL matches → 2-match ban
+  //   15 yellows by end of season → 3-match ban
+  // Detection rule: if cumulative yellow_cards through the LAST FINISHED
+  // GW crossed a multiple of 5 in that GW (i.e. it landed exactly at 5, 10,
+  // or 15), the player serves a ban in the NEXT GW. Cross-check against
+  // FPL's status — if FPL has already flipped to 's', we don't need this.
+  // But if FPL is lagging, this catches it.
+  const ycSuspended = new Set<number>();
+  if (playerIds.length > 0) {
+    const ycRows = await sql<Array<{
+      player_id: number; cum_yc_total: number; cum_yc_before_last: number;
+    }>>`
+      WITH match_yc AS (
+        SELECT pgh.player_id, pgh.gameweek_id, pgh.yellow_cards,
+               (SELECT MAX(gameweek_id) FROM fixtures WHERE finished = TRUE) AS last_gw
+        FROM player_gameweek_history pgh
+        JOIN fixtures f ON f.id = pgh.fixture_id
+        WHERE f.finished = TRUE
+          AND pgh.player_id IN ${sql(playerIds as any)}
+      )
+      SELECT player_id,
+             SUM(yellow_cards)::int AS cum_yc_total,
+             SUM(CASE WHEN gameweek_id < last_gw THEN yellow_cards ELSE 0 END)::int AS cum_yc_before_last
+      FROM match_yc
+      GROUP BY player_id
+    `;
+    for (const r of ycRows) {
+      // Did the cumulative count CROSS a 5/10/15 boundary in the last GW?
+      // before-last must be < threshold AND total must be >= threshold.
+      const before = r.cum_yc_before_last;
+      const total  = r.cum_yc_total;
+      const crossed5  = before < 5  && total >= 5;
+      const crossed10 = before < 10 && total >= 10;
+      const crossed15 = before < 15 && total >= 15;
+      if (crossed5 || crossed10 || crossed15) {
+        ycSuspended.add(r.player_id);
+      }
+    }
+  }
+
   // Recent per-match rows per player — the last 5 played fixtures. Powers
   // recency-weighted start/ninety/appearance rates so a player who was nailed
   // earlier in the season but recently benched gets a falling startProb, not
@@ -676,6 +729,7 @@ export async function recomputeMinutesForGameweek(gw: number) {
         fplStatus: p.status,
         chanceOfPlayingNext: p.chance_of_playing_next_round,
         fplNews: p.news,
+        ycSuspendedNext: ycSuspended.has(p.id),
         isPostEuropeanFixture: postEu,
         isPreEuropeanFixture:  preEu,
         daysRestBefore: null, daysRestAfter: null,

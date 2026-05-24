@@ -94,15 +94,13 @@ async function main() {
     const wmeanPred = pairs.reduce((s, r) => s + weighted(r.gameweek_id) * r.predicted, 0) / W;
     const wmeanAct  = pairs.reduce((s, r) => s + weighted(r.gameweek_id) * r.actual, 0) / W;
     const rawMult = wmeanPred > 0 ? wmeanAct / wmeanPred : 1.0;
-    // Clamp [0.5, 2.0]. Was 3.0 before per-player Bayesian priors landed,
-    // but now player priors (up to 1.4×) STACK on top of the position
-    // multiplier. With a 3.0 cap, elites like Haaland get
-    //   raw × 3.0 (position) × 1.2 (player) = 3.6× — inflated.
-    // 2.0 cap limits worst-case stack to 2.0 × 1.4 = 2.8× which matches
-    // what season actuals demand for elites. The team_xg_for fix
-    // (Understat team-level ingest) further reduces the position-mult
-    // need because the raw inputs are no longer undercounted.
-    const multiplier = Math.max(0.5, Math.min(2.0, rawMult));
+    // Clamp [0.5, 2.5]. Bumped from 2.0 alongside the shrinkage softening
+    // in engine.ts (floor 0.70, ceiling 8). RMSE backtests showed even
+    // with player priors capped at 1.4, elites were under-predicted by
+    // ~6 xPts/GW. The new shrinkage now lets ~70% of the position multiplier
+    // through for top attackers, so the train fitter needs more headroom.
+    // Worst-case stack: 2.5 × 0.70 (shrunk) × 1.4 (player prior) = 2.45×.
+    const multiplier = Math.max(0.5, Math.min(2.5, rawMult));
     // High confidence: full season of weighted data.
     const confidence = Math.min(1, pairs.length / 1500);
     const rmse = Math.sqrt(pairs.reduce(

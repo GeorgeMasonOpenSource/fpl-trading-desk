@@ -39,7 +39,7 @@ export interface TransferMove {
 }
 
 export interface ScenarioResult {
-  scenario: 'do_nothing' | 'roll' | 'ft1' | 'ft2' | 'hit_-4' | 'hit_-8' | 'wildcard';
+  scenario: 'do_nothing' | 'roll' | 'ft1' | 'ft2' | 'ft3' | 'ft4' | 'ft5' | 'hit_-4' | 'hit_-8' | 'wildcard';
   evGainByHorizon: Record<Horizon, number>;
   ev: number;                   // primary horizon (3 GW)
   hitCost: number;
@@ -470,6 +470,29 @@ export async function compareTransferScenarios(cfg: OptimiserConfig): Promise<Sc
     });
   }
 
+  // §saved-FT scenarios — ft3/ft4/ft5. From 24/25 onwards, FPL allows up to
+  // 5 saved free transfers. If the user has 3+ FTs available, evaluate
+  // deeper greedy sequences and surface as separate scenarios. Greedy
+  // (not globally optimal) but bounded N moves; matches the wildcard
+  // greedy in spirit.
+  for (let k = 3; k <= Math.min(5, cfg.freeTransfers); k++) {
+    const greedy = greedyKMoves(squad, startBank, byPos, k);
+    if (greedy.moves.length === k && greedy.evByHorizon[3] > 0) {
+      results.push({
+        scenario: `ft${k}` as ScenarioResult['scenario'],
+        evGainByHorizon: greedy.evByHorizon,
+        ev: greedy.evByHorizon[3],
+        hitCost: 0,
+        moves: greedy.moves,
+        risk: 0.4 + 0.05 * k,
+        confidence: Math.max(0.4, 0.7 - 0.05 * k),
+        flexibilityScore: Math.max(0, 0.2 - 0.05 * k),
+        opportunityCost: 0.0,
+        reasons: [`Spend all ${k} saved free transfers (greedy ${k}-move plan).`]
+      });
+    }
+  }
+
   // Indicative wildcard: iteratively pick the move with the best XI EV gain
   // against the current (post-prior-move) squad, until 5 moves are made or no
   // positive-EV move remains. Greedy, not globally optimal, but produces
@@ -536,4 +559,48 @@ export async function compareTransferScenarios(cfg: OptimiserConfig): Promise<Sc
   }
 
   return results;
+}
+
+/**
+ * Greedy k-move sequence builder. At each step picks the single best
+ * positive-EV swap against the post-prior-move squad, until k moves
+ * have been made (or no positive-EV move remains).
+ *
+ * Returns the move list plus cumulative EV per horizon. NOT globally
+ * optimal — the LP solver in lp-runner.ts is — but bounded and useful
+ * for the ftK scenarios when the LP is unavailable or as a sanity-check
+ * fallback.
+ */
+function greedyKMoves(
+  startSquad: SquadPlayer[],
+  startBank: number,
+  byPos: Record<Position, SquadPlayer[]>,
+  k: number
+): { moves: TransferMove[]; evByHorizon: Record<Horizon, number> } {
+  let curSquad = [...startSquad];
+  let curBank  = startBank;
+  const moves: TransferMove[] = [];
+  const cumEv: Record<Horizon, number> = { 1: 0, 3: 0, 6: 0, 8: 0 };
+  for (let i = 0; i < k; i++) {
+    const baseline = {} as Record<Horizon, number>;
+    for (const h of HORIZONS) baseline[h] = squadScore(curSquad, h);
+    let bestStep: TransferMove | null = null;
+    for (const s of curSquad) {
+      for (const c of byPos[s.position]) {
+        if (moves.some(m => m.in.playerId === c.playerId)) continue; // already transferred in
+        if (!isLegalSwap(curSquad, curBank, s, c)) continue;
+        const d = evDeltaXI(curSquad, baseline, s, c);
+        if (d[3] <= 0) continue;
+        if (!bestStep || d[3] > bestStep.evDelta[3]) {
+          bestStep = { out: s, in: c, evDelta: d, netCost: c.cost - s.cost };
+        }
+      }
+    }
+    if (!bestStep) break;
+    moves.push(bestStep);
+    curBank += bestStep.out.cost - bestStep.in.cost;
+    curSquad = curSquad.map(s => (s.playerId === bestStep!.out.playerId ? bestStep!.in : s));
+    for (const h of HORIZONS) cumEv[h] += bestStep.evDelta[h];
+  }
+  return { moves, evByHorizon: cumEv };
 }

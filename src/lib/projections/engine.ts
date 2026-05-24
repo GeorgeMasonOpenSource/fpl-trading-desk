@@ -826,8 +826,16 @@ export async function recomputeProjectionsForGameweek(
       // §raw-magnitude shrinkage on top — even within attacking components,
       // we shrink the multiplier toward 1.0 as raw attacking projection
       // rises. Bench-warmers with raw=0 attacking get full lift; elite
-      // strikers with raw=4 attacking get ~0 lift (their xG is already
-      // accurate via Understat data they actually have).
+      // strikers retain MOST of the lift because the RMSE backtest shows
+      // they're systematically under-predicted by ~6 xPts/GW (Haaland,
+      // Gabriel, B.Fernandes, Rice). Shrinking their lift to zero made
+      // the elite-bias worse.
+      //
+      // §elite-bias-fix (post-audit): replaced the aggressive shrinkage
+      // (ceiling=4, floor=0) with a gentler curve. Floor at 0.70 means
+      // even the highest raw-attack FWDs still get 70% of the position
+      // lift, instead of effectively zero. Ceiling raised to 8 so the
+      // taper is slower.
       const cal = calibrationByPos.get(p.position);
       const rawPosMult = cal
         ? (1 - cal.confidence) * 1.0 + cal.confidence * cal.multiplier
@@ -837,8 +845,12 @@ export async function recomputeProjectionsForGameweek(
         Number(projection.xpts_goals) +
         Number(projection.xpts_assists) +
         Number(projection.xpts_clean_sheet);
-      const SHRINKAGE_CEILING = 4.0;
-      const shrinkageWeight = Math.max(0, 1 - rawAttackTotal / SHRINKAGE_CEILING);
+      const SHRINKAGE_CEILING = 8.0;
+      const SHRINKAGE_FLOOR   = 0.70;
+      const shrinkageWeight = Math.max(
+        SHRINKAGE_FLOOR,
+        1 - rawAttackTotal / SHRINKAGE_CEILING
+      );
       const mult = 1.0 + (rawPosMult - 1.0) * shrinkageWeight;
       // We scale ONLY the attacking components (goals, assists, CS).
       // DEFCON / bonus / saves / cards / concede / owngoal / pen_save are

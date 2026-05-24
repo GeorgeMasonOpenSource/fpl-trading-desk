@@ -41,7 +41,15 @@ export interface CaptainOption {
   reasons: string[];
 }
 
-export async function rankCaptains(managerId: number, gameweekId: number, leagueId?: number) {
+export async function rankCaptains(
+  managerId: number,
+  gameweekId: number,
+  leagueId?: number,
+  opts?: { tcMode?: boolean }
+) {
+  // §triple-captain — when active, captain multiplier becomes 3× instead
+  // of 2×. All downstream EV computations multiply by `captainMult`.
+  const captainMult = opts?.tcMode ? 3 : 2;
   // Wrap each query in try/catch so a single bad row / type-coercion problem
   // in EO or blended-xpts doesn't take out the entire captaincy page. We log
   // the failing step explicitly so production debugging is straightforward.
@@ -142,10 +150,10 @@ export async function rankCaptains(managerId: number, gameweekId: number, league
   const ranked: CaptainOption[] = picks.map(r => {
     const eo = eoMap.get(r.player_id) ?? Number(r.start_prob > 0 ? 5 : 0); // floor at 0
     const blended = blendedMap.get(r.player_id) ?? Number(r.xpts);
-    const projection = Number(r.xpts) * 2;
-    const projectionBlended = blended * 2;
-    const ceiling = Number(r.ceiling) * 2;
-    const floor   = Number(r.floor)   * 2;
+    const projection = Number(r.xpts) * captainMult;
+    const projectionBlended = blended * captainMult;
+    const ceiling = Number(r.ceiling) * captainMult;
+    const floor   = Number(r.floor)   * captainMult;
     const miniLeagueImpact = projectionBlended - (Number(r.xpts) * eo / 100);
     const tcScore =
       ceiling * 0.6 +

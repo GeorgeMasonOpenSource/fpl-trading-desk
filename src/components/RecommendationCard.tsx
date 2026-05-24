@@ -3,7 +3,8 @@ import { fmt, pct } from '@/lib/util/fmt';
 
 export interface RecommendationCardData {
   title: string;
-  verdict: 'do_nothing' | 'roll' | 'ft1' | 'ft2' | 'hit_-4' | 'hit_-8' | 'wildcard' |
+  verdict: 'do_nothing' | 'roll' | 'ft1' | 'ft2' | 'ft3' | 'ft4' | 'ft5' |
+            'hit_-4' | 'hit_-8' | 'wildcard' |
             'captain' | 'tc' | 'bb' | 'fh' | 'wc';
   ev: number;
   risk: number;

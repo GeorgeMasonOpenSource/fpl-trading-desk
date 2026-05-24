@@ -25,6 +25,9 @@ export interface LpPlanInput {
   // Default true for 1-GW plans (where bench is mostly worthless),
   // false for multi-GW plans (where bench rotation matters).
   xiFirst?: boolean;
+  // §triple-captain — when true, the captain's contribution is tripled
+  // (×3) instead of doubled (×2). Use when the user is activating TC.
+  tcMode?: boolean;
 }
 
 export interface LpPlanResult {
@@ -39,6 +42,8 @@ export interface LpPlanResult {
   transfersOut: LpUiPlayer[];
   /** The full final 15, ordered by position. */
   finalSquad: LpUiPlayer[];
+  /** LP-chosen captain (highest xPts × 2 contribution baked into totalXpts). */
+  captain?: LpUiPlayer | null;
 }
 
 export interface LpUiPlayer {
@@ -156,7 +161,8 @@ export async function runLpPlan(input: LpPlanInput): Promise<LpPlanResult> {
       freeTransfers: input.freeTransfers,
       allowHits: input.allowHits ?? false,
       maxHits:   input.maxHits   ?? 1,
-      xiFirst
+      xiFirst,
+      tcMode: input.tcMode ?? false,
     });
   } catch (err) {
     // The LP package is dynamic-imported and might not be installed.
@@ -195,7 +201,8 @@ export async function runLpPlan(input: LpPlanInput): Promise<LpPlanResult> {
     spend: result.spend,
     transfersIn:  result.transfersIn.map(toUi),
     transfersOut: result.transfersOut.map(toUi),
-    finalSquad
+    finalSquad,
+    captain: result.captain ? toUi(result.captain) : null,
   };
 }
 

@@ -51,7 +51,12 @@ const LEGAL_SPLITS: Array<[number, number, number]> = [
   [5, 2, 3], [5, 3, 2], [5, 4, 1]
 ];
 
-export function autoPick<T extends AutoPickInput>(squad: T[]): AutoPickResult<T> {
+export function autoPick<T extends AutoPickInput>(
+  squad: T[],
+  opts?: { tcMode?: boolean }
+): AutoPickResult<T> {
+  // §triple-captain — captain multiplier becomes ×3 when TC is active.
+  const captainMult = opts?.tcMode ? 3 : 2;
   const byPos = {
     GKP: [...squad].filter(p => p.pos === 'GKP').sort((a, b) => b.xpts_total - a.xpts_total),
     DEF: [...squad].filter(p => p.pos === 'DEF').sort((a, b) => b.xpts_total - a.xpts_total),
@@ -133,12 +138,15 @@ export function autoPick<T extends AutoPickInput>(squad: T[]): AutoPickResult<T>
     bench.push({ player: benchGkp, slot: 'bench', benchOrder: 4, isCaptain: false, isVice: false });
   }
 
-  const captainXpts = (sortedStarters[0]?.xpts_total ?? 0) * 2;
+  const captainBase = sortedStarters[0]?.xpts_total ?? 0;
+  const captainXpts = captainBase * captainMult;
   return {
     formation: { def: best.def, mid: best.mid, fwd: best.fwd },
     starters,
     bench,
-    totalXpts: best.total + (sortedStarters[0]?.xpts_total ?? 0), // captain doubled
+    // captainMult-1 because captain's base xPts already counted in `best.total`.
+    // ×2 → +1× extra; ×3 → +2× extra (Triple Captain).
+    totalXpts: best.total + captainBase * (captainMult - 1),
     captainXpts
   };
 }

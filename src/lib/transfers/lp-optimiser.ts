@@ -191,6 +191,19 @@ export interface LpOptimiserInput {
   // so the solver still prefers a slightly better bench when XI is tied.
   // Default 0.05.
   benchWeight?: number;
+  // §captain-bonus — when true (default), augment the LP objective with
+  // a captain decision variable c_p ∈ {0,1} subject to:
+  //   c_p ≤ x_p  (can only captain a squad player)
+  //   Σ_p c_p = 1  (exactly one captain)
+  //   Σ_p c_p × xpts[p]  added to objective (captain bonus)
+  // This stops the optimiser undervaluing premium upgrades — without it,
+  // Haaland looks like +5 xpts when in fact he's +10 because he'd be
+  // captained. Triple-captain mode multiplies the captain bonus by 2
+  // instead of 1 (so total captain multiplier is 3× when tcMode=true).
+  captainBonus?: boolean;
+  // §triple-captain — when true, treat captain contribution as ×3 instead
+  // of ×2 (i.e. bonus coefficient = 2 × xpts not 1 × xpts).
+  tcMode?: boolean;
 }
 
 export interface LpOptimiserResult {
@@ -201,6 +214,8 @@ export interface LpOptimiserResult {
   transfersIn: LpPlayer[];
   transfersOut: LpPlayer[];
   spend: number;
+  /** Captain chosen by the LP. Null if captainBonus disabled or no feasible captain. */
+  captain?: LpPlayer | null;
   /** Populated when feasible=false. Explains the specific violation(s). */
   reason?: string;
 }
@@ -238,6 +253,10 @@ export async function runLpOptimiser(input: LpOptimiserInput): Promise<LpOptimis
 
   const xiFirst = input.xiFirst ?? false;
   const benchWeight = input.benchWeight ?? 0.05;
+  // Captain bonus on by default — closes the LP's blind spot to premium
+  // upgrades. tcMode triples the captain (bonus coefficient = 2 instead of 1).
+  const captainBonus = input.captainBonus ?? true;
+  const captainCoef  = input.tcMode ? 2 : 1;
 
   // Declare constraints early — the player loop adds per-player coupling
   // constraints under the §XI-first formulation, so we need the object
@@ -301,6 +320,29 @@ export async function runLpOptimiser(input: LpOptimiserInput): Promise<LpOptimis
       ints[`y_${p.playerId}`] = 1;
       constraints[couplingKey] = { max: 0 };
     }
+    if (captainBonus) {
+      // c_p = 1 if player is captain. Contributes captainCoef × xpts
+      // (1× for normal captain → 2× total; 2× for TC → 3× total).
+      // Coupling: c_p ≤ x_p (can only captain a squad player).
+      const cKey = `c_${p.playerId}`;
+      const captainCoupleKey = `cap_couple_${p.playerId}`;
+      const c: Record<string, number> = {
+        xpts: captainCoef * p.xptsHorizon,
+        total: 0,
+        gk: 0, def: 0, mid: 0, fwd: 0,
+        cost: 0, sellRev: 0, inIfBought: 0,
+        captain_total: 1,
+      };
+      // GKPs are technically captainable, but in 99% of FPL cases this
+      // is a bug not a feature. Block GKP captaincy at the LP level so
+      // the solver can't break ties by captaining a £4.0 keeper.
+      if (p.position === 'GKP') c['no_gkp_captain'] = 1;
+      c[captainCoupleKey] = 1;
+      v[captainCoupleKey] = -1;
+      variables[cKey] = c;
+      ints[cKey] = 1;
+      constraints[captainCoupleKey] = { max: 0 };
+    }
     // Force-include: pre-fix variable to 1 via tight constraint added below.
   }
 
@@ -330,6 +372,10 @@ export async function runLpOptimiser(input: LpOptimiserInput): Promise<LpOptimis
       xi_def:   { min: 3, max: 5 },
       xi_mid:   { min: 2, max: 5 },
       xi_fwd:   { min: 1, max: 3 }
+    } : {}),
+    ...(captainBonus ? {
+      captain_total:    { equal: 1 },
+      no_gkp_captain:   { max: 0 }, // sum of c_p × is_gkp must be 0
     } : {})
   });
   Object.assign(constraints, {
@@ -393,6 +439,23 @@ export async function runLpOptimiser(input: LpOptimiserInput): Promise<LpOptimis
   for (const p of candidates) {
     if ((r[`p_${p.playerId}`] as number) >= 0.99) squad15.push(p);
   }
+  // Extract captain from solver result.
+  let captain: LpPlayer | null = null;
+  if (captainBonus) {
+    for (const p of candidates) {
+      if ((r[`c_${p.playerId}`] as number) >= 0.99) {
+        captain = p;
+        break;
+      }
+    }
+    // Defensive: if LP didn't set a captain (e.g. infeasibility on the
+    // captain constraint), fall back to the highest-xpts non-GKP in the
+    // squad. Better to have a sensible captain than null.
+    if (!captain && squad15.length > 0) {
+      const eligible = squad15.filter(p => p.position !== 'GKP');
+      captain = eligible.sort((a, b) => b.xptsHorizon - a.xptsHorizon)[0] ?? null;
+    }
+  }
   const ownedIds = new Set(candidates.filter(p => p.isCurrentlyOwned).map(p => p.playerId));
   const newIds   = new Set(squad15.map(p => p.playerId));
   const transfersIn  = squad15.filter(p => !ownedIds.has(p.playerId));
@@ -450,7 +513,7 @@ export async function runLpOptimiser(input: LpOptimiserInput): Promise<LpOptimis
     };
   }
 
-  return { feasible: true, totalXpts, hitsTaken, squad15, transfersIn, transfersOut, spend };
+  return { feasible: true, totalXpts, hitsTaken, squad15, transfersIn, transfersOut, spend, captain };
 }
 
 function sumOwnedSellingPrice(pool: LpPlayer[]): number {

@@ -44,10 +44,11 @@ const SECTIONS: NavSection[] = [
   {
     label: 'Intel',
     items: [
-      { href: '/mini-league',       label: 'Mini Leagues' },
-      { href: '/creator-signals',   label: 'Creators' },
-      { href: '/predicted-lineups', label: 'Predicted Lineups' },
-      { href: '/player-explorer',   label: 'Player Explorer' }
+      { href: '/mini-league',        label: 'Mini Leagues' },
+      { href: '/creator-signals',    label: 'Creators' },
+      { href: '/press-conferences',  label: 'Press Conferences' },
+      { href: '/predicted-lineups',  label: 'Predicted Lineups' },
+      { href: '/player-explorer',    label: 'Player Explorer' }
     ]
   },
   {
