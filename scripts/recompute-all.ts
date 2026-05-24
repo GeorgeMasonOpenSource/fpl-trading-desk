@@ -34,6 +34,7 @@ import { recomputeMinutesCalibration } from '../src/lib/minutes/per-position-cal
 import { recomputeSetPieceRoles } from '../src/lib/projections/set-piece-roles';
 import { recomputeMinutesForGameweek } from '../src/lib/minutes/engine';
 import { recomputePlayerPriors } from '../src/lib/projections/player-priors';
+import { recomputeTeamContext } from '../src/lib/projections/team-context';
 
 async function main() {
   const args = process.argv.slice(2);
@@ -41,6 +42,18 @@ async function main() {
   const targetGw = gwArg >= 0 ? Number(args[gwArg + 1]) : await currentGw();
   const runMc = args.includes('--mc');
   console.log(`[recompute-all] target gameweek: ${targetGw}`);
+
+  // 0. Team context — PL table, motivation per team, stakes remaining.
+  //    Drives dead-rubber detection in the minutes engine and the
+  //    motivation label on the press-conferences page. Cheap to run.
+  const t00 = Date.now();
+  console.log('[recompute-all] step 0 — team context (table + motivation)');
+  try {
+    await recomputeTeamContext();
+    console.log(`[recompute-all] step 0 done in ${Date.now() - t00}ms`);
+  } catch (err) {
+    console.warn(`[recompute-all] step 0 SKIPPED (${(err as Error).message})`);
+  }
 
   // 1. Team ratings -----------------------------------------------------
   const t0 = Date.now();

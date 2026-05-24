@@ -1,6 +1,42 @@
 import { sql } from '@/lib/db/client';
 
 /**
+ * Parse the EU-qualification env config. Defaults reflect 25/26 reality:
+ *   • UCL: 5 league slots (England has UEFA coefficient bonus this cycle)
+ *   • UEL: 1 league slot (the other UEL spot goes to the EFL/FA cup winner)
+ *   • UECL: 1 league slot
+ *   • Trophy pre-qualifiers: AVL (UEL winner — already in next UCL),
+ *     CRY (UECL final — UECL slot if they win). Override via env to
+ *     reflect actual results.
+ */
+interface EuConfig {
+  uclLeagueSlots:  number;
+  uelLeagueSlots:  number;
+  ueclLeagueSlots: number;
+  uclByTrophy:    string[];   // upper-case short_names
+  uelByTrophy:    string[];
+}
+
+function parseEuConfig(): EuConfig {
+  const num = (k: string, def: number) => {
+    const v = Number(process.env[k]);
+    return Number.isFinite(v) && v >= 0 ? v : def;
+  };
+  const list = (k: string, def: string[]) => {
+    const raw = process.env[k];
+    if (!raw) return def;
+    return raw.split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
+  };
+  return {
+    uclLeagueSlots:  num('EU_UCL_LEAGUE_SLOTS',  5),
+    uelLeagueSlots:  num('EU_UEL_LEAGUE_SLOTS',  1),
+    ueclLeagueSlots: num('EU_UECL_LEAGUE_SLOTS', 1),
+    uclByTrophy:    list('EU_UCL_QUALIFIED_BY_TROPHY', ['AVL']),
+    uelByTrophy:    list('EU_UEL_QUALIFIED_BY_TROPHY', []),
+  };
+}
+
+/**
  * Recompute team-level context: the PL table, end-of-season motivation, and
  * tactical-style proxies. All values are derived deterministically from the
  * finished fixtures + season totals we already store — no external data
@@ -70,10 +106,60 @@ export async function recomputeTeamContext() {
 
   if (table.length === 0) return 0;
 
+  // §EU-slot config — varies year to year and depends on whether English
+  // clubs win European cups. Defaults to 25/26 reality:
+  //   • UCL: top-5 (England has the UEFA coefficient bonus this cycle)
+  //   • UEL: position 6 unless a PL cup winner has pre-qualified for it
+  //     (e.g. FA Cup winner gets UEL — frees the league spot up by one if
+  //      they would otherwise have been outside the EU places).
+  //   • UECL: position 7 (or 6 if FA Cup winner is in top-6 etc.)
+  //   • Already-qualified PL teams (e.g. UEL winner Aston Villa locked
+  //     into next-season UCL by trophy alone) DON'T consume a league EU
+  //     spot. The user lists them via env so we compute the right boundary.
+  //
+  // Env override format (comma-separated team short_names):
+  //   EU_UCL_QUALIFIED_BY_TROPHY=AVL,CHE      // these teams in UCL via cup
+  //   EU_UEL_QUALIFIED_BY_TROPHY=CRY          // these teams in UEL via FA Cup
+  //   EU_UCL_LEAGUE_SLOTS=5                   // default 5 (coefficient era)
+  //   EU_UEL_LEAGUE_SLOTS=1                   // default 1 (after PL cup spot)
+  //   EU_UECL_LEAGUE_SLOTS=1                  // default 1
+  const eu = parseEuConfig();
+  const trophyPreQualifiedIds = new Set<number>();
+  {
+    const shorts = new Set<string>([...eu.uclByTrophy, ...eu.uelByTrophy]);
+    if (shorts.size > 0) {
+      const rows = await sql<Array<{ id: number; short_name: string }>>`
+        SELECT id, short_name FROM teams
+      `;
+      for (const r of rows) {
+        if (shorts.has(r.short_name.toUpperCase())) trophyPreQualifiedIds.add(r.id);
+      }
+    }
+  }
+
+  // League EU thresholds, adjusted for trophy pre-qualifiers. If Villa
+  // (already in UCL via UEL win) finishes in the top-5 league places, the
+  // league's 5th UCL slot "cascades" — 6th gets it, and so on. We compute
+  // the BOUNDARY positions dynamically by walking the table skipping any
+  // team that's already trophy-qualified.
+  const orderedTeamIds = table.map(t => t.teamId);
+  const tIdToPts = new Map(table.map((t, i) => [t.teamId, t.points] as const));
+  // Build the eligible-for-league-EU list (excluding trophy-prequal teams).
+  const leagueEligibleIds = orderedTeamIds.filter(id => !trophyPreQualifiedIds.has(id));
+  // Compute the actual UCL / UEL / UECL boundary points (the LAST team to
+  // qualify under each comp). Falls back to top-of-list if fewer eligible
+  // teams than slots — defensive.
+  const boundaryPoints = (slot: number): number => {
+    if (slot <= 0 || leagueEligibleIds.length === 0) return Number.POSITIVE_INFINITY;
+    const id = leagueEligibleIds[Math.min(slot, leagueEligibleIds.length) - 1];
+    return tIdToPts.get(id) ?? Number.POSITIVE_INFINITY;
+  };
+  const lastUclPts  = boundaryPoints(eu.uclLeagueSlots);
+  const lastUelPts  = boundaryPoints(eu.uclLeagueSlots + eu.uelLeagueSlots);
+  const lastUeclPts = boundaryPoints(eu.uclLeagueSlots + eu.uelLeagueSlots + eu.ueclLeagueSlots);
+
   const pos1Pts  = table[0]?.points ?? 0;
-  const pos4Pts  = table[3]?.points ?? 0;
-  const pos6Pts  = table[5]?.points ?? 0;
-  const pos17Pts = table[16]?.points ?? 0;  // 18th from top = first safe spot
+  const pos17Pts = table[16]?.points ?? 0;
 
   // 2. Style — needs season totals from teams + goal-for/goal-against totals
   //    we just computed. League-mean as denominator for normalisation.
@@ -97,28 +183,50 @@ export async function recomputeTeamContext() {
     // 25/26 GW38 case: Arsenal #1 with title secured, MCI #2 with UCL
     // secured, Wolves/Burnley already relegated all correctly return
     // 0.1 now instead of 1.0.
+    // Trophy pre-qualified teams (e.g. UEL winner already in next-season
+    // UCL) don't NEED a league EU spot — but they still play for cushion
+    // pride / TV money / etc. We give them a small stake floor but never
+    // dead-rubber-clamp them.
+    const trophyPreQualified = trophyPreQualifiedIds.has(t.teamId);
+
+    // §stakes — a stake is "live" iff abs(gap-to-boundary) ≤ maxBridge.
+    // For a team ABOVE a boundary the gap is their cushion to the team
+    // immediately below; for a team BELOW it the gap is what they'd need
+    // to close. We compute against the DYNAMIC boundaries from above,
+    // which account for trophy pre-qualifiers cascading the league spots.
+    //
+    // Boundaries considered:
+    //   • title         — gap to/from #1
+    //   • UCL cutoff    — last UCL place (default top-5 in 25/26)
+    //   • UEL cutoff    — last UEL place (default position 6, unless PL
+    //                     cup winners have absorbed one)
+    //   • UECL cutoff   — last Conference League place (default position 7)
+    //   • relegation    — last safe place (17th)
+    const tPts = t.points;
+    const cushion = (boundaryPts: number) =>
+      tPts >= boundaryPts ? tPts - boundaryPts : boundaryPts - tPts;
+    // Title — only "live" if leader's gap-to-#2 is bridgeable (and we're
+    // not so far back we couldn't catch even with max wins).
     const titleGap = position === 1
-      ? t.points - (table[1]?.points ?? 0)        // cushion to #2
-      : pos1Pts - t.points;                        // gap to title
-    const top4Gap  = position <= 4
-      ? t.points - (table[4]?.points ?? 0)        // cushion to #5
-      : pos4Pts - t.points;                        // gap to UCL
-    const top6Gap  = position <= 6
-      ? t.points - (table[6]?.points ?? 0)        // cushion to #7
-      : pos6Pts - t.points;                        // gap to UEL
+      ? tPts - (table[1]?.points ?? 0)
+      : pos1Pts - tPts;
+    const uclGap  = cushion(lastUclPts);
+    const uelGap  = cushion(lastUelPts);
+    const ueclGap = cushion(lastUeclPts);
     const relegGap = position >= 18
-      ? (table[16]?.points ?? 0) - t.points       // gap to safety
-      : t.points - pos17Pts;                       // cushion above the line
+      ? (table[16]?.points ?? 0) - tPts
+      : tPts - pos17Pts;
 
     const stakeCandidates: number[] = [];
     if (Math.abs(titleGap) <= maxBridge) stakeCandidates.push(Math.abs(titleGap));
-    if (Math.abs(top4Gap)  <= maxBridge) stakeCandidates.push(Math.abs(top4Gap));
-    if (Math.abs(top6Gap)  <= maxBridge) stakeCandidates.push(Math.abs(top6Gap));
+    if (Number.isFinite(uclGap)  && Math.abs(uclGap)  <= maxBridge) stakeCandidates.push(Math.abs(uclGap));
+    if (Number.isFinite(uelGap)  && Math.abs(uelGap)  <= maxBridge) stakeCandidates.push(Math.abs(uelGap));
+    if (Number.isFinite(ueclGap) && Math.abs(ueclGap) <= maxBridge) stakeCandidates.push(Math.abs(ueclGap));
     if (Math.abs(relegGap) <= maxBridge) stakeCandidates.push(Math.abs(relegGap));
 
     let motivation: number;
     if (maxBridge === 0 || stakeCandidates.length === 0) {
-      motivation = 0.10;                            // nothing to play for
+      motivation = trophyPreQualified ? 0.25 : 0.10;   // nothing to play for
     } else {
       const closestGap = Math.min(...stakeCandidates);
       if (closestGap === 0)             motivation = 1.0;
