@@ -64,6 +64,17 @@ export interface PlayerInsight {
     bonus: number;
     defcon: number;
     defconPer90: number;
+    // §per-90 — all the rates the user actually wants to scan against each
+    // other when comparing OUT vs IN. Computed as STAT × 90 / minutes from
+    // the season totals, so 0 when minutes=0. xBonus/90 is a hybrid: real
+    // FPL bonus has no closed-form per-90, but bonus-per-90 from the season
+    // is the cleanest scan-friendly proxy.
+    xgPer90: number;
+    xaPer90: number;
+    bonusPer90: number;
+    // Open-play shots/90 and shots-in-box/90 require the per-shot aggregates,
+    // so they live on the `shots` block below. These two are convenience
+    // copies for the cases where shots is null and we still want SOMETHING.
   };
   /** Shot-situation aggregates from Understat. null if the player isn't in player_shot_aggregates. */
   shots: {
@@ -87,6 +98,15 @@ export interface PlayerInsight {
     npGoals: number;
     /** npGoals - npxG. Positive = over-finishing, negative = unlucky. */
     npFinishingDelta: number;
+    /** Open-play shots per 90 minutes. */
+    openPlayShotsPer90: number;
+    /** Open-play xG per 90. */
+    openPlayXgPer90: number;
+    /** Big-chance proxy: shots with xG/shot ≥ 0.15 ≈ shots in the danger
+     *  zone. We don't have raw shot-level data here, so we approximate via
+     *  (open_play_xg × 90 / mins) — only useful when the player has a
+     *  decent open-play sample. */
+    bigChancesPer90: number;
   } | null;
   /** Per-player Bayesian priors (output of recomputePlayerPriors). null if no entry. */
   priors: {
@@ -277,6 +297,9 @@ export async function getTransferInsights(
         };
       });
 
+    const seasonMinutes = Number(m?.season_minutes) || 0;
+    const per90 = (x: number) => seasonMinutes > 0 ? (x * 90) / seasonMinutes : 0;
+
     const sh = shotsById.get(p.id);
     const shots = sh ? {
       openPlayShots:   Number(sh.shots_open_play)   || 0,
@@ -291,7 +314,8 @@ export async function getTransferInsights(
       goalsSetPiece:   Number(sh.goals_set_piece)   || 0,
       goalsPenalty:    Number(sh.goals_penalty)     || 0,
       goalsDirectFk:   Number(sh.goals_direct_fk)   || 0,
-      xgPerOpenPlayShot: 0, npxg: 0, npGoals: 0, npFinishingDelta: 0
+      xgPerOpenPlayShot: 0, npxg: 0, npGoals: 0, npFinishingDelta: 0,
+      openPlayShotsPer90: 0, openPlayXgPer90: 0, bigChancesPer90: 0,
     } : null;
     if (shots) {
       shots.xgPerOpenPlayShot = shots.openPlayShots > 0
@@ -300,6 +324,16 @@ export async function getTransferInsights(
       shots.npxg     = shots.openPlayXg + shots.setPieceXg + shots.directFkXg;
       shots.npGoals  = shots.goalsOpenPlay + shots.goalsSetPiece + shots.goalsDirectFk;
       shots.npFinishingDelta = shots.npGoals - shots.npxg;
+      shots.openPlayShotsPer90 = per90(shots.openPlayShots);
+      shots.openPlayXgPer90    = per90(shots.openPlayXg);
+      // Big-chance proxy: weight each shot by max(0, xg_per_shot − 0.15) so
+      // only shots clearly in the danger zone count. Without raw shot rows
+      // this is an estimate; tells you "shots/90 from positions Understat
+      // rates ≥ 0.15 xG".
+      const bigShareApprox = shots.xgPerOpenPlayShot >= 0.15
+        ? shots.openPlayShots * (1 - 0.15 / Math.max(0.16, shots.xgPerOpenPlayShot))
+        : 0;
+      shots.bigChancesPer90 = per90(bigShareApprox);
     }
 
     const pr = priorsById.get(p.id);
@@ -371,7 +405,7 @@ export async function getTransferInsights(
         freekicksOrder: m?.direct_freekicks_order ?? null
       },
       season: {
-        minutes: Number(m?.season_minutes) || 0,
+        minutes: seasonMinutes,
         starts: Number(m?.season_starts) || 0,
         goals: Number(m?.season_goals) || 0,
         assists: Number(m?.season_assists) || 0,
@@ -379,7 +413,10 @@ export async function getTransferInsights(
         xa: Number(m?.season_xa) || 0,
         bonus: Number(m?.season_bonus) || 0,
         defcon: Number(m?.season_defcon) || 0,
-        defconPer90: Number(m?.season_defcon_per_90) || 0
+        defconPer90: Number(m?.season_defcon_per_90) || 0,
+        xgPer90: per90(Number(m?.season_xg) || 0),
+        xaPer90: per90(Number(m?.season_xa) || 0),
+        bonusPer90: per90(Number(m?.season_bonus) || 0),
       },
       shots,
       priors,

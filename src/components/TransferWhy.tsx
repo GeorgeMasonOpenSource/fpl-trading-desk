@@ -106,6 +106,16 @@ function PlayerPanel({ label, name, ins, tone }: {
                 <> · {fmt(ins.season.defconPer90, 1)} defcon/90</>
               )}
             </span>
+            {/* §per-90 — scan-friendly rates so the user can compare OUT
+                vs IN on the same basis. All four are derived from season
+                totals divided by minutes; safe to show when minutes > 0. */}
+            {ins.season.minutes > 0 && (
+              <span className="block text-[10px] text-ink-dim mt-0.5 font-mono">
+                xG/90 {fmt(ins.season.xgPer90, 2)} · xA/90 {fmt(ins.season.xaPer90, 2)}
+                {' · '}bonus/90 {fmt(ins.season.bonusPer90, 2)}
+                {ins.season.defconPer90 > 0 && <> · defcon/90 {fmt(ins.season.defconPer90, 1)}</>}
+              </span>
+            )}
             {/* Open-play xG split. If the player is a pen taker, the
                 headline xG above includes their penalty xG. We strip an
                 estimate of pen xG (penalty_share × 5 pens/season × 0.78)
@@ -187,6 +197,17 @@ function PlayerPanel({ label, name, ins, tone }: {
                   </tr>
                 </tbody>
               </table>
+              {/* §per-90 — shot rates per 90 minutes so the user can
+                  compare candidates on the same basis. Big-chances is a
+                  proxy: shots-volume weighted by how far xG/shot is above
+                  0.15, so only above-average chances contribute. */}
+              <div className="text-[10px] font-mono text-ink-muted mt-1">
+                open-play shots/90 {fmt(ins.shots.openPlayShotsPer90, 2)}
+                {' · '}open-play xG/90 {fmt(ins.shots.openPlayXgPer90, 2)}
+                {ins.shots.bigChancesPer90 > 0 && (
+                  <> · big-chance proxy/90 {fmt(ins.shots.bigChancesPer90, 2)}</>
+                )}
+              </div>
               <div className="text-[10px] text-ink-dim mt-1">
                 npxG = non-penalty expected goals · finishing Δ = np-goals − npxG.{' '}
                 {ins.shots.npFinishingDelta >= 2

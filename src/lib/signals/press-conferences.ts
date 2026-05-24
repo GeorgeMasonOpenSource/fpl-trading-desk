@@ -142,6 +142,24 @@ export interface TeamPressSummary {
   latestNews:    string;
   newsUpdatedAt: string | null;
   headline:      string;
+  // External team-news sources (Fantasy Football Scout etc.). Always
+  // displayed with explicit source attribution + outbound link.
+  externalNews?: ExternalTeamNews | null;
+}
+
+export interface ExternalTeamNews {
+  source:       string;       // 'ff_scout'
+  sourceLabel:  string;       // 'Fantasy Football Scout'
+  sourceUrl:    string;       // back-link for attribution
+  nextMatch:    string | null;
+  formation:    string | null;
+  predictedXi:  string[];
+  out:          Array<{ name: string }>;
+  doubts:       Array<{ name: string; percent: number | null }>;
+  banned:       Array<{ name: string }>;
+  latestNews:   string | null;
+  lastUpdated:  string | null;
+  fetchedAt:    string;       // ISO timestamp
 }
 
 // ─── managers ─────────────────────────────────────────────────────────────────
@@ -372,6 +390,7 @@ export async function buildPressConferenceSummary(
     projByTeam.get(p.team_id)!.push(p);
   }
   const rawQuotesByPlayer = await loadFreshQuotes(projRows.map(p => p.id), withinHours);
+  const externalByTeam    = await loadExternalTeamNews();
 
   const out: TeamPressSummary[] = [];
   for (const t of teams) {
@@ -476,6 +495,7 @@ export async function buildPressConferenceSummary(
       managerQuotes, punditQuotes,
       latestNews: narrative, newsUpdatedAt,
       headline,
+      externalNews: externalByTeam.get(t.id) ?? null,
     });
   }
   return out;
@@ -613,6 +633,53 @@ async function loadFreshQuotes(
   return m;
 }
 
+/**
+ * External team-news (Fantasy Football Scout etc.). Pulls the latest row
+ * per team from team_news_external. Tolerates the table not existing yet
+ * (returns empty map) so the page renders before the migration is run.
+ */
+async function loadExternalTeamNews(): Promise<Map<number, ExternalTeamNews>> {
+  const m = new Map<number, ExternalTeamNews>();
+  try {
+    type Row = {
+      team_id: number; source: string; source_label: string; source_url: string;
+      next_match: string | null; formation: string | null;
+      predicted_xi: any; out_list: any; doubts: any; banned: any;
+      latest_news: string | null; last_updated_at: string | null;
+      fetched_at: string;
+    };
+    const rows = await sql<Row[]>`
+      SELECT team_id, source, source_label, source_url,
+             next_match, formation, predicted_xi, out_list, doubts, banned,
+             latest_news, last_updated_at, fetched_at::text AS fetched_at
+      FROM team_news_external
+      ORDER BY fetched_at DESC
+    `;
+    // For each team, keep only the most-recent row.
+    for (const r of rows) {
+      if (m.has(r.team_id)) continue;
+      m.set(r.team_id, {
+        source: r.source,
+        sourceLabel: r.source_label,
+        sourceUrl: r.source_url,
+        nextMatch: r.next_match,
+        formation: r.formation,
+        predictedXi: Array.isArray(r.predicted_xi) ? r.predicted_xi : [],
+        out: Array.isArray(r.out_list) ? r.out_list : [],
+        doubts: Array.isArray(r.doubts) ? r.doubts : [],
+        banned: Array.isArray(r.banned) ? r.banned : [],
+        latestNews: r.latest_news,
+        lastUpdated: r.last_updated_at,
+        fetchedAt: r.fetched_at,
+      });
+    }
+  } catch (err) {
+    // Table missing (migration not yet applied) — log and continue.
+    console.warn(`[press-conf] loadExternalTeamNews skipped: ${(err as Error).message}`);
+  }
+  return m;
+}
+
 // ─── classification ───────────────────────────────────────────────────────────
 
 function buildPlayerLine(p: ProjectionRow, quotes: PressQuote[], yc: boolean): PressPlayerLine {
@@ -703,12 +770,19 @@ function buildReasonsForPlayer(p: ProjectionRow, yc: boolean): string[] {
 
 function describeMotivation(motivation: number | null, position: number | null): string {
   if (motivation == null) return 'Motivation unknown';
-  if (motivation >= 0.85 && position != null && position <= 2) return 'Title decider — full strength';
-  if (motivation >= 0.85 && position != null && position >= 18) return 'Relegation fight — full strength';
+  // Motivation comes from team-context.ts — it's already 0.10 when every
+  // boundary (title/top-4/top-6/relegation) is mathematically settled.
+  // So the band of 0.7+ here only fires when an open-ended chase remains.
+  if (motivation >= 0.85 && position != null && position >= 17 && position <= 18) {
+    return 'Relegation decider — full strength';
+  }
+  if (motivation >= 0.7 && position != null && position <= 6) {
+    return 'European chase — full strength';
+  }
   if (motivation >= 0.7) return 'Stakes remain — full XI expected';
   if (motivation >= 0.4) return 'Reduced stakes — some rotation possible';
   if (motivation >= 0.2) return 'Little to play for — heavy rotation likely';
-  return 'Dead rubber — expect rotation';
+  return 'Nothing to play for — expect rotation';
 }
 
 // ─── predicted XI ─────────────────────────────────────────────────────────────

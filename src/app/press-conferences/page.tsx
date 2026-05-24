@@ -54,15 +54,8 @@ export default async function PressConferencesPage() {
     buildPressConferenceSummary(gw.id, { withinHours: 48 }),
   ]);
 
-  // Sort: most actionable first.
-  teamSummaries.sort((a, b) => {
-    const aRisk = a.banned.length * 20 + a.out.length * 6 + a.doubts.length * 2
-                + (a.managerQuotes.length > 0 ? 1 : 0);
-    const bRisk = b.banned.length * 20 + b.out.length * 6 + b.doubts.length * 2
-                + (b.managerQuotes.length > 0 ? 1 : 0);
-    if (bRisk !== aRisk) return bRisk - aRisk;
-    return a.teamShort.localeCompare(b.teamShort);
-  });
+  // Alphabetical by team short name.
+  teamSummaries.sort((a, b) => a.teamShort.localeCompare(b.teamShort));
 
   const totalManagerQuotes = teamSummaries.reduce((s, t) => s + t.managerQuotes.length, 0);
   const totalPunditQuotes  = teamSummaries.reduce((s, t) => s + t.punditQuotes.length, 0);
@@ -99,7 +92,7 @@ export default async function PressConferencesPage() {
       <section>
         <div className="flex items-baseline justify-between mb-3">
           <h2 className="text-lg font-semibold">Team-by-team</h2>
-          <span className="text-xs text-ink-dim">Sorted by GW disruption</span>
+          <span className="text-xs text-ink-dim">Alphabetical</span>
         </div>
         <div className="space-y-4">
           {teamSummaries.map(t => <TeamCard key={t.teamId} team={t} />)}
@@ -225,7 +218,27 @@ function TeamCard({ team }: { team: TeamPressSummary }) {
           <BucketCol title="Banned" tone="red" players={team.banned} emptyText="—" />
         </div>
 
-        <Section title="Latest news">
+        {team.externalNews?.latestNews && (
+          <Section title={`From ${team.externalNews.sourceLabel}`}>
+            <p className="text-xs text-ink leading-relaxed">{team.externalNews.latestNews}</p>
+            <p className="text-[10px] text-ink-dim mt-1">
+              {team.externalNews.lastUpdated && <>Last updated {team.externalNews.lastUpdated} · </>}
+              <a href={team.externalNews.sourceUrl} target="_blank" rel="noopener noreferrer"
+                 className="text-accent-blue hover:underline">
+                Source: {team.externalNews.sourceLabel}↗
+              </a>
+            </p>
+            {(team.externalNews.out.length + team.externalNews.doubts.length + team.externalNews.banned.length) > 0 && (
+              <div className="grid grid-cols-3 gap-3 mt-2 text-[11px]">
+                <ExternalList title="Out" items={team.externalNews.out.map(i => i.name)} tone="red" />
+                <ExternalList title="Doubts" items={team.externalNews.doubts.map(d => d.percent != null ? `${d.name} (${d.percent}%)` : d.name)} tone="amber" />
+                <ExternalList title="Banned" items={team.externalNews.banned.map(i => i.name)} tone="red" />
+              </div>
+            )}
+          </Section>
+        )}
+
+        <Section title={team.externalNews?.latestNews ? 'Engine summary' : 'Latest news'}>
           <p className="text-xs text-ink leading-relaxed">{team.latestNews}</p>
           {team.newsUpdatedAt && (
             <p className="text-[10px] text-ink-dim mt-1">
@@ -318,6 +331,22 @@ function BucketCol({
           ))}
         </ul>
       )}
+    </div>
+  );
+}
+
+function ExternalList({ title, items, tone }: { title: string; items: string[]; tone: 'red' | 'amber' }) {
+  const dot = tone === 'red' ? 'bg-accent-red' : 'bg-accent-amber';
+  return (
+    <div>
+      <div className="flex items-center gap-1.5 mb-1">
+        <span className={`inline-block w-1.5 h-1.5 rounded-full ${dot}`} aria-hidden />
+        <h5 className="text-[10px] uppercase tracking-widest text-ink-dim font-semibold">{title}</h5>
+      </div>
+      {items.length === 0
+        ? <p className="text-[11px] text-ink-dim">—</p>
+        : <ul className="space-y-0.5">{items.map((it, i) => <li key={i} className="text-[11px]">{it}</li>)}</ul>
+      }
     </div>
   );
 }

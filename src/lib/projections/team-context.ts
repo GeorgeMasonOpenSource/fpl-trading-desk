@@ -86,29 +86,44 @@ export async function recomputeTeamContext() {
     const gamesRemaining = Math.max(0, 38 - t.played);
     const maxBridge = gamesRemaining * 3;
 
-    // The smaller the gap, the more bridgeable. Map gap → 0..1 motivation
-    // contribution. A team within `maxBridge` of any stake is motivated;
-    // gap > maxBridge contributes 0.
-    const stakeGaps = [
-      pos1Pts  - t.points,        // catch the top
-      pos4Pts  - t.points,        // catch top-4
-      pos6Pts  - t.points,        // catch top-6
-      t.points - pos17Pts         // avoid relegation (positive = above the line)
-    ].map(Math.abs);
-    const closestGap = Math.min(...stakeGaps);
-    // Linear interpolation: gap 0 → 1.0, gap == maxBridge → 0.3,
-    // gap > 2 × maxBridge → 0.1
-    let motivation = 0.1;
-    if (maxBridge > 0) {
-      if (closestGap === 0) motivation = 1.0;
-      else if (closestGap <= maxBridge) motivation = 1.0 - 0.7 * (closestGap / maxBridge);
-      else if (closestGap <= 2 * maxBridge) motivation = 0.3 - 0.2 * ((closestGap - maxBridge) / maxBridge);
-      else motivation = 0.10;
+    // §stakes — only OPEN-ENDED gaps count. For a team ABOVE a boundary
+    // (e.g. #1 above pos2) the gap is their cushion to the chasing rival;
+    // for a team BELOW it the gap is the points they'd need to bridge. A
+    // stake is "live" only if abs(gap) ≤ maxBridge. If every boundary is
+    // settled → motivation collapses to 0.1 ("dead rubber").
+    //
+    // This replaces the old "top-2 / bottom-3 floor at 0.85" override
+    // which fired even when the title was mathematically decided. The
+    // 25/26 GW38 case: Arsenal #1 with title secured, MCI #2 with UCL
+    // secured, Wolves/Burnley already relegated all correctly return
+    // 0.1 now instead of 1.0.
+    const titleGap = position === 1
+      ? t.points - (table[1]?.points ?? 0)        // cushion to #2
+      : pos1Pts - t.points;                        // gap to title
+    const top4Gap  = position <= 4
+      ? t.points - (table[4]?.points ?? 0)        // cushion to #5
+      : pos4Pts - t.points;                        // gap to UCL
+    const top6Gap  = position <= 6
+      ? t.points - (table[6]?.points ?? 0)        // cushion to #7
+      : pos6Pts - t.points;                        // gap to UEL
+    const relegGap = position >= 18
+      ? (table[16]?.points ?? 0) - t.points       // gap to safety
+      : t.points - pos17Pts;                       // cushion above the line
+
+    const stakeCandidates: number[] = [];
+    if (Math.abs(titleGap) <= maxBridge) stakeCandidates.push(Math.abs(titleGap));
+    if (Math.abs(top4Gap)  <= maxBridge) stakeCandidates.push(Math.abs(top4Gap));
+    if (Math.abs(top6Gap)  <= maxBridge) stakeCandidates.push(Math.abs(top6Gap));
+    if (Math.abs(relegGap) <= maxBridge) stakeCandidates.push(Math.abs(relegGap));
+
+    let motivation: number;
+    if (maxBridge === 0 || stakeCandidates.length === 0) {
+      motivation = 0.10;                            // nothing to play for
+    } else {
+      const closestGap = Math.min(...stakeCandidates);
+      if (closestGap === 0)             motivation = 1.0;
+      else                              motivation = 1.0 - 0.7 * (closestGap / maxBridge);
     }
-    // Title contenders (top-2) and relegation candidates (bottom-3) get a
-    // motivation floor — even when mathematically secure they tend to keep
-    // their starters in. End-of-season managers want clean send-offs too.
-    if (position <= 2 || position >= 18) motivation = Math.max(motivation, 0.85);
 
     // Style proxies: solidity ~ 1 - (ga / meanGa+1), attacking ~ gf / meanGf
     const solidity = meanGa > 0 ? Math.max(0, Math.min(1, 1 - t.ga / (meanGa * 2))) : 0.5;
