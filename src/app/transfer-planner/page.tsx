@@ -14,6 +14,7 @@ import { TransferReasons } from '@/components/TransferReasons';
 import { transferReasons } from '@/lib/transfers/transfer-reasons';
 import { loadMinutesContext } from '@/lib/transfers/minutes-context';
 import { EvDecompositionBar } from '@/components/EvDecompositionBar';
+import { XptsBreakdownTable } from '@/components/XptsBreakdownTable';
 import { CompareToOverlay } from '@/components/CompareToOverlay';
 import { TransferPreview, type PreviewPlayer, type PreviewSwap } from '@/components/TransferPreview';
 import { getGameweeks, managerSummary } from '@/lib/db/queries';
@@ -358,6 +359,19 @@ export default async function TransferPlanner() {
                   <TransferReasons reasons={reasons} />
                   {delta && (
                     <EvDecompositionBar delta={delta} perGw={perGw} />
+                  )}
+                  {inBreak && outBreak && (
+                    <XptsBreakdownTable
+                      outName={t.out.webName}
+                      inName={t.in.webName}
+                      outComponents={outBreak.components}
+                      inComponents={inBreak.components}
+                      outInsight={insights.get(t.out.playerId)}
+                      inInsight={insights.get(t.in.playerId)}
+                      outExpectedMinutes={minutesCtx.get(t.out.playerId)?.expectedMinutes ?? null}
+                      inExpectedMinutes={minutesCtx.get(t.in.playerId)?.expectedMinutes ?? null}
+                      horizonGws={EV_BREAKDOWN_HORIZON_GWS}
+                    />
                   )}
                   <TransferWhy
                     outName={t.out.webName}
