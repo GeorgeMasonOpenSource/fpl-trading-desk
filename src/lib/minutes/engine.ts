@@ -51,6 +51,12 @@ export interface MinutesInputs {
   seasonAvgMinsPerApp?: number;     // season total minutes / appearances
   fplStatus: 'a' | 'd' | 'i' | 'n' | 's' | 'u';
   chanceOfPlayingNext: number | null; // 0..100 from FPL
+  // §news-gate — FPL's `news` field. Often updates BEFORE status flips
+  // (press conferences, late-breaking injuries, "joined Flamengo
+  // permanently"). The minutes engine parses this for hard-out signals
+  // and forces injuryAbsenceProb to 1.0 when found, closing the gap
+  // where status='a' but news already says out.
+  fplNews?: string | null;
   // Context for this specific fixture:
   isPostEuropeanFixture: boolean;
   isPreEuropeanFixture: boolean;
@@ -96,23 +102,66 @@ export function projectMinutes(input: MinutesInputs): MinutesDistribution {
   const reasons: ProjectionReason[] = [];
 
   // 1. Injury / availability gate ---------------------------------------------
+  // The gate is a layered priority:
+  //   (1) news-based hard-out detection (FPL updates `news` before `status`)
+  //   (2) FPL status flag (a/d/i/n/s/u)
+  //   (3) chance_of_playing_next_round applies on top whenever it's set,
+  //       not just for status='d' — FPL frequently flags chance=75 without
+  //       flipping status to 'd'.
   let injuryAbsenceProb = 0;
   if (input.manualExpectedAbsence) {
-    injuryAbsenceProb = 0.95;
-    reasons.push({ kind: 'manual_absence_override', weight: 0.95, detail: 'manual override: expected absence' });
+    injuryAbsenceProb = 0.99;
+    reasons.push({ kind: 'manual_absence_override', weight: 0.99, detail: 'manual override: expected absence' });
   } else {
-    switch (input.fplStatus) {
-      case 'a': injuryAbsenceProb = 0.02; break;            // available
-      case 'd': {                                             // doubtful — use chance of playing
-        const chance = input.chanceOfPlayingNext == null ? 50 : input.chanceOfPlayingNext;
-        injuryAbsenceProb = clamp01(1 - chance / 100);
-        reasons.push({ kind: 'doubt_flag', weight: injuryAbsenceProb, detail: `chance of playing: ${chance}%` });
-        break;
+    // §news-gate — late-breaking unavailability that FPL hasn't yet
+    // reflected in `status`. Patterns observed in bootstrap:
+    //   "Suspended for the match against..."
+    //   "Suspended until 29 Aug"
+    //   "Not available for the match against ... on dd/m."
+    //   "Made unavailable for selection on dd/m."
+    //   "has joined <club> permanently."
+    // Each is a hard-out signal: force absence to ~1.0 regardless of
+    // the stale status flag.
+    const newsLc = (input.fplNews ?? '').toLowerCase();
+    const hardOut =
+      /\bsuspended\b/.test(newsLc) ||
+      /not available for the match/.test(newsLc) ||
+      /made unavailable for selection/.test(newsLc) ||
+      /joined .* permanently/.test(newsLc) ||
+      /transferred to/.test(newsLc) ||
+      /has left the club/.test(newsLc);
+    if (hardOut) {
+      injuryAbsenceProb = 0.99;
+      reasons.push({ kind: 'news_hard_out', weight: 0.99, detail: `news: ${input.fplNews?.slice(0, 80) ?? ''}` });
+    } else {
+      switch (input.fplStatus) {
+        case 'a': injuryAbsenceProb = 0.02; break;            // available
+        case 'd': {                                             // doubtful — use chance of playing
+          const chance = input.chanceOfPlayingNext == null ? 50 : input.chanceOfPlayingNext;
+          injuryAbsenceProb = clamp01(1 - chance / 100);
+          reasons.push({ kind: 'doubt_flag', weight: injuryAbsenceProb, detail: `chance of playing: ${chance}%` });
+          break;
+        }
+        case 'i': injuryAbsenceProb = 0.95; break;            // injured (was 0.92 — too soft)
+        case 'n': injuryAbsenceProb = 0.99; break;            // not available for this match (was 0.90 — should be near-100%)
+        case 's': injuryAbsenceProb = 0.99; break;            // suspended (was 0.97)
+        case 'u': injuryAbsenceProb = 0.99; break;            // transferred / no longer at club (was 0.90 — should be 100%)
       }
-      case 'i': injuryAbsenceProb = 0.92; break;            // injured
-      case 'n': injuryAbsenceProb = 0.90; break;            // ineligible / not in squad
-      case 's': injuryAbsenceProb = 0.97; break;            // suspended
-      case 'u': injuryAbsenceProb = 0.90; break;            // unavailable
+    }
+    // §chance-of-playing for ANY status — if FPL has set a chance value
+    // and we haven't already used it via the 'd' branch, take the MIN
+    // (more pessimistic). Closes the gap where a status='a' player has
+    // chance=75 due to a yellow flag.
+    if (input.fplStatus !== 'd' && !hardOut && input.chanceOfPlayingNext != null && input.chanceOfPlayingNext < 100) {
+      const chanceBasedAbsence = clamp01(1 - input.chanceOfPlayingNext / 100);
+      if (chanceBasedAbsence > injuryAbsenceProb) {
+        injuryAbsenceProb = chanceBasedAbsence;
+        reasons.push({
+          kind: 'chance_of_playing',
+          weight: chanceBasedAbsence,
+          detail: `FPL chance ${input.chanceOfPlayingNext}% despite status='${input.fplStatus}'`,
+        });
+      }
     }
   }
 
@@ -172,6 +221,17 @@ export function projectMinutes(input: MinutesInputs): MinutesDistribution {
   }
 
   startGivenAvailable -= rotationPenalty;
+
+  // §dead-rubber → startProb (not just expected_minutes). The previous
+  // engine applied motivation ONLY to expected_minutes, so a "team with
+  // nothing to play for" still saw full startProb → bonus and CS engines
+  // downstream over-projected. Mirror the same multiplier on startProb so
+  // the rotation reality flows everywhere.
+  const motivationForStart = input.teamMotivation ?? 0.7;
+  if (motivationForStart < 0.7) {
+    const startMult = 1.0 - 0.25 * Math.min(1, (0.7 - motivationForStart) / 0.7);
+    startGivenAvailable *= startMult;
+  }
 
   // Returning from injury: cap start prob aggressively in match 1, partial in match 2.
   if (input.returnFromInjuryMatch === 1) {
@@ -250,16 +310,22 @@ export function projectMinutes(input: MinutesInputs): MinutesDistribution {
 
   // §team-motivation multiplier — relegated/safe teams rest starters,
   // teams with stakes don't. teamMotivation ~0.7 default → 1.0 multiplier;
-  // 0.3 (no stakes) → 0.93 mult; 1.0 (max stakes) → 1.03 mult.
-  // Asymmetric: motivation pushes UP harder than down because once a team
-  // has nothing to play for they DO actually rotate, but a team chasing
-  // top-4 plays first-choice 90s.
+  // 0.0 (no stakes at all, e.g. final-GW dead rubber) → 0.75 mult;
+  // 1.0 (max stakes) → 1.10 mult.
+  // §dead-rubber-fix — downside widened from -7% to -25% because the
+  // previous magnitude underweighted final-GW rotation reality. Real
+  // dead rubbers see ~30-50% of starters rested or pulled at 60'. A
+  // -25% cap is still conservative.
   const motivation = input.teamMotivation ?? 0.7;
   const motivationMultiplier = motivation >= 0.7
     ? 1.0 + 0.10 * Math.min(1, (motivation - 0.7) / 0.3)   // 0.7→1.0, 1.0→1.10
-    : 1.0 - 0.07 * Math.min(1, (0.7 - motivation) / 0.7);   // 0.7→1.0, 0→0.93
-  if (motivation < 0.4) {
-    reasons.push({ kind: 'team_motivation', weight: 1 - motivationMultiplier, detail: `team has little to play for (motivation ${(motivation*100).toFixed(0)}%)` });
+    : 1.0 - 0.25 * Math.min(1, (0.7 - motivation) / 0.7);   // 0.7→1.0, 0→0.75
+  if (motivation < 0.7) {
+    reasons.push({
+      kind: 'team_motivation',
+      weight: 1 - motivationMultiplier,
+      detail: `team has little to play for (motivation ${(motivation*100).toFixed(0)}%) — minutes/start downweighted ${((1-motivationMultiplier)*100).toFixed(0)}%`,
+    });
   }
 
   // §injury depth — when teammates are out, the available starters play
@@ -358,9 +424,10 @@ export async function recomputeMinutesForGameweek(gw: number) {
     id: number; team_id: number; status: 'a'|'d'|'i'|'n'|'s'|'u';
     chance_of_playing_next_round: number | null;
     season_minutes: number; season_starts: number;
+    news: string | null;
   }>>`
     SELECT id, team_id, status, chance_of_playing_next_round,
-           season_minutes, season_starts
+           season_minutes, season_starts, news
     FROM players WHERE team_id IN ${sql(teamIds as any)}
   `;
   const playerIds = players.map(p => p.id);
@@ -608,6 +675,7 @@ export async function recomputeMinutesForGameweek(gw: number) {
         teamInjuredStarters,
         fplStatus: p.status,
         chanceOfPlayingNext: p.chance_of_playing_next_round,
+        fplNews: p.news,
         isPostEuropeanFixture: postEu,
         isPreEuropeanFixture:  preEu,
         daysRestBefore: null, daysRestAfter: null,

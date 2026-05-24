@@ -98,7 +98,15 @@ export function autoPick<T extends AutoPickInput>(squad: T[]): AutoPickResult<T>
   const viceId    = sortedStarters[1]?.player_id;
 
   const startedIds = new Set(best.starters.map(p => p.player_id));
-  // Bench: GKP first, then outfielders sorted by xPts.
+  // FPL bench convention: slots 12/13/14 are outfield substitutes (auto-sub
+  // priority order); slot 15 is the GKP (emergency only, only auto-subs
+  // when starting GKP doesn't play). Map to our benchOrder space:
+  //   benchOrder 1 → slot 12 (first outfield sub, highest auto-sub priority)
+  //   benchOrder 2 → slot 13
+  //   benchOrder 3 → slot 14
+  //   benchOrder 4 → slot 15 (GKP)
+  // Previously this was inverted — GKP was getting benchOrder=1 (highest
+  // auto-sub priority) which is the opposite of FPL's actual behaviour.
   const benchGkp = byPos.GKP.find(p => !startedIds.has(p.player_id));
   const benchOutfield = [...byPos.DEF, ...byPos.MID, ...byPos.FWD]
     .filter(p => !startedIds.has(p.player_id))
@@ -112,10 +120,6 @@ export function autoPick<T extends AutoPickInput>(squad: T[]): AutoPickResult<T>
   }));
   const bench: AutoPickedPlayer<T>[] = [];
   let order = 1;
-  if (benchGkp) {
-    bench.push({ player: benchGkp, slot: 'bench', benchOrder: 1, isCaptain: false, isVice: false });
-    order = 2;
-  }
   for (const p of benchOutfield) {
     bench.push({
       player: p, slot: 'bench',
@@ -123,6 +127,10 @@ export function autoPick<T extends AutoPickInput>(squad: T[]): AutoPickResult<T>
       isCaptain: false, isVice: false
     });
     order++;
+  }
+  if (benchGkp) {
+    // GKP always last (slot 15), regardless of how many outfielders are benched.
+    bench.push({ player: benchGkp, slot: 'bench', benchOrder: 4, isCaptain: false, isVice: false });
   }
 
   const captainXpts = (sortedStarters[0]?.xpts_total ?? 0) * 2;

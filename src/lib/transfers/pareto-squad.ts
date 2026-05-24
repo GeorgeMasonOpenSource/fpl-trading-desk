@@ -63,7 +63,11 @@ export async function runParetoSquad(input: ParetoSquadInput): Promise<ParetoSqu
     freeTransfers: input.freeTransfers,
     allowHits: input.allowHits,
     maxHits: input.maxHits,
-    xiFirst: true,
+    // xiFirst doubles variable count and adds N coupling constraints; the
+    // JS LP solver chokes above ~600 candidates and returns 9-player squads
+    // that the post-LP validator rejects. autoPick handles XI selection
+    // downstream from the chosen 15 anyway — no value lost.
+    xiFirst: false,
     forceInclude: input.forceInclude,
     forceExclude: input.forceExclude
   });
@@ -89,7 +93,11 @@ export async function runParetoSquad(input: ParetoSquadInput): Promise<ParetoSqu
     freeTransfers: input.freeTransfers,
     allowHits: input.allowHits,
     maxHits: input.maxHits,
-    xiFirst: true,
+    // xiFirst doubles variable count and adds N coupling constraints; the
+    // JS LP solver chokes above ~600 candidates and returns 9-player squads
+    // that the post-LP validator rejects. autoPick handles XI selection
+    // downstream from the chosen 15 anyway — no value lost.
+    xiFirst: false,
     forceInclude: input.forceInclude,
     forceExclude: input.forceExclude
   });
@@ -119,7 +127,11 @@ export async function runParetoSquad(input: ParetoSquadInput): Promise<ParetoSqu
     freeTransfers: input.freeTransfers,
     allowHits: input.allowHits,
     maxHits: input.maxHits,
-    xiFirst: true,
+    // xiFirst doubles variable count and adds N coupling constraints; the
+    // JS LP solver chokes above ~600 candidates and returns 9-player squads
+    // that the post-LP validator rejects. autoPick handles XI selection
+    // downstream from the chosen 15 anyway — no value lost.
+    xiFirst: false,
     forceInclude: input.forceInclude,
     forceExclude: input.forceExclude
   });

@@ -32,7 +32,8 @@
     "ingest:odds": "tsx scripts/ingest-odds.ts",
     "ingest:lineups": "tsx scripts/ingest-lineups.ts",
     "ingest:understat": "tsx scripts/ingest-understat.ts",
-    "probe:transcript": "tsx scripts/probe-transcript.ts"
+    "probe:transcript": "tsx scripts/probe-transcript.ts",
+    "db:query": "tsx scripts/db-query.ts"
   },
   "dependencies": {
     "@neondatabase/serverless": "^0.9.4",
