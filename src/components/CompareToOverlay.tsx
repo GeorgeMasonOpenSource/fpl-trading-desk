@@ -16,6 +16,8 @@ import { useState, useTransition } from 'react';
 import { priceCompareSwap } from '@/app/actions/compare-swap';
 import type { CompareSwapResult } from '@/app/actions/compare-swap.types';
 import { EvDecompositionBar } from './EvDecompositionBar';
+import { XptsBreakdownTable } from './XptsBreakdownTable';
+import { TransferWhy } from './TransferWhy';
 import { fmt } from '@/lib/util/fmt';
 
 interface CompareToOverlayProps {

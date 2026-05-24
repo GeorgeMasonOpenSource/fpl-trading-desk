@@ -26,8 +26,10 @@ import { sql } from '@/lib/db/client';
 import {
   getTransferEvBreakdown,
   diffComponents,
-  pairPerFixture
+  pairPerFixture,
+  getTransferInsights,
 } from '@/lib/transfers/insights';
+import { loadMinutesContext } from '@/lib/transfers/minutes-context';
 // NOTE: types live in compare-swap.types.ts because Next.js requires
 // 'use server' files to export ONLY async functions. Don't move these back.
 import type {
@@ -184,6 +186,13 @@ export async function priceCompareSwap(formData: FormData): Promise<CompareSwapR
   }
   const delta = diffComponents(inBreak.components, outBreak.components);
   const perGw = pairPerFixture(inBreak.perFixture, outBreak.perFixture);
+  // §detailed-breakdown — fetch the same insight + minutes context the
+  // top-N rows use so the overlay can render the per-component xPts table
+  // and recent-form panel inline.
+  const [insights, minutesCtx] = await Promise.all([
+    getTransferInsights([outResolved.playerId, inResolved.playerId], startGw),
+    loadMinutesContext([outResolved.playerId, inResolved.playerId], startGw),
+  ]);
   return {
     ok: true,
     source,
@@ -191,6 +200,13 @@ export async function priceCompareSwap(formData: FormData): Promise<CompareSwapR
     inResolved,
     delta,
     perGw,
-    netEv: delta.total
+    netEv: delta.total,
+    outComponents: outBreak.components,
+    inComponents:  inBreak.components,
+    outInsight:    insights.get(outResolved.playerId),
+    inInsight:     insights.get(inResolved.playerId),
+    outExpectedMinutes: minutesCtx.get(outResolved.playerId)?.expectedMinutes ?? null,
+    inExpectedMinutes:  minutesCtx.get(inResolved.playerId)?.expectedMinutes ?? null,
+    horizonGws: HORIZON_GWS,
   };
 }
