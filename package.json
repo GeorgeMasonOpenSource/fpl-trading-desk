@@ -34,7 +34,8 @@
     "ingest:understat": "tsx scripts/ingest-understat.ts",
     "probe:transcript": "tsx scripts/probe-transcript.ts",
     "db:query": "tsx scripts/db-query.ts",
-    "ingest:ff-scout": "tsx scripts/ingest-ff-scout.ts"
+    "ingest:ff-scout": "tsx scripts/ingest-ff-scout.ts",
+    "ingest:fpljoe": "tsx scripts/ingest-fpljoe.ts"
   },
   "dependencies": {
     "@neondatabase/serverless": "^0.9.4",
